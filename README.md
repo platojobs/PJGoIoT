@@ -315,8 +315,8 @@ seed 数据来源与边界：
 | `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok） |
 | `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=3；含旧数据回填） |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
-| `docker build` | 通过（GitHub Actions `docker-build` job，v0.1.0 提交） |
-| GitHub Actions | 通过（v0.1.0：gofmt、vet、build、单元测试、迁移、集成测试、distroless 镜像构建） |
+| `docker build` | 通过（GitHub Actions `docker-build` job，v0.2.0 提交，run 41881913964） |
+| GitHub Actions | 通过（v0.2.0：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建；run 41881913964） |
 
 集成测试运行方式：
 
