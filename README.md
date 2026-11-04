@@ -380,8 +380,8 @@ seed 数据来源与边界：
 | fixture 字段补全验证 | 通过：`/my/devices` 中 Android 设备返回 `nordic_uart / Nordic Semiconductor / nRF Connect SDK v2.9.0` 与 UART 兼容性；iOS 上报 `environmental_sensor` 返回厂商与温度/湿度/气压兼容性、`firmwareVersion=null`；未注册型号仅回显 `deviceType`，其余为 `null`；catalog 固件/配件均带 `vendor` 与 `compatibility` |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.1 提交 1e3f451，run 41891902083） |
-| GitHub Actions | 通过（v0.3.1：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建；run 41891902083） |
+| `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.2 提交 10fb27b，run 41897825528） |
+| GitHub Actions | 通过（v0.3.2：gofmt、vet、build、单元测试、迁移到 version=4、Postgres 集成测试、distroless 镜像构建；run 41897825528） |
 
 集成测试运行方式：
 
