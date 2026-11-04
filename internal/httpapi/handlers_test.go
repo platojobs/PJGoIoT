@@ -718,6 +718,189 @@ func TestMyDeviceByKey(t *testing.T) {
 	})
 }
 
+// TestDeviceMetadataEnrichment 覆盖 v0.3.2 的契约扩展：
+// UserDevice 带 deviceType/vendor/firmwareVersion/compatibility；
+// catalog 的固件与配件带 vendor/compatibility；
+// 公共元数据缺失时字段降级为 null，接口仍返回 200。
+func TestDeviceMetadataEnrichment(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+	now := time.Now().UTC()
+
+	const (
+		androidMAC      = "AA:BB:CC:00:00:01" // 已注册公共设备：nordic_uart
+		androidID       = "55555555-5555-4555-8555-555555555555"
+		iosID           = "66666666-6666-4666-8666-666666666666"
+		iosExternal     = "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+		unknownID       = "77777777-7777-4777-8777-777777777777"
+		unknownExternal = "0F1E2D3C-4B5A-4968-8777-666655554444"
+		noTypeID        = "88888888-8888-4888-8888-888888888888"
+		noTypeExternal  = "9A8B7C6D-5E4F-4A3B-8C2D-1E0F9A8B7C6D"
+	)
+
+	body := `{"clientId":"metadata","devices":[
+		{"id":"` + androidID + `","platform":"android","externalId":"` + androidMAC + `","alias":"走公共库推导","updatedAt":"` + now.Format(time.RFC3339) + `"},
+		{"id":"` + iosID + `","platform":"ios","externalId":"` + iosExternal + `","deviceType":"environmental_sensor","alias":"上报型号","updatedAt":"` + now.Format(time.RFC3339) + `"},
+		{"id":"` + unknownID + `","platform":"ios","externalId":"` + unknownExternal + `","deviceType":"unregistered_model","alias":"未注册型号","updatedAt":"` + now.Format(time.RFC3339) + `"},
+		{"id":"` + noTypeID + `","platform":"ios","externalId":"` + noTypeExternal + `","alias":"无型号无 MAC","updatedAt":"` + now.Format(time.RFC3339) + `"}]}`
+
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	type deviceView struct {
+		Platform        string          `json:"platform"`
+		ExternalID      string          `json:"externalId"`
+		DeviceType      *string         `json:"deviceType"`
+		Vendor          *string         `json:"vendor"`
+		FirmwareVersion *string         `json:"firmwareVersion"`
+		Compatibility   json.RawMessage `json:"compatibility"`
+	}
+
+	str := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+
+	cases := []struct {
+		name         string
+		key          string
+		wantType     string
+		wantVendor   string
+		wantFirmware string
+		wantCompat   bool
+	}{
+		{"按 MAC 关联公共库推导型号", "android/" + androidMAC, "nordic_uart", "Nordic Semiconductor", "nRF Connect SDK v2.9.0", true},
+		{"iOS 上报型号后回退到型号元数据", "ios/" + iosExternal, "environmental_sensor", "Bluetooth SIG", "", true},
+		{"未注册型号降级为 null", "ios/" + unknownExternal, "unregistered_model", "", "", false},
+		{"无型号无 MAC 全部降级为 null", "ios/" + noTypeExternal, "", "", "", false},
+	}
+
+	t.Run("设备列表字段补全", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		items := decode[itemsResponse[deviceView]](t, rec).Items
+		if len(items) != len(cases) {
+			t.Fatalf("设备数量=%d body=%s", len(items), rec.Body.String())
+		}
+		byKey := map[string]deviceView{}
+		for _, d := range items {
+			byKey[d.Platform+"/"+d.ExternalID] = d
+		}
+		for _, tc := range cases {
+			got, ok := byKey[tc.key]
+			if !ok {
+				t.Fatalf("缺少设备 %s", tc.key)
+			}
+			if tc.wantType == "" {
+				if got.DeviceType != nil {
+					t.Fatalf("%s: deviceType 应为 null，实际 %q", tc.name, str(got.DeviceType))
+				}
+			} else if str(got.DeviceType) != tc.wantType {
+				t.Fatalf("%s: deviceType=%q want %q", tc.name, str(got.DeviceType), tc.wantType)
+			}
+			if tc.wantVendor == "" {
+				if got.Vendor != nil {
+					t.Fatalf("%s: vendor 应为 null，实际 %q", tc.name, str(got.Vendor))
+				}
+			} else if str(got.Vendor) != tc.wantVendor {
+				t.Fatalf("%s: vendor=%q want %q", tc.name, str(got.Vendor), tc.wantVendor)
+			}
+			if tc.wantFirmware == "" {
+				if got.FirmwareVersion != nil {
+					t.Fatalf("%s: firmwareVersion 应为 null，实际 %q", tc.name, str(got.FirmwareVersion))
+				}
+			} else if str(got.FirmwareVersion) != tc.wantFirmware {
+				t.Fatalf("%s: firmwareVersion=%q want %q", tc.name, str(got.FirmwareVersion), tc.wantFirmware)
+			}
+			if isJSONNull(got.Compatibility) != !tc.wantCompat {
+				t.Fatalf("%s: compatibility=%s", tc.name, got.Compatibility)
+			}
+		}
+	})
+
+	t.Run("单台设备查询字段一致", func(t *testing.T) {
+		for _, tc := range cases {
+			rec := do(t, h, http.MethodGet, "/api/v1/my/devices/"+tc.key, "", user.Token, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: status=%d body=%s", tc.name, rec.Code, rec.Body.String())
+			}
+			got := decode[deviceView](t, rec)
+			if str(got.DeviceType) != tc.wantType || str(got.Vendor) != tc.wantVendor {
+				t.Fatalf("%s: 单查字段不一致 %+v", tc.name, got)
+			}
+		}
+	})
+
+	t.Run("catalog 固件与配件字段完整", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/device-types/environmental_sensor/catalog", "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		catalog := decode[struct {
+			DeviceType struct {
+				Type          string          `json:"type"`
+				Compatibility json.RawMessage `json:"compatibility"`
+			} `json:"deviceType"`
+			Firmwares []struct {
+				ID            string          `json:"id"`
+				Vendor        string          `json:"vendor"`
+				Compatibility json.RawMessage `json:"compatibility"`
+			} `json:"firmwares"`
+			Accessories []struct {
+				ID            string          `json:"id"`
+				Name          string          `json:"name"`
+				SKU           string          `json:"sku"`
+				Vendor        string          `json:"vendor"`
+				Compatibility json.RawMessage `json:"compatibility"`
+			} `json:"accessories"`
+		}](t, rec)
+
+		if catalog.DeviceType.Type != "environmental_sensor" || isJSONNull(catalog.DeviceType.Compatibility) {
+			t.Fatalf("deviceType 兼容性缺失: %s", rec.Body.String())
+		}
+		if len(catalog.Firmwares) == 0 {
+			t.Fatalf("固件列表为空: %s", rec.Body.String())
+		}
+		fw := catalog.Firmwares[0]
+		if fw.Vendor != "Espressif Systems" || isJSONNull(fw.Compatibility) {
+			t.Fatalf("固件字段不完整: %+v", fw)
+		}
+		if len(catalog.Accessories) == 0 {
+			t.Fatalf("配件列表为空: %s", rec.Body.String())
+		}
+		acc := catalog.Accessories[0]
+		if acc.Vendor == "" || acc.Name == "" || isJSONNull(acc.Compatibility) {
+			t.Fatalf("配件字段不完整: %+v", acc)
+		}
+
+		// 市场筛选用到的 sku/name 键必须存在（值可为空字符串）。
+		var raw struct {
+			Accessories []map[string]json.RawMessage `json:"accessories"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("解析原始 catalog 失败: %v", err)
+		}
+		for _, a := range raw.Accessories {
+			for _, key := range []string{"sku", "name", "vendor", "compatibility"} {
+				if _, ok := a[key]; !ok {
+					t.Fatalf("配件缺少字段 %q: %+v", key, a)
+				}
+			}
+		}
+	})
+}
+
+// isJSONNull 判断 RawMessage 是否等价于 JSON null（含字段缺省）。
+func isJSONNull(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed == "" || trimmed == "null"
+}
+
 // TestUnauthorizedDoesNotIssueToken 固化 401 契约：
 // token 失效时只返回错误体，绝不自动新建匿名账号或下发新 token。
 func TestUnauthorizedDoesNotIssueToken(t *testing.T) {

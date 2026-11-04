@@ -22,7 +22,7 @@ func (q *Queries) DeviceTypeExists(ctx context.Context, type_ string) (bool, err
 }
 
 const getDeviceType = `-- name: GetDeviceType :one
-SELECT type, name, vendor, description
+SELECT type, name, vendor, description, compatibility
 FROM device_types
 WHERE type = $1
 `
@@ -35,6 +35,7 @@ func (q *Queries) GetDeviceType(ctx context.Context, type_ string) (DeviceType, 
 		&i.Name,
 		&i.Vendor,
 		&i.Description,
+		&i.Compatibility,
 	)
 	return i, err
 }
@@ -69,27 +70,39 @@ func (q *Queries) GetPublicDevice(ctx context.Context, mac string) (GetPublicDev
 }
 
 const listAccessoriesByDeviceType = `-- name: ListAccessoriesByDeviceType :many
-SELECT id, device_type, name, sku, description
+SELECT id, device_type, name, sku, vendor, description, compatibility
 FROM accessories
 WHERE device_type = $1
 ORDER BY id
 `
 
-func (q *Queries) ListAccessoriesByDeviceType(ctx context.Context, deviceType string) ([]Accessory, error) {
+type ListAccessoriesByDeviceTypeRow struct {
+	ID            string
+	DeviceType    string
+	Name          string
+	Sku           string
+	Vendor        string
+	Description   string
+	Compatibility json.RawMessage
+}
+
+func (q *Queries) ListAccessoriesByDeviceType(ctx context.Context, deviceType string) ([]ListAccessoriesByDeviceTypeRow, error) {
 	rows, err := q.db.QueryContext(ctx, listAccessoriesByDeviceType, deviceType)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Accessory{}
+	items := []ListAccessoriesByDeviceTypeRow{}
 	for rows.Next() {
-		var i Accessory
+		var i ListAccessoriesByDeviceTypeRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.DeviceType,
 			&i.Name,
 			&i.Sku,
+			&i.Vendor,
 			&i.Description,
+			&i.Compatibility,
 		); err != nil {
 			return nil, err
 		}
@@ -140,7 +153,7 @@ func (q *Queries) ListAllGATTServices(ctx context.Context) ([]ListAllGATTService
 }
 
 const listDeviceTypes = `-- name: ListDeviceTypes :many
-SELECT type, name, vendor, description
+SELECT type, name, vendor, description, compatibility
 FROM device_types
 ORDER BY type
 `
@@ -159,6 +172,7 @@ func (q *Queries) ListDeviceTypes(ctx context.Context) ([]DeviceType, error) {
 			&i.Name,
 			&i.Vendor,
 			&i.Description,
+			&i.Compatibility,
 		); err != nil {
 			return nil, err
 		}
@@ -174,27 +188,39 @@ func (q *Queries) ListDeviceTypes(ctx context.Context) ([]DeviceType, error) {
 }
 
 const listFirmwaresByDeviceType = `-- name: ListFirmwaresByDeviceType :many
-SELECT id, device_type, version, release_notes, released_at
+SELECT id, device_type, version, vendor, release_notes, released_at, compatibility
 FROM firmwares
 WHERE device_type = $1
 ORDER BY released_at DESC, version DESC
 `
 
-func (q *Queries) ListFirmwaresByDeviceType(ctx context.Context, deviceType string) ([]Firmware, error) {
+type ListFirmwaresByDeviceTypeRow struct {
+	ID            string
+	DeviceType    string
+	Version       string
+	Vendor        string
+	ReleaseNotes  string
+	ReleasedAt    string
+	Compatibility json.RawMessage
+}
+
+func (q *Queries) ListFirmwaresByDeviceType(ctx context.Context, deviceType string) ([]ListFirmwaresByDeviceTypeRow, error) {
 	rows, err := q.db.QueryContext(ctx, listFirmwaresByDeviceType, deviceType)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Firmware{}
+	items := []ListFirmwaresByDeviceTypeRow{}
 	for rows.Next() {
-		var i Firmware
+		var i ListFirmwaresByDeviceTypeRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.DeviceType,
 			&i.Version,
+			&i.Vendor,
 			&i.ReleaseNotes,
 			&i.ReleasedAt,
+			&i.Compatibility,
 		); err != nil {
 			return nil, err
 		}

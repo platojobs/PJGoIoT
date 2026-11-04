@@ -10,6 +10,7 @@ package lww
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/platojobs/PJGoIoT/internal/model"
@@ -82,6 +83,17 @@ func SameContent(server *model.UserDevice, client model.PushDevice) bool {
 	}
 	if (server.DeletedAt != nil) != client.Deleted {
 		return false
+	}
+	// 仅当客户端上报了 deviceType 时才比较：旧客户端不传该字段，
+	// 不应因其缺失而与服务端（含由 mac 推导的型号）产生冲突。
+	if client.DeviceType != "" {
+		serverType := ""
+		if server.DeviceType != nil {
+			serverType = *server.DeviceType
+		}
+		if !strings.EqualFold(serverType, client.DeviceType) {
+			return false
+		}
 	}
 	return jsonEqual(server.Rules, client.Rules) && jsonEqual(server.ScanRecords, client.ScanRecords)
 }

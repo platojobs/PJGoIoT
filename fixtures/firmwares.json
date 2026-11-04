@@ -3,14 +3,28 @@
     "id": "fw-nrf-ncs-2.9.0",
     "deviceType": "nordic_uart",
     "version": "nRF Connect SDK v2.9.0",
+    "vendor": "Nordic Semiconductor",
     "releaseNotes": "Nordic Semiconductor 官方 nRF Connect SDK 发布版本。此处作为开发板参考固件版本，量产设备的具体固件版本以厂商发布为准。",
-    "releasedAt": ""
+    "releasedAt": "",
+    "compatibility": {
+      "platforms": ["android", "ios"],
+      "minAppVersion": "1.0.0",
+      "protocol": "ble-gatt",
+      "features": ["uart-transparent"]
+    }
   },
   {
     "id": "fw-esp-idf-5.2.2",
     "deviceType": "environmental_sensor",
     "version": "ESP-IDF v5.2.2",
+    "vendor": "Espressif Systems",
     "releaseNotes": "Espressif 官方 ESP-IDF 发布版本。此处作为开发板参考固件版本，量产设备的具体固件版本以厂商发布为准。",
-    "releasedAt": ""
+    "releasedAt": "",
+    "compatibility": {
+      "platforms": ["android", "ios"],
+      "minAppVersion": "1.0.0",
+      "protocol": "ble-gatt",
+      "features": ["temperature", "humidity", "pressure"]
+    }
   }
 ]

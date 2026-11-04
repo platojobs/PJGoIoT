@@ -277,6 +277,83 @@ func TestPostgresStoreIntegration(t *testing.T) {
 			t.Fatalf("换 id 后设备数量=%d", len(list))
 		}
 	})
+
+	t.Run("公共元数据补全与缺失降级", func(t *testing.T) {
+		// 000004 迁移为种子公共设备补齐了型号/厂商/固件/兼容性。
+		android, err := st.GetUserDeviceByKey(context.Background(), userC, "android", "AA:BB:CC:00:00:03")
+		if err != nil {
+			t.Fatalf("查询 Android 设备失败: %v", err)
+		}
+		if android.DeviceType == nil || *android.DeviceType != "nordic_uart" {
+			t.Fatalf("Android deviceType=%v", android.DeviceType)
+		}
+		if android.Vendor == nil || *android.Vendor != "Nordic Semiconductor" {
+			t.Fatalf("Android vendor=%v", android.Vendor)
+		}
+		if android.FirmwareVersion == nil || *android.FirmwareVersion != "nRF Connect SDK v2.9.0" {
+			t.Fatalf("Android firmwareVersion=%v", android.FirmwareVersion)
+		}
+		if len(android.Compatibility) == 0 || string(android.Compatibility) == "{}" {
+			t.Fatalf("Android compatibility=%s", android.Compatibility)
+		}
+
+		// iOS 未上报型号且无 MAC：字段降级为 null，读取本身仍成功。
+		ios, err := st.GetUserDeviceByKey(context.Background(), userC, "ios", "E621E1F8-C36C-495A-93FC-0C247A3E6E5F")
+		if err != nil {
+			t.Fatalf("查询 iOS 设备失败: %v", err)
+		}
+		if ios.DeviceType != nil || ios.Vendor != nil || ios.FirmwareVersion != nil || len(ios.Compatibility) != 0 {
+			t.Fatalf("iOS 缺失关联时应为 null: %+v", ios)
+		}
+
+		// 客户端上报型号但无 MAC：按 device_types 回退补全厂商与型号级兼容性。
+		typedExternal := "0F1E2D3C-4B5A-4968-8777-666655554444"
+		typedReq := model.PushRequest{ClientID: "typed", Devices: []model.PushDevice{{
+			ID: uuid.NewString(), Platform: "ios", ExternalID: typedExternal,
+			DeviceType: "environmental_sensor", Alias: "上报型号",
+			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(3 * time.Minute),
+		}}}
+		if _, _, err := st.Push(context.Background(), userC, typedReq, store.PushOptions{}); err != nil {
+			t.Fatalf("上报型号 push 失败: %v", err)
+		}
+		typed, err := st.GetUserDeviceByKey(context.Background(), userC, "ios", typedExternal)
+		if err != nil {
+			t.Fatalf("查询上报型号设备失败: %v", err)
+		}
+		if typed.DeviceType == nil || *typed.DeviceType != "environmental_sensor" {
+			t.Fatalf("deviceType=%v", typed.DeviceType)
+		}
+		if typed.Vendor == nil || *typed.Vendor != "Bluetooth SIG" {
+			t.Fatalf("vendor=%v", typed.Vendor)
+		}
+		if typed.FirmwareVersion != nil {
+			t.Fatalf("无 MAC 时 firmwareVersion 应为 null: %v", typed.FirmwareVersion)
+		}
+		if len(typed.Compatibility) == 0 || string(typed.Compatibility) == "{}" {
+			t.Fatalf("compatibility=%s", typed.Compatibility)
+		}
+
+		// 未注册型号：写入与读取都不报错，关联字段为 null。
+		unknownExternal := "9A8B7C6D-5E4F-4A3B-8C2D-1E0F9A8B7C6D"
+		unknownReq := model.PushRequest{ClientID: "unknown", Devices: []model.PushDevice{{
+			ID: uuid.NewString(), Platform: "ios", ExternalID: unknownExternal,
+			DeviceType: "unregistered_model", Alias: "未注册",
+			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(4 * time.Minute),
+		}}}
+		if _, _, err := st.Push(context.Background(), userC, unknownReq, store.PushOptions{}); err != nil {
+			t.Fatalf("未注册型号 push 不应报错: %v", err)
+		}
+		unknown, err := st.GetUserDeviceByKey(context.Background(), userC, "ios", unknownExternal)
+		if err != nil {
+			t.Fatalf("未注册型号查询不应报错: %v", err)
+		}
+		if unknown.DeviceType == nil || *unknown.DeviceType != "unregistered_model" {
+			t.Fatalf("deviceType=%v", unknown.DeviceType)
+		}
+		if unknown.Vendor != nil || unknown.FirmwareVersion != nil || len(unknown.Compatibility) != 0 {
+			t.Fatalf("未注册型号关联字段应为 null: %+v", unknown)
+		}
+	})
 }
 
 func runMigrations(t *testing.T, dsn string) {

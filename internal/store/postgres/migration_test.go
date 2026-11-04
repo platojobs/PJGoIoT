@@ -20,9 +20,10 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
 )
 
-// TestMigrationBackfillsLegacyDevices 验证 000003 迁移：
+// TestMigrationBackfillsLegacyDevices 验证 000003 与 000004 迁移：
 // 旧 (user_id, mac) 记录在迁移后变为 platform=android、external_id=大写 MAC，
-// 仍可通过 MAC 读取；旧 change_log 也会补 platform/externalId 与新 entity_id。
+// 仍可通过 MAC 读取；旧 change_log 也会补 platform/externalId 与新 entity_id；
+// 000004 按 mac 回填 user_devices.device_type，并为固件/配件补厂商信息。
 //
 // 使用临时数据库，避免破坏 TEST_DATABASE_URL 指向的测试库。
 func TestMigrationBackfillsLegacyDevices(t *testing.T) {
@@ -124,6 +125,31 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 			payloadPlatform, payloadExternal, entityID, wantEntity)
 	}
 
+	// 000004：按 mac 关联公共库回填 device_type；未注册型号保持 NULL。
+	var deviceType sql.NullString
+	if err := db.QueryRow(`SELECT device_type FROM user_devices WHERE user_id = $1`, userID).
+		Scan(&deviceType); err != nil {
+		t.Fatalf("读取 device_type 回填失败: %v", err)
+	}
+	if !deviceType.Valid || deviceType.String != "nordic_uart" {
+		t.Fatalf("device_type 回填异常: valid=%v value=%q", deviceType.Valid, deviceType.String)
+	}
+
+	// 000004：为可核实的固件/配件补齐厂商，未核实的保持空字符串。
+	var fwVendor, accVendor string
+	if err := db.QueryRow(`SELECT vendor FROM firmwares WHERE id = 'fw-nrf-ncs-2.9.0'`).Scan(&fwVendor); err != nil {
+		t.Fatalf("读取固件厂商失败: %v", err)
+	}
+	if fwVendor != "Nordic Semiconductor" {
+		t.Fatalf("固件厂商回填异常: %q", fwVendor)
+	}
+	if err := db.QueryRow(`SELECT vendor FROM accessories WHERE id = 'acc-scale-aa-battery'`).Scan(&accVendor); err != nil {
+		t.Fatalf("读取配件厂商失败: %v", err)
+	}
+	if accVendor != "" {
+		t.Fatalf("未核实配件厂商应为空: %q", accVendor)
+	}
+
 	// 旧数据通过 Store 仍可读。
 	st, err := postgres.New(context.Background(), tempDSN)
 	if err != nil {
@@ -137,5 +163,8 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	}
 	if got.Platform != "android" || got.ExternalID != strings.ToUpper(legacyMAC) || got.Alias != "旧设备" || got.ServerSeq != 7 {
 		t.Fatalf("迁移后旧设备字段异常: %+v", got)
+	}
+	if got.DeviceType == nil || *got.DeviceType != "nordic_uart" {
+		t.Fatalf("迁移后旧设备型号异常: %+v", got.DeviceType)
 	}
 }

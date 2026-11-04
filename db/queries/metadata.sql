@@ -10,12 +10,12 @@ WHERE device_type = $1
 ORDER BY position, uuid;
 
 -- name: ListDeviceTypes :many
-SELECT type, name, vendor, description
+SELECT type, name, vendor, description, compatibility
 FROM device_types
 ORDER BY type;
 
 -- name: GetDeviceType :one
-SELECT type, name, vendor, description
+SELECT type, name, vendor, description, compatibility
 FROM device_types
 WHERE type = $1;
 
@@ -28,13 +28,13 @@ ORDER BY device_type, position, uuid;
 SELECT EXISTS (SELECT 1 FROM device_types WHERE type = $1) AS exists;
 
 -- name: ListFirmwaresByDeviceType :many
-SELECT id, device_type, version, release_notes, released_at
+SELECT id, device_type, version, vendor, release_notes, released_at, compatibility
 FROM firmwares
 WHERE device_type = $1
 ORDER BY released_at DESC, version DESC;
 
 -- name: ListAccessoriesByDeviceType :many
-SELECT id, device_type, name, sku, description
+SELECT id, device_type, name, sku, vendor, description, compatibility
 FROM accessories
 WHERE device_type = $1
 ORDER BY id;

@@ -13,11 +13,13 @@ import (
 )
 
 type Accessory struct {
-	ID          string
-	DeviceType  string
-	Name        string
-	Sku         string
-	Description string
+	ID            string
+	DeviceType    string
+	Name          string
+	Sku           string
+	Description   string
+	Vendor        string
+	Compatibility json.RawMessage
 }
 
 type ChangeLog struct {
@@ -31,18 +33,21 @@ type ChangeLog struct {
 }
 
 type DeviceType struct {
-	Type        string
-	Name        string
-	Vendor      string
-	Description string
+	Type          string
+	Name          string
+	Vendor        string
+	Description   string
+	Compatibility json.RawMessage
 }
 
 type Firmware struct {
-	ID           string
-	DeviceType   string
-	Version      string
-	ReleaseNotes string
-	ReleasedAt   string
+	ID            string
+	DeviceType    string
+	Version       string
+	ReleaseNotes  string
+	ReleasedAt    string
+	Vendor        string
+	Compatibility json.RawMessage
 }
 
 type GattService struct {
@@ -99,4 +104,5 @@ type UserDevice struct {
 	CreatedAt   time.Time
 	Platform    string
 	ExternalID  string
+	DeviceType  sql.NullString
 }

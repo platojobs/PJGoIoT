@@ -87,3 +87,36 @@ func TestDecide(t *testing.T) {
 		}
 	})
 }
+
+// TestDeviceTypeComparison 固化 deviceType 的比较规则：
+// 客户端上报型号时参与内容比较；旧客户端不传该字段时不影响幂等判定。
+func TestDeviceTypeComparison(t *testing.T) {
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+
+	server := serverAt(now)
+	serverType := "nordic_uart"
+	server.DeviceType = &serverType
+
+	t.Run("客户端上报相同型号视为内容一致", func(t *testing.T) {
+		client := clientAt(now, "服务端")
+		client.DeviceType = "nordic_uart"
+		if !SameContent(server, client) {
+			t.Fatalf("相同型号被判为不同内容")
+		}
+	})
+
+	t.Run("客户端上报不同型号判定为冲突", func(t *testing.T) {
+		client := clientAt(now, "服务端")
+		client.DeviceType = "smart_scale"
+		if SameContent(server, client) {
+			t.Fatalf("不同型号被判为内容一致")
+		}
+	})
+
+	t.Run("旧客户端不上报型号不影响幂等", func(t *testing.T) {
+		client := clientAt(now, "服务端")
+		if !SameContent(server, client) {
+			t.Fatalf("缺省 deviceType 不应造成冲突")
+		}
+	})
+}

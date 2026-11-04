@@ -27,29 +27,35 @@ type PublicDevice struct {
 
 // DeviceType 是设备类型（如体重秤、心率带）的公共描述。
 type DeviceType struct {
-	Type         string        `json:"type"`
-	Name         string        `json:"name"`
-	Vendor       string        `json:"vendor"`
-	Description  string        `json:"description"`
-	GATTServices []GATTService `json:"gattServices"`
+	Type          string          `json:"type"`
+	Name          string          `json:"name"`
+	Vendor        string          `json:"vendor"`
+	Description   string          `json:"description"`
+	GATTServices  []GATTService   `json:"gattServices"`
+	Compatibility json.RawMessage `json:"compatibility"`
 }
 
 // Firmware 是某一设备类型的固件版本记录。
+// vendor 标识固件发布方，compatibility 描述平台与协议支持，供市场模块筛选。
 type Firmware struct {
-	ID           string `json:"id"`
-	DeviceType   string `json:"deviceType"`
-	Version      string `json:"version"`
-	ReleaseNotes string `json:"releaseNotes"`
-	ReleasedAt   string `json:"releasedAt"`
+	ID            string          `json:"id"`
+	DeviceType    string          `json:"deviceType"`
+	Version       string          `json:"version"`
+	Vendor        string          `json:"vendor"`
+	ReleaseNotes  string          `json:"releaseNotes"`
+	ReleasedAt    string          `json:"releasedAt"`
+	Compatibility json.RawMessage `json:"compatibility"`
 }
 
 // Accessory 是某一设备类型的官方配件记录。
 type Accessory struct {
-	ID          string `json:"id"`
-	DeviceType  string `json:"deviceType"`
-	Name        string `json:"name"`
-	SKU         string `json:"sku"`
-	Description string `json:"description"`
+	ID            string          `json:"id"`
+	DeviceType    string          `json:"deviceType"`
+	Name          string          `json:"name"`
+	SKU           string          `json:"sku"`
+	Vendor        string          `json:"vendor"`
+	Description   string          `json:"description"`
+	Compatibility json.RawMessage `json:"compatibility"`
 }
 
 // DeviceCatalog 汇总某设备类型的元数据、固件与配件。
@@ -63,27 +69,38 @@ type DeviceCatalog struct {
 // UserDevice 是用户私有设备记录。id 由客户端生成，serverSeq 由服务端同步序列填充。
 // 唯一键为 (user_id, platform, externalId)：Android 的 externalId 为大写 MAC，
 // iOS 的 externalId 为 CBPeripheral.identifier。mac 仅作为可选元数据保留。
+//
+// deviceType / vendor / firmwareVersion / compatibility 由公共元数据关联得到：
+// deviceType 优先取用户记录中的值，缺失时按 mac 匹配 public_devices；
+// 其余字段按 mac（public_devices）或 deviceType（device_types）解析。
+// 关联缺失时对应字段为 JSON null，不影响用户记录本身返回。
 type UserDevice struct {
-	ID          string          `json:"id"`
-	ClientID    string          `json:"clientId"`
-	Platform    string          `json:"platform"`
-	ExternalID  string          `json:"externalId"`
-	MAC         string          `json:"mac,omitempty"`
-	Alias       string          `json:"alias"`
-	Group       string          `json:"group"`
-	Rules       json.RawMessage `json:"rules"`
-	ScanRecords json.RawMessage `json:"scanRecords"`
-	UpdatedAt   time.Time       `json:"updatedAt"`
-	DeletedAt   *time.Time      `json:"deletedAt,omitempty"`
-	ServerSeq   int64           `json:"serverSeq"`
+	ID              string          `json:"id"`
+	ClientID        string          `json:"clientId"`
+	Platform        string          `json:"platform"`
+	ExternalID      string          `json:"externalId"`
+	MAC             string          `json:"mac,omitempty"`
+	Alias           string          `json:"alias"`
+	Group           string          `json:"group"`
+	Rules           json.RawMessage `json:"rules"`
+	ScanRecords     json.RawMessage `json:"scanRecords"`
+	UpdatedAt       time.Time       `json:"updatedAt"`
+	DeletedAt       *time.Time      `json:"deletedAt,omitempty"`
+	ServerSeq       int64           `json:"serverSeq"`
+	DeviceType      *string         `json:"deviceType"`
+	Vendor          *string         `json:"vendor"`
+	FirmwareVersion *string         `json:"firmwareVersion"`
+	Compatibility   json.RawMessage `json:"compatibility"`
 }
 
 // PushDevice 是客户端在一次 push 中提交的单台设备。
+// deviceType 可选；客户端已知型号时应上报，便于服务端关联公共元数据。
 type PushDevice struct {
 	ID          string          `json:"id"`
 	Platform    string          `json:"platform"`
 	ExternalID  string          `json:"externalId"`
 	MAC         string          `json:"mac,omitempty"`
+	DeviceType  string          `json:"deviceType,omitempty"`
 	Alias       string          `json:"alias"`
 	Group       string          `json:"group"`
 	Rules       json.RawMessage `json:"rules"`

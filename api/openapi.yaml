@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.3.1
+  version: 0.3.2
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -48,7 +48,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.3.1"
+                version: "0.3.2"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -185,6 +185,8 @@ paths:
       description: |
         一次返回型号详情、固件列表与配件列表，不依赖 MAC，供 iOS 产品/市场/详情页使用。
         历史端点 `/device-types/{type}/firmwares` 与 `/device-types/{type}/accessories` 保持可用。
+        自 `0.3.2` 起，`firmwares` 与 `accessories` 均带 `vendor` 与 `compatibility`，
+        市场模块可按厂商与兼容性在客户端筛选；`deviceType.compatibility` 为型号级兼容性。
         空列表返回 `[]` 而不是 `null`。
       parameters:
         - $ref: "#/components/parameters/DeviceType"
@@ -697,10 +699,15 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GATTService"
+        compatibility:
+          allOf:
+            - $ref: "#/components/schemas/Compatibility"
+          nullable: true
+          description: 型号级兼容性；未核实的型号为 null
 
     Firmware:
       type: object
-      required: [id, deviceType, version, releaseNotes, releasedAt]
+      required: [id, deviceType, version, vendor, releaseNotes, releasedAt, compatibility]
       properties:
         id:
           type: string
@@ -708,15 +715,23 @@ components:
           type: string
         version:
           type: string
+        vendor:
+          type: string
+          description: 固件发布方；未核实的记录为空字符串，不编造
         releaseNotes:
           type: string
         releasedAt:
           type: string
           description: 发布日期；未核实的记录为空字符串，不编造
+        compatibility:
+          allOf:
+            - $ref: "#/components/schemas/Compatibility"
+          nullable: true
+          description: 固件兼容性；供市场模块按平台/协议筛选
 
     Accessory:
       type: object
-      required: [id, deviceType, name, sku, description]
+      required: [id, deviceType, name, sku, vendor, description, compatibility]
       properties:
         id:
           type: string
@@ -726,8 +741,17 @@ components:
           type: string
         sku:
           type: string
+          description: 厂商 SKU；未核实的记录为空字符串，不编造
+        vendor:
+          type: string
+          description: 配件厂商；通用配件可为空字符串
         description:
           type: string
+        compatibility:
+          allOf:
+            - $ref: "#/components/schemas/Compatibility"
+          nullable: true
+          description: 配件兼容性（如 `deviceTypes`）；供市场模块按适配型号筛选
 
     DeviceCatalog:
       type: object
@@ -791,6 +815,26 @@ components:
           type: integer
           format: int64
           description: 最近一次写入对应的 change_log seq
+        deviceType:
+          type: string
+          nullable: true
+          description: |
+            设备所属型号，用于 iOS/Android 详情页直接展示。
+            优先取用户记录上报的 `deviceType`，缺失时按 `mac` 关联公共设备元数据；
+            均未命中时为 null（不报错）。
+        vendor:
+          type: string
+          nullable: true
+          description: 厂商；按 `mac` 关联公共元数据，缺失时回退到型号元数据，仍无则为 null
+        firmwareVersion:
+          type: string
+          nullable: true
+          description: 参考固件版本，来自公共设备元数据；未命中时为 null
+        compatibility:
+          allOf:
+            - $ref: "#/components/schemas/Compatibility"
+          nullable: true
+          description: 兼容性；优先取公共设备元数据，缺失时回退到型号元数据，仍无则为 null
 
     PushDevice:
       type: object
@@ -816,6 +860,12 @@ components:
         mac:
           type: string
           description: 可选 MAC 元数据；Android 会自动填充为小写 MAC，iOS 可省略
+        deviceType:
+          type: string
+          maxLength: 64
+          description: |
+            可选设备型号（如 `nordic_uart`），服务端统一转小写。
+            上报后可用于关联公共元数据；缺省时服务端尝试按 `mac` 推导。
         alias:
           type: string
           maxLength: 100

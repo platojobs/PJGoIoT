@@ -3,12 +3,14 @@
 package fixture
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -253,7 +255,7 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 		if d.DeletedAt != nil {
 			continue
 		}
-		out = append(out, *d)
+		out = append(out, s.enrichUserDevice(*d))
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if !out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
@@ -284,7 +286,7 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	if found == nil {
 		return model.UserDevice{}, store.ErrNotFound
 	}
-	return *found, nil
+	return s.enrichUserDevice(*found), nil
 }
 
 // GetUserDeviceByKey 实现 store.Store。
@@ -299,7 +301,73 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 	if !ok || d.DeletedAt != nil {
 		return model.UserDevice{}, store.ErrNotFound
 	}
-	return *d, nil
+	return s.enrichUserDevice(*d), nil
+}
+
+// enrichUserDevice 用 fixtures 中的公共元数据补全型号、厂商、固件版本与兼容性。
+// 关联缺失时字段为 nil（JSON null），不产生错误。
+func (s *Store) enrichUserDevice(d model.UserDevice) model.UserDevice {
+	resolved := ""
+	if d.DeviceType != nil {
+		resolved = *d.DeviceType
+	}
+	var public *model.PublicDevice
+	if d.MAC != "" {
+		if pd, ok := s.publicDevices[d.MAC]; ok {
+			public = &pd
+		}
+	}
+	if resolved == "" && public != nil {
+		resolved = public.DeviceType
+	}
+	if resolved == "" {
+		d.DeviceType = nil
+	} else {
+		dt := resolved
+		d.DeviceType = &dt
+	}
+
+	var typeVendor string
+	var typeCompatibility json.RawMessage
+	for _, dt := range s.deviceTypes {
+		if dt.Type == resolved {
+			typeVendor = dt.Vendor
+			typeCompatibility = dt.Compatibility
+			break
+		}
+	}
+
+	d.Vendor = nil
+	d.FirmwareVersion = nil
+	d.Compatibility = nil
+	if public != nil {
+		if public.Vendor != "" {
+			v := public.Vendor
+			d.Vendor = &v
+		}
+		if public.FirmwareVersion != "" {
+			v := public.FirmwareVersion
+			d.FirmwareVersion = &v
+		}
+		if !emptyJSON(public.Compatibility) {
+			d.Compatibility = public.Compatibility
+		}
+	}
+	if d.Vendor == nil && typeVendor != "" {
+		v := typeVendor
+		d.Vendor = &v
+	}
+	if d.Compatibility == nil && !emptyJSON(typeCompatibility) {
+		d.Compatibility = typeCompatibility
+	}
+	return d
+}
+
+// emptyJSON 判断兼容性字段是否为空。
+func emptyJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) ||
+		bytes.Equal(trimmed, []byte("[]")) || bytes.Equal(trimmed, []byte("null"))
 }
 
 // Push 实现 store.Store。
@@ -332,6 +400,12 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			return model.PushResult{}, false, fmt.Errorf("设备键非法: %w", err)
 		}
 		dev.Platform, dev.ExternalID, dev.MAC = platform, externalID, mac
+		dev.DeviceType = strings.ToLower(strings.TrimSpace(dev.DeviceType))
+		if dev.DeviceType == "" && dev.MAC != "" {
+			if pd, ok := s.publicDevices[dev.MAC]; ok {
+				dev.DeviceType = pd.DeviceType
+			}
+		}
 
 		key := deviceKey(dev.Platform, dev.ExternalID)
 		existingByID := data.byID[dev.ID]
@@ -339,7 +413,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if existingByID != nil && keyHolder != nil && keyHolder.ID != existingByID.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: "key_taken", Server: *keyHolder, Client: dev,
+				Reason: "key_taken", Server: s.enrichUserDevice(*keyHolder), Client: dev,
 			})
 			continue
 		}
@@ -348,12 +422,16 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if existing == nil {
 			existing = keyHolder
 		}
+		// 客户端未上报型号且公共库无关联时，沿用已存型号，避免更新把字段清空。
+		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
+			dev.DeviceType = *existing.DeviceType
+		}
 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: decision.Reason, Server: *existing, Client: dev,
+				Reason: decision.Reason, Server: s.enrichUserDevice(*existing), Client: dev,
 			})
 			continue
 		}
@@ -384,6 +462,11 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			deletedAt := decision.EffectiveUpdatedAt
 			record.DeletedAt = &deletedAt
 		}
+		if dev.DeviceType != "" {
+			dt := dev.DeviceType
+			record.DeviceType = &dt
+		}
+		*record = s.enrichUserDevice(*record)
 
 		if existing != nil {
 			delete(data.byID, existing.ID)

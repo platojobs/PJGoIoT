@@ -48,6 +48,7 @@ type pushDevicePayload struct {
 	Platform    string          `json:"platform" binding:"omitempty,oneof=android ios"`
 	ExternalID  string          `json:"externalId" binding:"max=128"`
 	MAC         string          `json:"mac" binding:"max=64"`
+	DeviceType  string          `json:"deviceType" binding:"omitempty,max=64"`
 	Alias       string          `json:"alias" binding:"max=100"`
 	Group       string          `json:"group" binding:"max=64"`
 	Rules       json.RawMessage `json:"rules"`
@@ -65,6 +66,7 @@ func (p pushPayload) toModel() model.PushRequest {
 			Platform:    d.Platform,
 			ExternalID:  d.ExternalID,
 			MAC:         d.MAC,
+			DeviceType:  d.DeviceType,
 			Alias:       d.Alias,
 			Group:       d.Group,
 			Rules:       d.Rules,
@@ -121,6 +123,10 @@ func normalizePush(req *model.PushRequest) error {
 		dev.Alias = strings.TrimSpace(dev.Alias)
 		if len([]rune(dev.Alias)) > maxAliasLength {
 			return fmt.Errorf("devices[%d].alias 长度不能超过 %d", i, maxAliasLength)
+		}
+		dev.DeviceType = strings.ToLower(strings.TrimSpace(dev.DeviceType))
+		if len([]rune(dev.DeviceType)) > 64 {
+			return fmt.Errorf("devices[%d].deviceType 长度不能超过 64", i)
 		}
 		dev.Group = strings.TrimSpace(dev.Group)
 		if len([]rune(dev.Group)) > maxGroupLength {

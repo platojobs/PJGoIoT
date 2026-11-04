@@ -2,11 +2,13 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,6 +104,7 @@ func (s *Store) ListDeviceTypes(ctx context.Context) ([]model.DeviceType, error)
 		out = append(out, model.DeviceType{
 			Type: row.Type, Name: row.Name, Vendor: row.Vendor,
 			Description: row.Description, GATTServices: services,
+			Compatibility: row.Compatibility,
 		})
 	}
 	return out, nil
@@ -123,6 +126,7 @@ func (s *Store) GetDeviceType(ctx context.Context, deviceType string) (model.Dev
 	return model.DeviceType{
 		Type: row.Type, Name: row.Name, Vendor: row.Vendor,
 		Description: row.Description, GATTServices: mapGATTServices(services),
+		Compatibility: row.Compatibility,
 	}, nil
 }
 
@@ -145,7 +149,8 @@ func (s *Store) ListFirmwares(ctx context.Context, deviceType string) ([]model.F
 	for _, row := range rows {
 		out = append(out, model.Firmware{
 			ID: row.ID, DeviceType: row.DeviceType, Version: row.Version,
-			ReleaseNotes: row.ReleaseNotes, ReleasedAt: row.ReleasedAt,
+			Vendor: row.Vendor, ReleaseNotes: row.ReleaseNotes, ReleasedAt: row.ReleasedAt,
+			Compatibility: row.Compatibility,
 		})
 	}
 	return out, nil
@@ -161,7 +166,8 @@ func (s *Store) ListAccessories(ctx context.Context, deviceType string) ([]model
 	for _, row := range rows {
 		out = append(out, model.Accessory{
 			ID: row.ID, DeviceType: row.DeviceType, Name: row.Name,
-			SKU: row.Sku, Description: row.Description,
+			SKU: row.Sku, Vendor: row.Vendor, Description: row.Description,
+			Compatibility: row.Compatibility,
 		})
 	}
 	return out, nil
@@ -221,7 +227,7 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 	}
 	out := make([]model.UserDevice, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, mapUserDevice(row))
+		out = append(out, s.enrichUserDevice(ctx, s.q, mapUserDevice(row)))
 	}
 	return out, nil
 }
@@ -239,7 +245,7 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 		}
 		return model.UserDevice{}, fmt.Errorf("查询用户设备失败: %w", err)
 	}
-	return mapUserDevice(row), nil
+	return s.enrichUserDevice(ctx, s.q, mapUserDevice(row)), nil
 }
 
 // GetUserDeviceByKey 实现 store.Store。
@@ -257,7 +263,7 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 		}
 		return model.UserDevice{}, fmt.Errorf("查询用户设备失败: %w", err)
 	}
-	return mapUserDevice(row), nil
+	return s.enrichUserDevice(ctx, s.q, mapUserDevice(row)), nil
 }
 
 // Push 实现 store.Store。所有设备、变更日志与幂等记录在同一事务内写入。
@@ -309,6 +315,13 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			return model.PushResult{}, false, fmt.Errorf("设备键非法: %w", err)
 		}
 		dev.Platform, dev.ExternalID, dev.MAC = platform, externalID, mac
+		dev.DeviceType = strings.ToLower(strings.TrimSpace(dev.DeviceType))
+		// 客户端未上报型号时，按 mac 关联公共库推导，保证旧客户端也能拿到元数据。
+		if dev.DeviceType == "" && dev.MAC != "" {
+			if pd, lookupErr := q.GetPublicDevice(ctx, dev.MAC); lookupErr == nil && pd.DeviceType != "" {
+				dev.DeviceType = pd.DeviceType
+			}
+		}
 
 		devID, err := uuid.Parse(dev.ID)
 		if err != nil {
@@ -321,6 +334,10 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		// 复合键已存在但客户端 id 不同：视为同一设备的新 id（upsert），沿用已有记录。
 		if existing == nil && keyHolder != nil {
 			existing, keyHolder = keyHolder, nil
+		}
+		// 客户端未上报型号且公共库无关联时，沿用已存型号，避免更新把字段清空。
+		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
+			dev.DeviceType = *existing.DeviceType
 		}
 		if existing != nil && keyHolder != nil && existing.ID != keyHolder.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
@@ -368,6 +385,12 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			record.DeletedAt = &decision.EffectiveUpdatedAt
 			deletedAt = sql.NullTime{Time: decision.EffectiveUpdatedAt, Valid: true}
 		}
+		if dev.DeviceType != "" {
+			dt := dev.DeviceType
+			record.DeviceType = &dt
+		}
+		// 补全 vendor / firmwareVersion / compatibility；关联缺失时保持 null。
+		record = s.enrichUserDevice(ctx, q, record)
 
 		if existing == nil {
 			_, err = q.InsertUserDevice(ctx, sqlcgen.InsertUserDeviceParams{
@@ -375,7 +398,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
 				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
-				DeletedAt: deletedAt, ServerSeq: seq,
+				DeletedAt: deletedAt, ServerSeq: seq, DeviceType: nullableString(dev.DeviceType),
 			})
 		} else {
 			oldID, parseErr := uuid.Parse(existing.ID)
@@ -387,7 +410,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
 				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
-				DeletedAt: deletedAt, ServerSeq: seq,
+				DeletedAt: deletedAt, ServerSeq: seq, DeviceType: nullableString(dev.DeviceType),
 				UserID: uid, OldID: oldID,
 			})
 		}
@@ -535,7 +558,80 @@ func mapUserDevice(row sqlcgen.UserDevice) model.UserDevice {
 		t := row.DeletedAt.Time.UTC()
 		d.DeletedAt = &t
 	}
+	if row.DeviceType.Valid && strings.TrimSpace(row.DeviceType.String) != "" {
+		dt := strings.TrimSpace(row.DeviceType.String)
+		d.DeviceType = &dt
+	}
 	return d
+}
+
+// enrichUserDevice 用公共元数据补全型号、厂商、固件版本与兼容性。
+// 关联缺失（未注册型号、无 mac、无公共记录）时字段保持 nil，JSON 输出 null，不返回错误。
+func (s *Store) enrichUserDevice(ctx context.Context, q *sqlcgen.Queries, d model.UserDevice) model.UserDevice {
+	resolved := ""
+	if d.DeviceType != nil {
+		resolved = *d.DeviceType
+	}
+
+	var public *model.PublicDevice
+	if d.MAC != "" {
+		if row, err := q.GetPublicDevice(ctx, d.MAC); err == nil {
+			public = &model.PublicDevice{
+				MAC: row.Mac, Vendor: row.Vendor, Model: row.Model, DeviceType: row.DeviceType,
+				FirmwareVersion: row.FirmwareVersion, Compatibility: row.Compatibility,
+			}
+		}
+	}
+	if resolved == "" && public != nil {
+		resolved = public.DeviceType
+	}
+	if resolved == "" {
+		d.DeviceType = nil
+	} else {
+		dt := resolved
+		d.DeviceType = &dt
+	}
+
+	var typeVendor string
+	var typeCompatibility json.RawMessage
+	if resolved != "" {
+		if row, err := q.GetDeviceType(ctx, resolved); err == nil {
+			typeVendor = row.Vendor
+			typeCompatibility = row.Compatibility
+		}
+	}
+
+	d.Vendor = nil
+	d.FirmwareVersion = nil
+	d.Compatibility = nil
+	if public != nil {
+		if public.Vendor != "" {
+			v := public.Vendor
+			d.Vendor = &v
+		}
+		if public.FirmwareVersion != "" {
+			v := public.FirmwareVersion
+			d.FirmwareVersion = &v
+		}
+		if !emptyJSON(public.Compatibility) {
+			d.Compatibility = public.Compatibility
+		}
+	}
+	if d.Vendor == nil && typeVendor != "" {
+		v := typeVendor
+		d.Vendor = &v
+	}
+	if d.Compatibility == nil && !emptyJSON(typeCompatibility) {
+		d.Compatibility = typeCompatibility
+	}
+	return d
+}
+
+// emptyJSON 判断兼容性字段是否为空（NULL、{}、[] 或 null 视为无数据）。
+func emptyJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("{}")) ||
+		bytes.Equal(trimmed, []byte("[]")) || bytes.Equal(trimmed, []byte("null"))
 }
 
 func mapGATTServices(rows []sqlcgen.ListGATTServicesByDeviceTypeRow) []model.GATTService {
