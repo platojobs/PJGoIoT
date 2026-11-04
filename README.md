@@ -6,7 +6,7 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.3.1**（与 Android v0.3.1、iOS v0.3.0 联调对齐）
 
 ## 快速开始
 
@@ -61,10 +61,12 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/devices/{mac}` | 否 | 200 | 公共设备元数据（厂商、型号、固件、GATT、兼容性） |
 | GET | `/device-types` | 否 | 200 | 设备类型列表，`{"items":[...]}` |
 | GET | `/device-types/{type}` | 否 | 200 | 按类型查询设备类型元数据，供 iOS 等无法获取 MAC 的端使用 |
-| GET | `/device-types/{type}/firmwares` | 否 | 200 | 指定类型的固件列表 |
-| GET | `/device-types/{type}/accessories` | 否 | 200 | 指定类型的配件列表 |
+| GET | `/device-types/{type}/catalog` | 否 | 200 | 按类型聚合元数据、固件、配件，`{deviceType,firmwares,accessories}` |
+| GET | `/device-types/{type}/firmwares` | 否 | 200 | 指定类型的固件列表（历史端点，保持可用） |
+| GET | `/device-types/{type}/accessories` | 否 | 200 | 指定类型的配件列表（历史端点，保持可用） |
 | GET | `/my/devices` | Bearer | 200 | 当前用户未删除设备列表 |
-| GET | `/my/devices/{mac}` | Bearer | 200 | 按 MAC 元数据查单台设备（Android 为主；iOS 用列表 + platform/externalId） |
+| GET | `/my/devices/{mac}` | Bearer | 200 | 按 MAC 元数据查单台设备（仅 Android；iOS 用下一行接口） |
+| GET | `/my/devices/{platform}/{externalId}` | Bearer | 200 | 按设备唯一键查单台设备，iOS 无需 MAC |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}` |
 | POST | `/sync/push` | Bearer | 200 | 批量写入，`{applied,conflicts,nextCursor}` |
 
@@ -90,9 +92,19 @@ curl -s $BASE/device-types/nordic_uart
 curl -s $BASE/device-types/nordic_uart/firmwares
 curl -s $BASE/device-types/heart_rate_monitor/accessories
 
+# 4b. 聚合端点：一次拿到类型元数据 + 固件 + 配件（不依赖 MAC）
+curl -s $BASE/device-types/environmental_sensor/catalog
+
 # 5. 我的设备（401 示例与 200 示例）
 curl -i $BASE/my/devices
 curl -s $BASE/my/devices -H "Authorization: Bearer $TOKEN"
+
+# 5b. 按设备唯一键查单台（iOS：platform=ios + CBPeripheral.identifier）
+curl -s "$BASE/my/devices/ios/E621E1F8-C36C-495A-93FC-0C247A3E6E5F" \
+  -H "Authorization: Bearer $TOKEN"
+# Android 也可以按 (android, MAC) 查询；旧 MAC 路径仍可用
+curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01" -H "Authorization: Bearer $TOKEN"
+curl -s "$BASE/my/devices/AA:BB:CC:00:00:01" -H "Authorization: Bearer $TOKEN"
 
 # 6. 推送设备（带幂等键）
 # Android：platform=android，externalId 为大写 MAC，mac 可选（会自动补全）
@@ -189,6 +201,9 @@ PostgreSQL
 - iOS `externalId` = `CBPeripheral.identifier`（UUID，大写），不依赖 MAC。
 - `mac` 字段只作为可选元数据，禁止任何一端把 `mac` 当作唯一键。
 - `entityId` = `<userId>:<platform>:<externalId>`，由服务端派生；客户端不要自行拼接或解析。
+- 契约只增不删：新增了 `/device-types/{type}/catalog` 聚合端点与 `/my/devices/{platform}/{externalId}` 单台查询，历史端点保持不变。
+- 设备详情不再必须依赖 MAC：公共元数据用 `/device-types/{type}`，用户私有数据用 `/my/devices/{platform}/{externalId}`。
+- `401` 语义见下节；iOS 端已确认不在 401 后自动匿名重登。
 - 字段命名以 `api/openapi.yaml` 为准；若与 iOS 端 `docs/consistency.md` 有出入，需同步修改两份文档并在此处记录。
 
 ### 账号与鉴权
@@ -197,6 +212,18 @@ PostgreSQL
 - token 为不透明随机串：`pjiot_` + 32 字节随机数的 base64url 编码。
 - 数据库只存 SHA-256 哈希；`tokens.revoked_at` 支持吊销（`/auth/logout`）。
 - 私有接口用 `Authorization: Bearer <token>`，服务端按 token 哈希查出 `userId` 后再执行查询。
+- 服务端不会自动签发、轮换或续期 token；只有显式调用 `/auth/anonymous` 才会创建新账号与新 token。
+
+### 401 语义（客户端必须遵守）
+
+`401` 是明确的「token 失效」信号：token 缺失、无效或已被吊销。契约如下：
+
+1. 客户端应提示用户重新登录，并保留本地待同步数据；不得静默丢弃或覆盖。
+2. **不得**在收到 401 后自动调用 `POST /auth/anonymous`。自动重登会创建新的 `userId`，导致
+   原账号的设备列表与 `sync` 游标失联，出现「数据消失 / 重复同步 / 跨账号串数据」。
+3. 401 响应只包含 `{"error":{"code":"UNAUTHORIZED","message":"..."}}`，不会下发新 token，也不返回 `userId`。
+4. 重新登录是用户显式操作；登录成功后客户端应重新拉取 `/my/devices` 与从 `cursor=0` 或本地保存的游标继续同步。
+5. 匿名账号一旦丢失 token 且无其他登录方式，旧数据不可恢复；这是匿名模式的固有限制，客户端应在 UI 明确提示。
 
 ### 同步模型
 
@@ -246,7 +273,7 @@ PJGoIoT/
 │   ├── lww/lww.go                # LWW 判定
 │   ├── model/model.go            # 对外 JSON 领域模型
 │   ├── store/                    # Store 接口 + fixture/postgres 实现
-│   └── validate/mac.go           # MAC 规范化
+│   └── validate/                 # MAC / platform / externalId 规范化
 ├── Dockerfile                    # 多阶段 + distroless
 ├── docker-compose.yml            # Postgres + migrate + api
 ├── Makefile
@@ -266,7 +293,7 @@ PJGoIoT/
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.1.0` | 健康接口与日志中展示的版本 |
+| `APP_VERSION` | `0.3.1` | 健康接口与日志中展示的版本 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -301,9 +328,9 @@ seed 数据来源与边界：
 
 测试覆盖：
 
-- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、限流。
+- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定。
-- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离。
+- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404。
 - `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到 version=3，验证回填、旧数据可读与 entity_id。
 
 本机实际执行结果（2026-11-05）：
@@ -315,6 +342,9 @@ seed 数据来源与边界：
 | `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok） |
 | `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=3；含旧数据回填） |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
+| fixture 模式新增接口验证 | 通过：`/device-types/{type}/catalog` 200 且含固件/配件、未知类型 404；`/my/devices/android/{mac}` 与 `/my/devices/ios/{uuid}` 200；非法 platform 400；旧 `/my/devices/{mac}` 兼容 |
+| 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
+| 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
 | `docker build` | 通过（GitHub Actions `docker-build` job，v0.2.0 提交，run 41881913964） |
 | GitHub Actions | 通过（v0.2.0：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建；run 41881913964） |
 
@@ -328,8 +358,8 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 ## 已知限制与下一步
 
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
-- token 无刷新与过期时间，仅支持吊销；如需长效会话可增加滚动续期。
-- `/my/devices/{mac}` 仍以 mac 元数据查询，适合 Android；iOS 应使用 `/my/devices` 列表并以 `platform + externalId` 定位记录。后续可增加按复合键查询单台的接口。
+- token 无刷新与过期时间，仅支持吊销；如需长效会话可增加滚动续期，但必须保持「401 不自动重登」的契约。
+- `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
 - fixture 模式的用户与设备数据在重启后丢失，仅用于本地联调与测试。
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。

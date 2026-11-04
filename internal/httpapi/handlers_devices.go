@@ -62,6 +62,43 @@ func (s *Server) handleDeviceType(c *gin.Context) {
 	c.JSON(http.StatusOK, item)
 }
 
+// handleDeviceCatalog 汇总某设备类型的元数据、固件与配件，供无法获取 MAC 的客户端使用。
+func (s *Server) handleDeviceCatalog(c *gin.Context) {
+	var param typeURIParam
+	if err := c.ShouldBindUri(&param); err != nil {
+		failValidation(c, err)
+		return
+	}
+	deviceType := strings.ToLower(strings.TrimSpace(param.Type))
+
+	detail, err := s.store.GetDeviceType(c.Request.Context(), deviceType)
+	if err != nil {
+		s.storeFailure(c, "查询设备类型失败", err)
+		return
+	}
+	firmwares, err := s.store.ListFirmwares(c.Request.Context(), deviceType)
+	if err != nil {
+		s.storeFailure(c, "查询固件列表失败", err)
+		return
+	}
+	accessories, err := s.store.ListAccessories(c.Request.Context(), deviceType)
+	if err != nil {
+		s.storeFailure(c, "查询配件列表失败", err)
+		return
+	}
+	if firmwares == nil {
+		firmwares = []model.Firmware{}
+	}
+	if accessories == nil {
+		accessories = []model.Accessory{}
+	}
+	c.JSON(http.StatusOK, model.DeviceCatalog{
+		DeviceType:  detail,
+		Firmwares:   firmwares,
+		Accessories: accessories,
+	})
+}
+
 func (s *Server) handleFirmwares(c *gin.Context) {
 	var param typeURIParam
 	if err := c.ShouldBindUri(&param); err != nil {
@@ -130,18 +167,58 @@ func (s *Server) handleMyDevices(c *gin.Context) {
 	c.JSON(http.StatusOK, listResponse{Items: items})
 }
 
-func (s *Server) handleMyDevice(c *gin.Context) {
-	var param macURIParam
-	if err := c.ShouldBindUri(&param); err != nil {
-		failValidation(c, err)
+// handleMyDeviceRoute 统一分发 /my/devices/{mac} 与 /my/devices/{platform}/{externalId}。
+// Gin 的树结构不支持同一段上同时存在 :mac 与 :platform/:externalId，故使用 catch-all。
+func (s *Server) handleMyDeviceRoute(c *gin.Context) {
+	rest := strings.Trim(c.Param("key"), "/")
+	if rest == "" {
+		fail(c, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		return
 	}
-	mac, err := validate.NormalizeMAC(param.MAC)
+	parts := strings.Split(rest, "/")
+	switch len(parts) {
+	case 1:
+		s.respondMyDeviceByMAC(c, parts[0])
+	case 2:
+		s.respondMyDeviceByKey(c, parts[0], parts[1])
+	default:
+		fail(c, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
+	}
+}
+
+// respondMyDeviceByMAC 处理 Android 常见的按 MAC 查询。
+func (s *Server) respondMyDeviceByMAC(c *gin.Context, rawMAC string) {
+	mac, err := validate.NormalizeMAC(rawMAC)
 	if err != nil {
 		fail(c, http.StatusBadRequest, CodeInvalidMAC, "MAC 地址格式不合法，需为 6 字节蓝牙地址")
 		return
 	}
 	device, err := s.store.GetUserDevice(c.Request.Context(), userID(c), mac)
+	if err != nil {
+		s.storeFailure(c, "查询用户设备失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, device)
+}
+
+// respondMyDeviceByKey 处理 iOS 等按 (platform, externalId) 查询。
+// 任何不属于当前用户的键都返回 404，避免泄露记录是否存在。
+func (s *Server) respondMyDeviceByKey(c *gin.Context, rawPlatform string, rawExternalID string) {
+	platform, err := validate.NormalizePlatform(rawPlatform)
+	if err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "platform 只能是 android 或 ios")
+		return
+	}
+	_, externalID, err := validate.NormalizeExternalID(platform, rawExternalID)
+	if err != nil {
+		if platform == validate.PlatformAndroid {
+			fail(c, http.StatusBadRequest, CodeInvalidMAC, "Android externalId 必须是 6 字节 MAC")
+			return
+		}
+		fail(c, http.StatusBadRequest, CodeBadRequest, "iOS externalId 必须是 UUID")
+		return
+	}
+	device, err := s.store.GetUserDeviceByKey(c.Request.Context(), userID(c), platform, externalID)
 	if err != nil {
 		s.storeFailure(c, "查询用户设备失败", err)
 		return

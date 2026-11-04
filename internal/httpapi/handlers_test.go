@@ -102,6 +102,8 @@ func TestPublicEndpoints(t *testing.T) {
 		{"未知设备类型详情", http.MethodGet, "/api/v1/device-types/unknown", http.StatusNotFound, httpapi.CodeNotFound},
 		{"固件列表", http.MethodGet, "/api/v1/device-types/nordic_uart/firmwares", http.StatusOK, ""},
 		{"配件列表", http.MethodGet, "/api/v1/device-types/environmental_sensor/accessories", http.StatusOK, ""},
+		{"设备类型聚合", http.MethodGet, "/api/v1/device-types/environmental_sensor/catalog", http.StatusOK, ""},
+		{"未知设备类型聚合", http.MethodGet, "/api/v1/device-types/unknown/catalog", http.StatusNotFound, httpapi.CodeNotFound},
 		{"公共设备-大写-MAC", http.MethodGet, "/api/v1/devices/AA:BB:CC:00:00:01", http.StatusOK, ""},
 		{"公共设备-未知-MAC", http.MethodGet, "/api/v1/devices/aa:bb:cc:00:00:99", http.StatusNotFound, httpapi.CodeNotFound},
 		{"公共设备-非法-MAC", http.MethodGet, "/api/v1/devices/not-a-mac", http.StatusBadRequest, httpapi.CodeInvalidMAC},
@@ -163,6 +165,26 @@ func TestPublicEndpoints(t *testing.T) {
 		}
 		if len(device.GATTServices) == 0 || device.FirmwareVersion == "" {
 			t.Fatalf("公共设备字段缺失: %+v", device)
+		}
+	})
+
+	t.Run("设备类型聚合包含固件与配件", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/device-types/environmental_sensor/catalog", "", "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		catalog := decode[struct {
+			DeviceType struct {
+				Type string `json:"type"`
+			} `json:"deviceType"`
+			Firmwares   []json.RawMessage `json:"firmwares"`
+			Accessories []json.RawMessage `json:"accessories"`
+		}](t, rec)
+		if catalog.DeviceType.Type != "environmental_sensor" {
+			t.Fatalf("deviceType.type=%q", catalog.DeviceType.Type)
+		}
+		if len(catalog.Firmwares) == 0 || len(catalog.Accessories) == 0 {
+			t.Fatalf("聚合结果缺少固件或配件: %s", rec.Body.String())
 		}
 	})
 
@@ -557,6 +579,13 @@ func TestCrossUserIsolation(t *testing.T) {
 		}
 	})
 
+	t.Run("A 按复合键访问 B 的设备必须 404", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+mac, "", userA.Token, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("A 的增量变更不包含 B 的记录", func(t *testing.T) {
 		rec := do(t, h, http.MethodGet, "/api/v1/sync/changes?cursor=0&limit=100", "", userA.Token, nil)
 		page := decode[struct {
@@ -572,7 +601,144 @@ func TestCrossUserIsolation(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status=%d", rec.Code)
 		}
+		rec = do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+mac, "", userB.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("复合键查询 status=%d body=%s", rec.Code, rec.Body.String())
+		}
 	})
+}
+
+// TestMyDeviceByKey 覆盖按 (platform, externalId) 查询单台设备的新路径。
+// 该路径让 iOS 不必依赖 MAC；旧 /my/devices/{mac} 保持可用。
+func TestMyDeviceByKey(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+	now := time.Now().UTC()
+
+	androidID := "33333333-3333-4333-8333-333333333333"
+	iosID := "44444444-4444-4444-8444-444444444444"
+	androidMAC := "AA:BB:CC:00:00:05"
+	iosExternalID := "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+
+	body := `{"clientId":"key-lookup","devices":[
+		{"id":"` + androidID + `","platform":"android","externalId":"` + androidMAC + `","alias":"Android","updatedAt":"` + now.Format(time.RFC3339) + `"},
+		{"id":"` + iosID + `","platform":"ios","externalId":"` + iosExternalID + `","alias":"iOS","updatedAt":"` + now.Format(time.RFC3339) + `"}]}`
+	rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	t.Run("Android 按复合键查询并规范化大小写", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+strings.ToLower(androidMAC), "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		device := decode[struct {
+			Platform   string `json:"platform"`
+			ExternalID string `json:"externalId"`
+			MAC        string `json:"mac"`
+		}](t, rec)
+		if device.Platform != "android" || device.ExternalID != androidMAC || device.MAC != strings.ToLower(androidMAC) {
+			t.Fatalf("设备键异常: %+v", device)
+		}
+	})
+
+	t.Run("iOS 按复合键查询且无 MAC", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/ios/"+strings.ToLower(iosExternalID), "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		device := decode[struct {
+			Platform   string `json:"platform"`
+			ExternalID string `json:"externalId"`
+			MAC        string `json:"mac"`
+		}](t, rec)
+		if device.Platform != "ios" || device.ExternalID != iosExternalID || device.MAC != "" {
+			t.Fatalf("iOS 设备键异常: %+v", device)
+		}
+	})
+
+	t.Run("平台参数大小写不敏感", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/IOS/"+iosExternalID, "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("非法 platform 返回 400", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/windows/"+androidMAC, "", user.Token, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if code := decode[errResponse](t, rec).Error.Code; code != httpapi.CodeBadRequest {
+			t.Fatalf("code=%q", code)
+		}
+	})
+
+	t.Run("Android 非法 externalId 返回 400", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/not-a-mac", "", user.Token, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d", rec.Code)
+		}
+		if code := decode[errResponse](t, rec).Error.Code; code != httpapi.CodeInvalidMAC {
+			t.Fatalf("code=%q", code)
+		}
+	})
+
+	t.Run("iOS 非法 externalId 返回 400", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/ios/not-a-uuid", "", user.Token, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d", rec.Code)
+		}
+	})
+
+	t.Run("不存在的键返回 404", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/ios/00000000-0000-4000-8000-000000000000", "", user.Token, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status=%d", rec.Code)
+		}
+	})
+
+	t.Run("旧 MAC 路径仍可用", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/"+androidMAC, "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("删除后按复合键返回 404", func(t *testing.T) {
+		deleteBody := `{"devices":[{"id":"` + androidID + `","platform":"android","externalId":"` + androidMAC + `","deleted":true,"updatedAt":"` + now.Add(time.Minute).Format(time.RFC3339) + `"}]}`
+		if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", deleteBody, user.Token, nil); rec.Code != http.StatusOK {
+			t.Fatalf("删除 push status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+androidMAC, "", user.Token, nil)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("删除后 status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestUnauthorizedDoesNotIssueToken 固化 401 契约：
+// token 失效时只返回错误体，绝不自动新建匿名账号或下发新 token。
+func TestUnauthorizedDoesNotIssueToken(t *testing.T) {
+	h := newHandler(t, 0)
+	rec := do(t, h, http.MethodGet, "/api/v1/my/devices/ios/E621E1F8-C36C-495A-93FC-0C247A3E6E5F", "", "pjiot_revoked", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if code := decode[errResponse](t, rec).Error.Code; code != httpapi.CodeUnauthorized {
+		t.Fatalf("code=%q", code)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if _, ok := raw["token"]; ok {
+		t.Fatalf("401 响应不应下发新 token: %s", rec.Body.String())
+	}
+	if _, ok := raw["userId"]; ok {
+		t.Fatalf("401 响应不应返回 userId: %s", rec.Body.String())
+	}
 }
 
 func TestRateLimit(t *testing.T) {

@@ -57,12 +57,15 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	deviceTypesGroup := api.Group("/device-types")
 	deviceTypesGroup.GET("", s.handleDeviceTypes)
 	deviceTypesGroup.GET("/:type", s.handleDeviceType)
+	deviceTypesGroup.GET("/:type/catalog", s.handleDeviceCatalog)
 	deviceTypesGroup.GET("/:type/firmwares", s.handleFirmwares)
 	deviceTypesGroup.GET("/:type/accessories", s.handleAccessories)
 
 	myGroup := api.Group("/my", s.requireAuth())
 	myGroup.GET("/devices", s.handleMyDevices)
-	myGroup.GET("/devices/:mac", s.handleMyDevice)
+	// Gin 不允许同一段同时存在 :mac 与 :platform/:externalId 两个参数节点，
+	// 因此用 catch-all 统一分发，对外仍保持 /devices/{mac} 与 /devices/{platform}/{externalId} 两种路径。
+	myGroup.GET("/devices/*key", s.handleMyDeviceRoute)
 
 	syncGroup := api.Group("/sync", s.requireAuth())
 	syncGroup.GET("/changes", s.handleChanges)

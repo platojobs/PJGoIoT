@@ -56,8 +56,11 @@ type Store interface {
 	// ListUserDevices 返回用户未删除的设备，按 updated_at 倒序。
 	ListUserDevices(ctx context.Context, userID string) ([]model.UserDevice, error)
 	// GetUserDevice 按 (user_id, mac) 查询，越权或已删除均返回 ErrNotFound。
-	// mac 仅为可选元数据；iOS 设备没有 MAC，应使用设备列表接口。
+	// mac 仅为可选元数据；iOS 设备没有 MAC，应使用 GetUserDeviceByKey。
 	GetUserDevice(ctx context.Context, userID string, mac string) (model.UserDevice, error)
+	// GetUserDeviceByKey 按 (user_id, platform, external_id) 查询。
+	// 越权、已删除或不存在均返回 ErrNotFound，供 iOS 按 CBPeripheral.identifier 定位单台设备。
+	GetUserDeviceByKey(ctx context.Context, userID string, platform string, externalID string) (model.UserDevice, error)
 	// Push 执行一次同步写入；replayed 表示命中幂等缓存并直接返回历史响应。
 	Push(ctx context.Context, userID string, req model.PushRequest, opts PushOptions) (result model.PushResult, replayed bool, err error)
 	// Changes 返回用户自 cursor 之后的增量变更，limit 为本次上限。

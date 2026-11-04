@@ -20,6 +20,11 @@ WHERE user_id = $1 AND mac = $2 AND deleted_at IS NULL
 ORDER BY updated_at DESC
 LIMIT 1;
 
+-- name: GetUserDeviceByKey :one
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
+FROM user_devices
+WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL;
+
 -- name: ListUserDevices :many
 SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices

@@ -52,6 +52,14 @@ type Accessory struct {
 	Description string `json:"description"`
 }
 
+// DeviceCatalog 汇总某设备类型的元数据、固件与配件。
+// 供无法获取 MAC 的客户端（如 iOS）一次性读取型号详情、产品与市场信息。
+type DeviceCatalog struct {
+	DeviceType  DeviceType  `json:"deviceType"`
+	Firmwares   []Firmware  `json:"firmwares"`
+	Accessories []Accessory `json:"accessories"`
+}
+
 // UserDevice 是用户私有设备记录。id 由客户端生成，serverSeq 由服务端同步序列填充。
 // 唯一键为 (user_id, platform, externalId)：Android 的 externalId 为大写 MAC，
 // iOS 的 externalId 为 CBPeripheral.identifier。mac 仅作为可选元数据保留。

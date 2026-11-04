@@ -87,6 +87,40 @@ func (q *Queries) GetUserDeviceByIDForUpdate(ctx context.Context, arg GetUserDev
 	return i, err
 }
 
+const getUserDeviceByKey = `-- name: GetUserDeviceByKey :one
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
+FROM user_devices
+WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL
+`
+
+type GetUserDeviceByKeyParams struct {
+	UserID     uuid.UUID
+	Platform   string
+	ExternalID string
+}
+
+func (q *Queries) GetUserDeviceByKey(ctx context.Context, arg GetUserDeviceByKeyParams) (UserDevice, error) {
+	row := q.db.QueryRowContext(ctx, getUserDeviceByKey, arg.UserID, arg.Platform, arg.ExternalID)
+	var i UserDevice
+	err := row.Scan(
+		&i.UserID,
+		&i.ID,
+		&i.ClientID,
+		&i.Mac,
+		&i.Alias,
+		&i.Group,
+		&i.Rules,
+		&i.ScanRecords,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.ServerSeq,
+		&i.CreatedAt,
+		&i.Platform,
+		&i.ExternalID,
+	)
+	return i, err
+}
+
 const getUserDeviceByKeyForUpdate = `-- name: GetUserDeviceByKeyForUpdate :one
 SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices

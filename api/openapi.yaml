@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.2.0
+  version: 0.3.1
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -18,6 +18,8 @@ info:
     - 公共设备查询的 MAC 规范化为小写冒号分隔的 6 字节形式。
     - 所有时间字段为 RFC 3339（UTC）。
     - 契约只增不删，客户端应忽略未知字段。
+    - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
+      `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
     - 与 iOS 端 `docs/consistency.md` 保持一致；字段命名与键规则冲突时以本文件为准并同步修改两端文档。
 servers:
   - url: http://127.0.0.1:8080/api/v1
@@ -46,7 +48,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.2.0"
+                version: "0.3.1"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -57,7 +59,11 @@ paths:
       tags: [auth]
       operationId: createAnonymousUser
       summary: 创建匿名用户并签发 token
-      description: 请求体可为空。返回的 token 只在本次响应中出现，服务端保存 SHA-256 哈希。
+      description: |
+        请求体可为空。返回的 token 只在本次响应中出现，服务端保存 SHA-256 哈希。
+
+        仅在用户明确选择「匿名使用」时调用一次。任何私有接口返回 `401` 时，客户端应提示重新登录，
+        不应自动调用本接口：那会创建新的 userId，使旧账号的设备与同步游标失联。
       responses:
         "201":
           description: 创建成功
@@ -171,6 +177,27 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /device-types/{type}/catalog:
+    get:
+      tags: [metadata]
+      operationId: getDeviceCatalog
+      summary: 按类型聚合设备元数据、固件与配件
+      description: |
+        一次返回型号详情、固件列表与配件列表，不依赖 MAC，供 iOS 产品/市场/详情页使用。
+        历史端点 `/device-types/{type}/firmwares` 与 `/device-types/{type}/accessories` 保持可用。
+        空列表返回 `[]` 而不是 `null`。
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceCatalog"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /device-types/{type}/firmwares:
     get:
       tags: [metadata]
@@ -244,15 +271,46 @@ paths:
     get:
       tags: [user]
       operationId: getMyDevice
-      summary: 按 MAC 查询当前用户的单台设备（Android 为主）
+      summary: 按 MAC 查询当前用户的单台设备（仅 Android）
       description: |
         按 mac 元数据查询 token 对应用户的设备；其他用户的设备一律返回 404，已删除返回 404。
-        iOS 无法获取 MAC，应使用 `GET /my/devices` 列表，并用 `platform + externalId` 标识记录。
-        当同一用户存在多条相同 mac 的记录时，返回 updatedAt 最新的一条。
+        `mac` 不是唯一键，同一用户可能有多条相同 mac 的记录（例如 Android 与 iOS 各一条），
+        此时返回 updatedAt 最新的一条。
+
+        iOS 无法获取 MAC，必须使用 `GET /my/devices/{platform}/{externalId}` 查询单台设备。
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/Mac"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDevice"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /my/devices/{platform}/{externalId}:
+    get:
+      tags: [user]
+      operationId: getMyDeviceByKey
+      summary: 按 (platform, externalId) 查询当前用户的单台设备
+      description: |
+        以设备唯一键查询，供 iOS 使用 `CBPeripheral.identifier` 定位设备，无需 MAC。
+        `platform` 取 `android` 或 `ios`（大小写不敏感）；Android 的 `externalId` 必须是 MAC，
+        iOS 的 `externalId` 必须是 UUID。服务端统一规范化为大写后再匹配。
+        其他用户的设备、已删除的记录与不存在的键一律返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
       responses:
         "200":
           description: 查询成功
@@ -405,7 +463,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: opaque-token
-      description: POST /auth/anonymous 返回的 token
+      description: POST /auth/anonymous 返回的不透明 token；服务端仅存哈希，可通过 POST /auth/logout 吊销。收到 401 时应提示重新登录，不要自动创建新匿名账号。
 
   parameters:
     Mac:
@@ -424,6 +482,23 @@ components:
       schema:
         type: string
         example: nordic_uart
+    Platform:
+      name: platform
+      in: path
+      required: true
+      description: 平台，取 android 或 ios，大小写不敏感
+      schema:
+        type: string
+        example: ios
+    ExternalId:
+      name: externalId
+      in: path
+      required: true
+      description: 设备唯一键。Android 为 MAC；iOS 为 CBPeripheral.identifier（UUID）。服务端统一规范化为大写
+      schema:
+        type: string
+        maxLength: 128
+        example: E621E1F8-C36C-495A-93FC-0C247A3E6E5F
 
   responses:
     BadRequest:
@@ -437,7 +512,11 @@ components:
               code: BAD_REQUEST
               message: "请求参数校验失败"
     Unauthorized:
-      description: token 缺失、无效或已吊销
+      description: |
+        token 缺失、无效或已吊销。这是明确的重新登录信号：
+        客户端应提示用户重新登录，不得自动调用 POST /auth/anonymous 静默新建匿名账号，
+        否则 userId 会变化并导致设备列表与同步游标漂移。
+        本响应只包含错误体，不会下发新 token。
       content:
         application/json:
           schema:
@@ -649,6 +728,21 @@ components:
           type: string
         description:
           type: string
+
+    DeviceCatalog:
+      type: object
+      required: [deviceType, firmwares, accessories]
+      properties:
+        deviceType:
+          $ref: "#/components/schemas/DeviceType"
+        firmwares:
+          type: array
+          items:
+            $ref: "#/components/schemas/Firmware"
+        accessories:
+          type: array
+          items:
+            $ref: "#/components/schemas/Accessory"
 
     UserDevice:
       type: object

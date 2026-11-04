@@ -242,6 +242,24 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	return mapUserDevice(row), nil
 }
 
+// GetUserDeviceByKey 实现 store.Store。
+func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform string, externalID string) (model.UserDevice, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.UserDevice{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	row, err := s.q.GetUserDeviceByKey(ctx, sqlcgen.GetUserDeviceByKeyParams{
+		UserID: uid, Platform: platform, ExternalID: externalID,
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.UserDevice{}, store.ErrNotFound
+		}
+		return model.UserDevice{}, fmt.Errorf("查询用户设备失败: %w", err)
+	}
+	return mapUserDevice(row), nil
+}
+
 // Push 实现 store.Store。所有设备、变更日志与幂等记录在同一事务内写入。
 func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, opts store.PushOptions) (model.PushResult, bool, error) {
 	uid, err := uuid.Parse(userID)

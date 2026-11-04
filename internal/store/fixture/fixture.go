@@ -287,6 +287,21 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	return *found, nil
 }
 
+// GetUserDeviceByKey 实现 store.Store。
+func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform string, externalID string) (model.UserDevice, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, ok := s.users[userID]
+	if !ok {
+		return model.UserDevice{}, store.ErrNotFound
+	}
+	d, ok := data.byKey[deviceKey(platform, externalID)]
+	if !ok || d.DeletedAt != nil {
+		return model.UserDevice{}, store.ErrNotFound
+	}
+	return *d, nil
+}
+
 // Push 实现 store.Store。
 func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, opts store.PushOptions) (model.PushResult, bool, error) {
 	s.mu.Lock()

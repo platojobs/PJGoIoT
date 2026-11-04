@@ -234,6 +234,19 @@ func TestPostgresStoreIntegration(t *testing.T) {
 			}
 		}
 
+		// 按复合键查询单台设备。
+		gotAndroid, err := st.GetUserDeviceByKey(context.Background(), userC, "android", "AA:BB:CC:00:00:03")
+		if err != nil || gotAndroid.Platform != "android" || gotAndroid.MAC != "aa:bb:cc:00:00:03" {
+			t.Fatalf("按复合键查 Android 失败: %+v err=%v", gotAndroid, err)
+		}
+		gotIOS, err := st.GetUserDeviceByKey(context.Background(), userC, "ios", iosExternal)
+		if err != nil || gotIOS.Platform != "ios" || gotIOS.MAC != "" {
+			t.Fatalf("按复合键查 iOS 失败: %+v err=%v", gotIOS, err)
+		}
+		if _, err := st.GetUserDeviceByKey(context.Background(), userA, "ios", iosExternal); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("跨用户复合键查询应 404，err=%v", err)
+		}
+
 		// 更新 Android 设备不应影响 iOS 记录。
 		update := userCReq
 		update.Devices = []model.PushDevice{{
