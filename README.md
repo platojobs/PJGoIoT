@@ -345,8 +345,8 @@ seed 数据来源与边界：
 | fixture 模式新增接口验证 | 通过：`/device-types/{type}/catalog` 200 且含固件/配件、未知类型 404；`/my/devices/android/{mac}` 与 `/my/devices/ios/{uuid}` 200；非法 platform 400；旧 `/my/devices/{mac}` 兼容 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| `docker build` | 通过（GitHub Actions `docker-build` job，v0.2.0 提交，run 41881913964） |
-| GitHub Actions | 通过（v0.2.0：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建；run 41881913964） |
+| `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.1 提交 1e3f451，run 41891902083） |
+| GitHub Actions | 通过（v0.3.1：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建；run 41891902083） |
 
 集成测试运行方式：
 

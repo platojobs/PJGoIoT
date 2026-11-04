@@ -14,6 +14,7 @@
 - `go build ./...`、`go vet ./...`、`go test ./...` 通过。
 - 真实 PostgreSQL 上执行迁移（version=3）与 `TestPostgresStoreIntegration`、`TestMigrationBackfillsLegacyDevices` 通过。
 - Postgres 模式下 HTTP 全接口 curl 验证通过，包括幂等重放、409、LWW 冲突、tombstone 404、跨用户 404、注销后 401、Android/iOS 同一用户双记录互不覆盖。
+- GitHub Actions v0.3.1 运行通过（run 41891902083，提交 1e3f451）：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建。
 - GitHub Actions v0.2.0 运行通过（run 41881913964，提交 5524481）：gofmt、vet、build、单元测试、迁移、Postgres 集成测试、distroless 镜像构建。
 
 ## 功能限制
