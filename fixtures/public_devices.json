@@ -1,0 +1,59 @@
+[
+  {
+    "mac": "aa:bb:cc:00:00:01",
+    "vendor": "Nordic Semiconductor",
+    "model": "nRF52840 DK",
+    "deviceType": "nordic_uart",
+    "firmwareVersion": "nRF Connect SDK v2.9.0",
+    "gattServices": [
+      { "uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e", "name": "Nordic UART Service" },
+      { "uuid": "00001800-0000-1000-8000-00805f9b34fb", "name": "Generic Access" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" }
+    ],
+    "compatibility": {
+      "platforms": ["android", "ios"],
+      "minAppVersion": "1.0.0",
+      "protocol": "ble-gatt",
+      "features": ["uart-transparent"]
+    }
+  },
+  {
+    "mac": "aa:bb:cc:00:00:02",
+    "vendor": "Espressif Systems",
+    "model": "ESP32-C3-DevKitM-1",
+    "deviceType": "environmental_sensor",
+    "firmwareVersion": "ESP-IDF v5.2.2",
+    "gattServices": [
+      { "uuid": "0000181a-0000-1000-8000-00805f9b34fb", "name": "Environmental Sensing" },
+      { "uuid": "00001800-0000-1000-8000-00805f9b34fb", "name": "Generic Access" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" }
+    ],
+    "compatibility": {
+      "platforms": ["android", "ios"],
+      "minAppVersion": "1.0.0",
+      "protocol": "ble-gatt",
+      "features": ["temperature", "humidity", "pressure"]
+    }
+  },
+  {
+    "mac": "aa:bb:cc:00:00:03",
+    "vendor": "Nordic Semiconductor",
+    "model": "nRF5340 DK",
+    "deviceType": "nordic_uart",
+    "firmwareVersion": "nRF Connect SDK v2.9.0",
+    "gattServices": [
+      { "uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e", "name": "Nordic UART Service" },
+      { "uuid": "00001800-0000-1000-8000-00805f9b34fb", "name": "Generic Access" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" }
+    ],
+    "compatibility": {
+      "platforms": ["android", "ios"],
+      "minAppVersion": "1.0.0",
+      "protocol": "ble-gatt",
+      "features": ["uart-transparent"]
+    }
+  }
+]

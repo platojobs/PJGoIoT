@@ -1,0 +1,10 @@
+.git
+.gitignore
+.github
+bin
+dist
+*.log
+coverage.out
+coverage.html
+.env
+.env.local

@@ -1,0 +1,19 @@
+# 构建产物
+/bin/
+/dist/
+*.exe
+
+# 本地环境
+.env
+.env.local
+*.log
+tmp/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 测试与覆盖率
+coverage.out
+coverage.html

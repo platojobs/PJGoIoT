@@ -1,0 +1,783 @@
+openapi: 3.0.3
+info:
+  title: PJGoIoT API
+  version: 0.1.0
+  description: |
+    蓝牙设备数据面板 Android App 的后端接口（多用户 + 多设备数据同步）。
+
+    统一约定：
+    - 所有路径以 `/api/v1` 开头。
+    - 成功响应为裸 JSON + HTTP 状态码，不使用 `{code,data}` 包装。
+    - 失败响应固定为 `{"error":{"code":"...","message":"..."}}`。
+    - 私有接口使用 `Authorization: Bearer <token>`；token 为不透明随机串，服务端仅存哈希，可吊销。
+    - 数据分两层：`device_types` / `firmwares` / `accessories` / 公共设备元数据全局共享；
+      `user_devices` 等私有数据按 `user_id` 隔离，越权访问统一返回 404。
+    - MAC 地址规范化为小写冒号分隔的 6 字节形式。
+    - 所有时间字段为 RFC 3339（UTC）。
+    - 契约只增不删，客户端应忽略未知字段。
+servers:
+  - url: http://127.0.0.1:8080/api/v1
+    description: 本地开发
+tags:
+  - name: system
+  - name: auth
+  - name: metadata
+  - name: user
+  - name: sync
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: 健康检查
+      description: 容器探针使用；不受限流影响。存储不可用时返回 503。
+      responses:
+        "200":
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+                service: pjgoiot-api
+                version: "0.1.0"
+                store: postgres
+                time: "2026-11-05T01:00:00Z"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /auth/anonymous:
+    post:
+      tags: [auth]
+      operationId: createAnonymousUser
+      summary: 创建匿名用户并签发 token
+      description: 请求体可为空。返回的 token 只在本次响应中出现，服务端保存 SHA-256 哈希。
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnonymousResponse"
+              example:
+                userId: "3f2b8c1e-4d5a-4e6f-9a7b-0c1d2e3f4a5b"
+                token: "pjiot_5f3a9c0d2e7b4a8c6d1e..."
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: 账号密码登录（后续实现）
+      description: 当前固定返回 501，客户端应使用匿名登录。
+      responses:
+        "501":
+          description: 尚未实现
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_IMPLEMENTED
+                  message: "账号密码登录尚未实现，请使用 /api/v1/auth/anonymous"
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: 吊销当前 token
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: 吊销成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /devices/{mac}:
+    get:
+      tags: [metadata]
+      operationId: getPublicDevice
+      summary: 查询公共设备元数据
+      description: 按 MAC 返回厂商、型号、设备类型、参考固件版本、GATT 服务与兼容性。无需鉴权。
+      parameters:
+        - $ref: "#/components/parameters/Mac"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicDevice"
+        "400":
+          description: MAC 格式非法
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: INVALID_MAC
+                  message: "MAC 地址格式不合法，需为 6 字节蓝牙地址"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /device-types:
+    get:
+      tags: [metadata]
+      operationId: listDeviceTypes
+      summary: 设备类型列表
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DeviceType"
+
+  /device-types/{type}/firmwares:
+    get:
+      tags: [metadata]
+      operationId: listFirmwares
+      summary: 指定设备类型的固件列表
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Firmware"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /device-types/{type}/accessories:
+    get:
+      tags: [metadata]
+      operationId: listAccessories
+      summary: 指定设备类型的配件列表
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Accessory"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /my/devices:
+    get:
+      tags: [user]
+      operationId: listMyDevices
+      summary: 当前用户的设备列表（不含已删除）
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UserDevice"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /my/devices/{mac}:
+    get:
+      tags: [user]
+      operationId: getMyDevice
+      summary: 按 MAC 查询当前用户的单台设备
+      description: 只查询 token 对应用户的数据；其他用户的同 MAC 设备一律返回 404。已删除设备返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Mac"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDevice"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /sync/changes:
+    get:
+      tags: [sync]
+      operationId: getSyncChanges
+      summary: 拉取自 cursor 之后的增量变更
+      description: |
+        `change_log` 按 user_id 隔离，seq 单调递增。客户端保存 `nextCursor`，
+        下次携带该值继续拉取。`limit` 默认 100，范围 1-500。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: 上次响应的 nextCursor；首次传 0 或省略
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: 单页条数，默认 100
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangesPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /sync/push:
+    post:
+      tags: [sync]
+      operationId: pushSyncChanges
+      summary: 批量提交本地设备变更
+      description: |
+        字段级 LWW：
+        - 比较 `updatedAt`；客户端时间严格更新则接受；
+        - 客户端时间超前服务端 2 分钟以上时，以服务端当前时间兜底；
+        - 时间相同且内容一致视为幂等无操作；
+        - 否则服务端获胜，落败数据放入 `conflicts`，绝不静默覆盖；
+        - `deleted=true` 只写 tombstone（`deletedAt`），不物理删除。
+
+        `Idempotency-Key` 在同一用户下唯一。相同 key + 相同请求体重复提交直接返回历史响应，
+        响应头带 `Idempotent-Replayed: true`；相同 key + 不同请求体返回 409。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: 幂等键，最长 128 字符；建议使用客户端生成的 UUID
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushRequest"
+            example:
+              clientId: android-demo
+              devices:
+                - id: "11111111-1111-4111-8111-111111111111"
+                  mac: "aa:bb:cc:00:00:01"
+                  alias: "客厅开发板"
+                  group: "客厅"
+                  rules:
+                    sampleRate: 10
+                  scanRecords:
+                    - rssi: -55
+                      at: "2026-11-05T00:00:00Z"
+                  updatedAt: "2026-11-05T00:00:00Z"
+                  deleted: false
+      responses:
+        "200":
+          description: 处理完成（可能包含 conflicts）
+          headers:
+            Idempotent-Replayed:
+              description: 命中幂等缓存时为 true
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Idempotency-Key 对应的请求体不一致
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: IDEMPOTENCY_CONFLICT
+                  message: "该 Idempotency-Key 已用于不同的请求体"
+        "413":
+          description: 请求体过大（超过 1 MiB）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-token
+      description: POST /auth/anonymous 返回的 token
+
+  parameters:
+    Mac:
+      name: mac
+      in: path
+      required: true
+      description: 蓝牙 MAC，接受大写/小写、冒号/连字符或连续 12 位十六进制；服务端规范化为小写冒号
+      schema:
+        type: string
+        example: "aa:bb:cc:00:00:01"
+    DeviceType:
+      name: type
+      in: path
+      required: true
+      description: 设备类型 slug，如 nordic_uart、environmental_sensor
+      schema:
+        type: string
+        example: nordic_uart
+
+  responses:
+    BadRequest:
+      description: 参数或请求体不合法
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: BAD_REQUEST
+              message: "请求参数校验失败"
+    Unauthorized:
+      description: token 缺失、无效或已吊销
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: "token 无效或已吊销"
+    NotFound:
+      description: 资源不存在，或当前用户无权访问
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: NOT_FOUND
+              message: "资源不存在或无权访问"
+    RateLimited:
+      description: 触发每 IP 限流
+      headers:
+        Retry-After:
+          schema:
+            type: string
+          description: 建议等待秒数
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: RATE_LIMITED
+              message: "请求过于频繁，请稍后再试"
+    ServiceUnavailable:
+      description: 存储不可用
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: UNAVAILABLE
+              message: "存储不可用"
+    InternalError:
+      description: 服务内部错误
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: INTERNAL
+              message: "服务内部错误"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: 稳定的错误码
+              enum:
+                - BAD_REQUEST
+                - INVALID_MAC
+                - INVALID_JSON
+                - UNAUTHORIZED
+                - NOT_FOUND
+                - METHOD_NOT_ALLOWED
+                - CONFLICT
+                - IDEMPOTENCY_CONFLICT
+                - RATE_LIMITED
+                - PAYLOAD_TOO_LARGE
+                - NOT_IMPLEMENTED
+                - UNAVAILABLE
+                - INTERNAL
+            message:
+              type: string
+              description: 面向开发者的说明，不应作为分支依据
+
+    Health:
+      type: object
+      required: [status, service, version, store, time]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+        version:
+          type: string
+        store:
+          type: string
+          enum: [fixture, postgres]
+        time:
+          type: string
+          format: date-time
+
+    AnonymousResponse:
+      type: object
+      required: [userId, token]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        token:
+          type: string
+          description: 不透明 token，仅在创建时返回一次
+
+    GATTService:
+      type: object
+      required: [uuid, name]
+      properties:
+        uuid:
+          type: string
+          description: 128 位 GATT 服务 UUID
+        name:
+          type: string
+
+    Compatibility:
+      type: object
+      description: 兼容性信息，保留扩展字段
+      additionalProperties: true
+      properties:
+        platforms:
+          type: array
+          items:
+            type: string
+        minAppVersion:
+          type: string
+        protocol:
+          type: string
+          example: ble-gatt
+        features:
+          type: array
+          items:
+            type: string
+
+    PublicDevice:
+      type: object
+      required: [mac, vendor, model, deviceType, firmwareVersion, gattServices, compatibility]
+      properties:
+        mac:
+          type: string
+        vendor:
+          type: string
+        model:
+          type: string
+        deviceType:
+          type: string
+        firmwareVersion:
+          type: string
+          description: 公共元数据中的参考固件版本；实际设备版本以设备上报为准
+        gattServices:
+          type: array
+          items:
+            $ref: "#/components/schemas/GATTService"
+        compatibility:
+          $ref: "#/components/schemas/Compatibility"
+
+    DeviceType:
+      type: object
+      required: [type, name, vendor, description, gattServices]
+      properties:
+        type:
+          type: string
+        name:
+          type: string
+        vendor:
+          type: string
+        description:
+          type: string
+        gattServices:
+          type: array
+          items:
+            $ref: "#/components/schemas/GATTService"
+
+    Firmware:
+      type: object
+      required: [id, deviceType, version, releaseNotes, releasedAt]
+      properties:
+        id:
+          type: string
+        deviceType:
+          type: string
+        version:
+          type: string
+        releaseNotes:
+          type: string
+        releasedAt:
+          type: string
+          description: 发布日期；未核实的记录为空字符串，不编造
+
+    Accessory:
+      type: object
+      required: [id, deviceType, name, sku, description]
+      properties:
+        id:
+          type: string
+        deviceType:
+          type: string
+        name:
+          type: string
+        sku:
+          type: string
+        description:
+          type: string
+
+    UserDevice:
+      type: object
+      required: [id, clientId, mac, alias, group, rules, scanRecords, updatedAt, serverSeq]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端生成的设备 UUID
+        clientId:
+          type: string
+          description: 最后写入该记录的客户端标识
+        mac:
+          type: string
+        alias:
+          type: string
+        group:
+          type: string
+        rules:
+          type: object
+          additionalProperties: true
+        scanRecords:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        updatedAt:
+          type: string
+          format: date-time
+        deletedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: tombstone 时间；未删除时不出现
+        serverSeq:
+          type: integer
+          format: int64
+          description: 最近一次写入对应的 change_log seq
+
+    PushDevice:
+      type: object
+      required: [id, mac, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mac:
+          type: string
+        alias:
+          type: string
+          maxLength: 100
+        group:
+          type: string
+          maxLength: 64
+        rules:
+          type: object
+          additionalProperties: true
+        scanRecords:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        updatedAt:
+          type: string
+          format: date-time
+          description: 客户端最后修改时间；超前服务端 2 分钟以上会被服务端时间兜底
+        deleted:
+          type: boolean
+          default: false
+
+    PushRequest:
+      type: object
+      required: [devices]
+      properties:
+        clientId:
+          type: string
+          maxLength: 128
+        devices:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/PushDevice"
+
+    AppliedChange:
+      type: object
+      required: [id, mac, status, serverSeq]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mac:
+          type: string
+        status:
+          type: string
+          enum: [applied, unchanged]
+        serverSeq:
+          type: integer
+          format: int64
+
+    Conflict:
+      type: object
+      required: [id, mac, reason, server, client]
+      properties:
+        id:
+          type: string
+          format: uuid
+        mac:
+          type: string
+        reason:
+          type: string
+          enum: [server_newer, clock_clamped, mac_taken]
+        server:
+          $ref: "#/components/schemas/UserDevice"
+        client:
+          $ref: "#/components/schemas/PushDevice"
+
+    PushResult:
+      type: object
+      required: [applied, conflicts, nextCursor]
+      properties:
+        applied:
+          type: array
+          items:
+            $ref: "#/components/schemas/AppliedChange"
+        conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Conflict"
+        nextCursor:
+          type: integer
+          format: int64
+
+    Change:
+      type: object
+      required: [seq, entity, entityId, op, payload, serverTs]
+      properties:
+        seq:
+          type: integer
+          format: int64
+        entity:
+          type: string
+          example: user_device
+        entityId:
+          type: string
+          description: 设备客户端 UUID
+        op:
+          type: string
+          enum: [upsert, delete]
+        payload:
+          $ref: "#/components/schemas/UserDevice"
+        serverTs:
+          type: string
+          format: date-time
+
+    ChangesPage:
+      type: object
+      required: [changes, nextCursor, hasMore]
+      properties:
+        changes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Change"
+        nextCursor:
+          type: integer
+          format: int64
+        hasMore:
+          type: boolean

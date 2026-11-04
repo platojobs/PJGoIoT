@@ -1,0 +1,58 @@
+[
+  {
+    "type": "cycling_speed_cadence",
+    "name": "骑行速度/踏频传感器",
+    "vendor": "Bluetooth SIG",
+    "description": "基于 Bluetooth SIG Cycling Speed and Cadence 标准服务的骑行传感器，可读取踏频与轮速。",
+    "gattServices": [
+      { "uuid": "00001816-0000-1000-8000-00805f9b34fb", "name": "Cycling Speed and Cadence" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" }
+    ]
+  },
+  {
+    "type": "environmental_sensor",
+    "name": "环境传感器",
+    "vendor": "Bluetooth SIG",
+    "description": "基于 Bluetooth SIG Environmental Sensing 标准服务的温湿度、气压等环境数据采集设备。",
+    "gattServices": [
+      { "uuid": "0000181a-0000-1000-8000-00805f9b34fb", "name": "Environmental Sensing" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" }
+    ]
+  },
+  {
+    "type": "heart_rate_monitor",
+    "name": "心率传感器",
+    "vendor": "Bluetooth SIG",
+    "description": "基于 Bluetooth SIG Heart Rate 标准服务的心率带或心率传感器。",
+    "gattServices": [
+      { "uuid": "0000180d-0000-1000-8000-00805f9b34fb", "name": "Heart Rate" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" }
+    ]
+  },
+  {
+    "type": "nordic_uart",
+    "name": "Nordic UART 透传设备",
+    "vendor": "Nordic Semiconductor",
+    "description": "使用 Nordic UART Service（NUS）进行双向串口透传的 BLE 设备。",
+    "gattServices": [
+      { "uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e", "name": "Nordic UART Service" },
+      { "uuid": "00001800-0000-1000-8000-00805f9b34fb", "name": "Generic Access" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" }
+    ]
+  },
+  {
+    "type": "smart_scale",
+    "name": "智能体脂秤",
+    "vendor": "Bluetooth SIG",
+    "description": "基于 Bluetooth SIG Body Composition 与 Weight Scale 标准服务的体脂秤。",
+    "gattServices": [
+      { "uuid": "0000181b-0000-1000-8000-00805f9b34fb", "name": "Body Composition" },
+      { "uuid": "0000181d-0000-1000-8000-00805f9b34fb", "name": "Weight Scale" },
+      { "uuid": "0000180f-0000-1000-8000-00805f9b34fb", "name": "Battery Service" },
+      { "uuid": "0000180a-0000-1000-8000-00805f9b34fb", "name": "Device Information" }
+    ]
+  }
+]

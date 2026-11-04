@@ -1,0 +1,29 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "db/migrations/000001_init.up.sql"
+    queries: "db/queries"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "internal/store/postgres/sqlcgen"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        emit_empty_slices: true
+        emit_interface: false
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "database/sql"
+              type: "NullTime"
+          - db_type: "jsonb"
+            go_type:
+              import: "encoding/json"
+              type: "RawMessage"

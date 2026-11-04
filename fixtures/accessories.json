@@ -1,0 +1,23 @@
+[
+  {
+    "id": "acc-hrm-polar-pro-strap",
+    "deviceType": "heart_rate_monitor",
+    "name": "Polar Pro 心率带胸带",
+    "sku": "",
+    "description": "Polar 官方在售的可替换心率带胸带；具体 SKU 与尺码以厂商渠道为准。"
+  },
+  {
+    "id": "acc-esp-usb-c-cable",
+    "deviceType": "environmental_sensor",
+    "name": "USB-C 数据线",
+    "sku": "",
+    "description": "ESP32-C3-DevKitM-1 开发板的供电与串口调试线缆。"
+  },
+  {
+    "id": "acc-scale-aa-battery",
+    "deviceType": "smart_scale",
+    "name": "AA 碱性电池",
+    "sku": "",
+    "description": "通用 1.5V AA 电池；实际电池型号以设备说明书为准。"
+  }
+]

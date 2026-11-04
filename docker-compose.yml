@@ -1,0 +1,57 @@
+# 本地开发用编排：PostgreSQL 16 + 迁移任务 + API 服务。
+# 仅用于本地验证，生产环境请自行管理数据库与密钥。
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pjgoiot
+      POSTGRES_PASSWORD: pjgoiot
+      POSTGRES_DB: pjgoiot
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pjgoiot -d pjgoiot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      args:
+        APP_VERSION: "0.1.0"
+    entrypoint: ["/migrate"]
+    command: ["-direction", "up"]
+    environment:
+      DATABASE_URL: postgres://pjgoiot:pjgoiot@db:5432/pjgoiot?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        APP_VERSION: "0.1.0"
+    environment:
+      STORE: postgres
+      DATABASE_URL: postgres://pjgoiot:pjgoiot@db:5432/pjgoiot?sslmode=disable
+      ADDR: ":8080"
+      APP_VERSION: "0.1.0"
+      RATE_LIMIT_PER_MINUTE: "120"
+      RATE_LIMIT_BURST: "40"
+      CORS_ALLOWED_ORIGINS: "*"
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
