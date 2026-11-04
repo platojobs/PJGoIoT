@@ -405,8 +405,8 @@ seed 数据来源与边界：
 | fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.2 提交 10fb27b，run 41897825528） |
-| GitHub Actions | 通过（v0.3.2：gofmt、vet、build、单元测试、迁移到 version=4、Postgres 集成测试、distroless 镜像构建；run 41897825528） |
+| `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.3 提交 006e6fc，run 41909871723） |
+| GitHub Actions | 通过（v0.3.3：gofmt、vet、build、单元测试、迁移到 version=5、Postgres 集成测试、distroless 镜像构建；run 41909871723） |
 
 集成测试运行方式：
 
