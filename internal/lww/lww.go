@@ -74,6 +74,9 @@ func Decide(now time.Time, client model.PushDevice, server *model.UserDevice) De
 
 // SameContent 比较客户端与服务端记录的业务内容（忽略时间与序列号）。
 func SameContent(server *model.UserDevice, client model.PushDevice) bool {
+	if server.Platform != client.Platform || server.ExternalID != client.ExternalID {
+		return false
+	}
 	if server.MAC != client.MAC || server.Alias != client.Alias || server.Group != client.Group {
 		return false
 	}

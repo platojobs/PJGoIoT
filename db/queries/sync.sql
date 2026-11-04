@@ -1,41 +1,48 @@
--- user_devices 的全部列，保证 sqlc 生成统一的 UserDevice 结构。
+-- user_devices 的全部列，保证 sqlc 生成统一的结构。
+-- 唯一键为 (user_id, platform, external_id)；mac 仅作为可选元数据。
+
 -- name: GetUserDeviceByIDForUpdate :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices
 WHERE user_id = $1 AND id = $2
 FOR UPDATE;
 
--- name: GetUserDeviceByMACForUpdate :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at
+-- name: GetUserDeviceByKeyForUpdate :one
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices
-WHERE user_id = $1 AND mac = $2
+WHERE user_id = $1 AND platform = $2 AND external_id = $3
 FOR UPDATE;
 
 -- name: GetUserDeviceByMAC :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices
-WHERE user_id = $1 AND mac = $2 AND deleted_at IS NULL;
+WHERE user_id = $1 AND mac = $2 AND deleted_at IS NULL
+ORDER BY updated_at DESC
+LIMIT 1;
 
 -- name: ListUserDevices :many
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id
 FROM user_devices
 WHERE user_id = $1 AND deleted_at IS NULL
 ORDER BY updated_at DESC, id;
 
 -- name: InsertUserDevice :one
 INSERT INTO user_devices (
-    user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq
+    user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, platform, external_id
 ) VALUES (
-    sqlc.arg(user_id), sqlc.arg(id), sqlc.arg(client_id), sqlc.arg(mac), sqlc.arg(alias),
-    sqlc.arg(group_name), sqlc.arg(rules), sqlc.arg(scan_records), sqlc.arg(updated_at),
-    sqlc.arg(deleted_at), sqlc.arg(server_seq)
+    sqlc.arg(user_id), sqlc.arg(id), sqlc.arg(client_id), sqlc.arg(mac),
+    sqlc.arg(alias), sqlc.arg(group_name), sqlc.arg(rules), sqlc.arg(scan_records),
+    sqlc.arg(updated_at), sqlc.arg(deleted_at), sqlc.arg(server_seq),
+    sqlc.arg(platform), sqlc.arg(external_id)
 )
-RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at;
+RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id;
 
 -- name: UpdateUserDevice :one
 UPDATE user_devices
 SET id = sqlc.arg(new_id),
     client_id = sqlc.arg(client_id),
+    platform = sqlc.arg(platform),
+    external_id = sqlc.arg(external_id),
     mac = sqlc.arg(mac),
     alias = sqlc.arg(alias),
     "group" = sqlc.arg(group_name),
@@ -45,7 +52,7 @@ SET id = sqlc.arg(new_id),
     deleted_at = sqlc.arg(deleted_at),
     server_seq = sqlc.arg(server_seq)
 WHERE user_id = sqlc.arg(user_id) AND id = sqlc.arg(old_id)
-RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at;
+RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id;
 
 -- name: NextChangeSeq :one
 SELECT nextval(pg_get_serial_sequence('change_log', 'seq'))::bigint AS seq;

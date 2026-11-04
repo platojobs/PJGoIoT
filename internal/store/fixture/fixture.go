@@ -16,6 +16,7 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/lww"
 	"github.com/platojobs/PJGoIoT/internal/model"
 	"github.com/platojobs/PJGoIoT/internal/store"
+	"github.com/platojobs/PJGoIoT/internal/validate"
 )
 
 type idempotencyRecord struct {
@@ -35,7 +36,12 @@ type changeRecord struct {
 
 type userData struct {
 	byID  map[string]*model.UserDevice
-	byMAC map[string]*model.UserDevice
+	byKey map[string]*model.UserDevice // key: platform|externalId
+}
+
+// deviceKey 返回内存索引使用的复合键。
+func deviceKey(platform, externalID string) string {
+	return platform + "|" + externalID
 }
 
 // Store 是内存实现，读 fixtures 初始化公共元数据。
@@ -141,6 +147,18 @@ func (s *Store) ListDeviceTypes(ctx context.Context) ([]model.DeviceType, error)
 	return out, nil
 }
 
+// GetDeviceType 实现 store.Store。
+func (s *Store) GetDeviceType(ctx context.Context, deviceType string) (model.DeviceType, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, dt := range s.deviceTypes {
+		if dt.Type == deviceType {
+			return dt, nil
+		}
+	}
+	return model.DeviceType{}, store.ErrNotFound
+}
+
 // DeviceTypeExists 实现 store.Store。
 func (s *Store) DeviceTypeExists(ctx context.Context, deviceType string) (bool, error) {
 	s.mu.RLock()
@@ -186,7 +204,7 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	userID := uuid.NewString()
-	s.users[userID] = &userData{byID: map[string]*model.UserDevice{}, byMAC: map[string]*model.UserDevice{}}
+	s.users[userID] = &userData{byID: map[string]*model.UserDevice{}, byKey: map[string]*model.UserDevice{}}
 	s.tokens[tokenHash] = userID
 	return userID, nil
 }
@@ -254,11 +272,19 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	if !ok {
 		return model.UserDevice{}, store.ErrNotFound
 	}
-	d, ok := data.byMAC[mac]
-	if !ok || d.DeletedAt != nil {
+	var found *model.UserDevice
+	for _, d := range data.byID {
+		if d.MAC != mac || d.DeletedAt != nil {
+			continue
+		}
+		if found == nil || d.UpdatedAt.After(found.UpdatedAt) {
+			found = d
+		}
+	}
+	if found == nil {
 		return model.UserDevice{}, store.ErrNotFound
 	}
-	return *d, nil
+	return *found, nil
 }
 
 // Push 实现 store.Store。
@@ -285,33 +311,41 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	result := model.PushResult{Applied: []model.AppliedChange{}, Conflicts: []model.Conflict{}}
 
 	for _, dev := range req.Devices {
-		existingByID := data.byID[dev.ID]
-		var macHolder *model.UserDevice
-		if existingByID != nil && existingByID.MAC != dev.MAC {
-			macHolder = data.byMAC[dev.MAC]
+		// 存储层再次规范化，避免直接调用 Store 时写入空唯一键。
+		platform, externalID, mac, err := validate.ResolveDeviceKey(dev.Platform, dev.ExternalID, dev.MAC)
+		if err != nil {
+			return model.PushResult{}, false, fmt.Errorf("设备键非法: %w", err)
 		}
-		if existingByID != nil && macHolder != nil && macHolder.ID != existingByID.ID {
+		dev.Platform, dev.ExternalID, dev.MAC = platform, externalID, mac
+
+		key := deviceKey(dev.Platform, dev.ExternalID)
+		existingByID := data.byID[dev.ID]
+		keyHolder := data.byKey[key]
+		if existingByID != nil && keyHolder != nil && keyHolder.ID != existingByID.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
-				ID: dev.ID, MAC: dev.MAC, Reason: "mac_taken", Server: *macHolder, Client: dev,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Reason: "key_taken", Server: *keyHolder, Client: dev,
 			})
 			continue
 		}
 
 		existing := existingByID
 		if existing == nil {
-			existing = data.byMAC[dev.MAC]
+			existing = keyHolder
 		}
 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
-				ID: dev.ID, MAC: dev.MAC, Reason: decision.Reason, Server: *existing, Client: dev,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Reason: decision.Reason, Server: *existing, Client: dev,
 			})
 			continue
 		}
 		if decision.Noop {
 			result.Applied = append(result.Applied, model.AppliedChange{
-				ID: dev.ID, MAC: dev.MAC, Status: "unchanged", ServerSeq: existing.ServerSeq,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Status: "unchanged", ServerSeq: existing.ServerSeq,
 			})
 			continue
 		}
@@ -321,6 +355,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		record := &model.UserDevice{
 			ID:          dev.ID,
 			ClientID:    req.ClientID,
+			Platform:    dev.Platform,
+			ExternalID:  dev.ExternalID,
 			MAC:         dev.MAC,
 			Alias:       dev.Alias,
 			Group:       dev.Group,
@@ -336,25 +372,27 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 
 		if existing != nil {
 			delete(data.byID, existing.ID)
-			delete(data.byMAC, existing.MAC)
+			delete(data.byKey, deviceKey(existing.Platform, existing.ExternalID))
 		}
 		data.byID[record.ID] = record
-		data.byMAC[record.MAC] = record
+		data.byKey[key] = record
 
 		op := "upsert"
 		if dev.Deleted {
 			op = "delete"
 		}
+		entityID := userID + ":" + dev.Platform + ":" + dev.ExternalID
 		payload, err := json.Marshal(record)
 		if err != nil {
 			return model.PushResult{}, false, fmt.Errorf("序列化变更记录失败: %w", err)
 		}
 		s.changes = append(s.changes, changeRecord{
-			seq: seq, userID: userID, entity: "user_device", entityID: record.ID,
+			seq: seq, userID: userID, entity: "user_device", entityID: entityID,
 			op: op, payload: payload, serverTS: now,
 		})
 		result.Applied = append(result.Applied, model.AppliedChange{
-			ID: dev.ID, MAC: dev.MAC, Status: "applied", ServerSeq: seq,
+			ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+			Status: "applied", ServerSeq: seq,
 		})
 	}
 

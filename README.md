@@ -1,6 +1,6 @@
 # PJGoIoT 后端
 
-「蓝牙设备数据面板」Android App 的后端服务：多用户账号、BLE 设备公共元数据、用户私有设备与增量同步。
+「蓝牙设备数据面板」Android / iOS App 的后端服务：多用户账号、BLE 设备公共元数据、用户私有设备与增量同步。
 
 - 语言 / 运行时：Go 1.22+
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
@@ -60,10 +60,11 @@ make dev-postgres   # Postgres 模式启动 API
 | POST | `/auth/logout` | Bearer | 204 | 吊销当前 token |
 | GET | `/devices/{mac}` | 否 | 200 | 公共设备元数据（厂商、型号、固件、GATT、兼容性） |
 | GET | `/device-types` | 否 | 200 | 设备类型列表，`{"items":[...]}` |
+| GET | `/device-types/{type}` | 否 | 200 | 按类型查询设备类型元数据，供 iOS 等无法获取 MAC 的端使用 |
 | GET | `/device-types/{type}/firmwares` | 否 | 200 | 指定类型的固件列表 |
 | GET | `/device-types/{type}/accessories` | 否 | 200 | 指定类型的配件列表 |
 | GET | `/my/devices` | Bearer | 200 | 当前用户未删除设备列表 |
-| GET | `/my/devices/{mac}` | Bearer | 200 | 当前用户单台设备；不存在、已删除或越权均为 404 |
+| GET | `/my/devices/{mac}` | Bearer | 200 | 按 MAC 元数据查单台设备（Android 为主；iOS 用列表 + platform/externalId） |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}` |
 | POST | `/sync/push` | Bearer | 200 | 批量写入，`{applied,conflicts,nextCursor}` |
 
@@ -83,8 +84,9 @@ echo "$AUTH"
 # 3. 公共设备元数据（MAC 大小写均可）
 curl -s $BASE/devices/AA:BB:CC:00:00:01
 
-# 4. 设备类型 / 固件 / 配件
+# 4. 设备类型 / 固件 / 配件（iOS 无法拿 MAC 时用 /device-types/{type}）
 curl -s $BASE/device-types
+curl -s $BASE/device-types/nordic_uart
 curl -s $BASE/device-types/nordic_uart/firmwares
 curl -s $BASE/device-types/heart_rate_monitor/accessories
 
@@ -93,6 +95,7 @@ curl -i $BASE/my/devices
 curl -s $BASE/my/devices -H "Authorization: Bearer $TOKEN"
 
 # 6. 推送设备（带幂等键）
+# Android：platform=android，externalId 为大写 MAC，mac 可选（会自动补全）
 curl -s -X POST $BASE/sync/push \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -101,11 +104,28 @@ curl -s -X POST $BASE/sync/push \
     "clientId": "android-demo",
     "devices": [{
       "id": "11111111-1111-4111-8111-111111111111",
-      "mac": "AA:BB:CC:00:00:01",
+      "platform": "android",
+      "externalId": "AA:BB:CC:00:00:01",
       "alias": "我的开发板",
       "group": "默认",
       "rules": {"notify": true},
       "scanRecords": [{"rssi": -50}],
+      "updatedAt": "2026-11-05T01:00:00Z",
+      "deleted": false
+    }]
+  }'
+
+# iOS：externalId 为 CBPeripheral.identifier（UUID），mac 可省略
+curl -s -X POST $BASE/sync/push \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "ios-demo",
+    "devices": [{
+      "id": "22222222-2222-4222-8222-222222222222",
+      "platform": "ios",
+      "externalId": "E621E1F8-C36C-495A-93FC-0C247A3E6E5F",
+      "alias": "iOS 连接的开发板",
       "updatedAt": "2026-11-05T01:00:00Z",
       "deleted": false
     }]
@@ -118,7 +138,7 @@ curl -s "$BASE/sync/changes?cursor=0&limit=50" -H "Authorization: Bearer $TOKEN"
 curl -s -X POST $BASE/sync/push \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"clientId":"android-demo","devices":[{"id":"11111111-1111-4111-8111-111111111111","mac":"AA:BB:CC:00:00:01","updatedAt":"2026-11-05T02:00:00Z","deleted":true}]}'
+  -d '{"clientId":"android-demo","devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"android","externalId":"AA:BB:CC:00:00:01","updatedAt":"2026-11-05T02:00:00Z","deleted":true}]}'
 
 # 9. 注销
 curl -i -X POST $BASE/auth/logout -H "Authorization: Bearer $TOKEN"
@@ -129,7 +149,7 @@ curl -i -X POST $BASE/auth/logout -H "Authorization: Bearer $TOKEN"
 ## 架构
 
 ```
-Android App
+Android / iOS App
    │  HTTP /api/v1
    ▼
 Gin Engine（internal/httpapi）
@@ -151,7 +171,25 @@ PostgreSQL
 - **公共元数据**（全局共享，按 MAC 或 type 查询）：`device_types`、`gatt_services`、`public_devices`、`firmwares`、`accessories`。
 - **用户私有数据**（按 `user_id` 隔离）：`user_devices`、`change_log`、`idempotency_keys`、`tokens`。
 
+设备唯一键：
+
+- `user_devices` 的唯一约束是 `(user_id, platform, external_id)`，主键仍是 `(user_id, id)`。
+- Android：`platform=android`，`external_id` 为规范化大写 MAC；`mac` 元数据自动填充为小写。
+- iOS：`platform=ios`，`external_id` 为 `CBPeripheral.identifier`（UUID，服务端统一大写）；`mac` 可为空。
+- 因此同一台设备在 Android 与 iOS 上不会被错误合并，也不会互相覆盖；不同平台的同型号设备是两条独立记录。
+
 所有私有查询都带 `user_id` 条件；访问他人资源统一返回 404，不泄露资源是否存在。
+
+### 与 iOS 端一致性（docs/consistency.md）
+
+本后端与 iOS 端仓库中的 `docs/consistency.md` 保持同一套约定，联调时以以下规则为准：
+
+- 设备唯一键：`(platform, externalId)`；`platform` 只能是 `android` / `ios`。
+- Android `externalId` = 大写 MAC（冒号分隔）；公共设备接口 `/devices/{mac}` 仍按小写 MAC 查询。
+- iOS `externalId` = `CBPeripheral.identifier`（UUID，大写），不依赖 MAC。
+- `mac` 字段只作为可选元数据，禁止任何一端把 `mac` 当作唯一键。
+- `entityId` = `<userId>:<platform>:<externalId>`，由服务端派生；客户端不要自行拼接或解析。
+- 字段命名以 `api/openapi.yaml` 为准；若与 iOS 端 `docs/consistency.md` 有出入，需同步修改两份文档并在此处记录。
 
 ### 账号与鉴权
 
@@ -162,13 +200,15 @@ PostgreSQL
 
 ### 同步模型
 
-- `user_devices` 唯一约束 `(user_id, mac)`，主键 `(user_id, id)`，`id` 为客户端生成的 UUID。
+- `user_devices` 唯一约束 `(user_id, platform, external_id)`，主键 `(user_id, id)`，`id` 为客户端生成的 UUID。
+- `platform` 取值 `android` / `ios`；Android 的 `external_id` 为大写 MAC，iOS 为 `CBPeripheral.identifier`；`mac` 仅作为可选元数据。
 - `change_log(user_id, seq BIGSERIAL, entity, entity_id, op, payload, server_ts)` 是增量来源，`seq` 单调递增。
+- `entity_id` 由复合键派生：`<userId>:<platform>:<externalId>`；旧变更日志在 000003 迁移中回填为同一形式。
 - 字段级 LWW：
   - 客户端 `updatedAt` 严格更新 → 接受；
   - 客户端时间超前服务端 2 分钟以上 → 以服务端时间兜底（`clock_clamped`）；
   - 时间相同且内容一致 → `unchanged`，不写库；
-  - 否则服务端获胜，落败数据放入 `conflicts`（原因 `server_newer` / `clock_clamped`），不静默覆盖。
+  - 否则服务端获胜，落败数据放入 `conflicts`（原因 `server_newer` / `clock_clamped` / `key_taken`），不静默覆盖。
 - 删除只写 tombstone：`deleted=true` 时写 `deleted_at` 与 `op=delete`，不物理删除；`/my/devices` 列表与单查默认过滤已删除记录，`/sync/changes` 仍会返回删除事件。
 - `POST /sync/push` 支持 `Idempotency-Key`（同用户下唯一，≤128 字符）：
   - 相同 key + 相同请求体 → 返回历史响应，并带 `Idempotent-Replayed: true`；
@@ -243,6 +283,12 @@ go run ./cmd/migrate -direction up -steps 1   # 只前进一步
 
 - `000001_init`：建表（`users`、`tokens`、`device_types`、`gatt_services`、`public_devices`、`firmwares`、`accessories`、`user_devices`、`change_log`、`idempotency_keys`）。
 - `000002_seed`：公共元数据 seed。
+- `000003_platform_external_id`：设备唯一键从 `(user_id, mac)` 迁移为 `(user_id, platform, external_id)`：
+  - 旧记录回填 `platform=android`、`external_id=upper(mac)`；
+  - `mac` 改为可空，仅作为元数据；
+  - 旧的 `change_log` 记录回填 `payload.platform` / `payload.externalId` 与新的 `entity_id`；
+  - 迁移不破坏已有数据，旧记录迁移后仍可按 MAC 读取；
+  - down 迁移有损（iOS 的 external_id 会被回填到 mac），仅用于本地回滚。
 
 seed 数据来源与边界：
 
@@ -255,9 +301,10 @@ seed 数据来源与边界：
 
 测试覆盖：
 
-- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/固件/配件、401/404、非法 MAC、CORS 预检、注销、push 参数校验、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、限流。
+- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、限流。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定。
-- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离。
+- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离。
+- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到 version=3，验证回填、旧数据可读与 entity_id。
 
 本机实际执行结果（2026-11-05）：
 
@@ -266,22 +313,23 @@ seed 数据来源与边界：
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
 | `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok） |
-| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run TestPostgresStoreIntegration -v` | 通过（本机真实 PostgreSQL，迁移 version=2） |
-| Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、tombstone 404、跨用户 404、注销后 401 |
-| `docker build` | **未验证**：本机未安装 Docker；CI 已配置镜像构建 |
-| GitHub Actions | **未实际运行**：首次推送后由 GitHub 触发 |
+| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=3；含旧数据回填） |
+| Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
+| `docker build` | 通过（GitHub Actions `docker-build` job，v0.1.0 提交） |
+| GitHub Actions | 通过（v0.1.0：gofmt、vet、build、单元测试、迁移、集成测试、distroless 镜像构建） |
 
 集成测试运行方式：
 
 ```bash
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
-  go test ./internal/store/postgres -run TestPostgresStoreIntegration -v
+  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v
 ```
 
 ## 已知限制与下一步
 
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
 - token 无刷新与过期时间，仅支持吊销；如需长效会话可增加滚动续期。
+- `/my/devices/{mac}` 仍以 mac 元数据查询，适合 Android；iOS 应使用 `/my/devices` 列表并以 `platform + externalId` 定位记录。后续可增加按复合键查询单台的接口。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
 - fixture 模式的用户与设备数据在重启后丢失，仅用于本地联调与测试。
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。

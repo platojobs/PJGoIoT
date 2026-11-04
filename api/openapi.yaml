@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.1.0
+  version: 0.2.0
   description: |
-    蓝牙设备数据面板 Android App 的后端接口（多用户 + 多设备数据同步）。
+    蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
     统一约定：
     - 所有路径以 `/api/v1` 开头。
@@ -12,9 +12,13 @@ info:
     - 私有接口使用 `Authorization: Bearer <token>`；token 为不透明随机串，服务端仅存哈希，可吊销。
     - 数据分两层：`device_types` / `firmwares` / `accessories` / 公共设备元数据全局共享；
       `user_devices` 等私有数据按 `user_id` 隔离，越权访问统一返回 404。
-    - MAC 地址规范化为小写冒号分隔的 6 字节形式。
+    - 设备唯一键为 `(platform, externalId)`：
+      Android 的 `externalId` 为规范化大写 MAC；iOS 的 `externalId` 为 `CBPeripheral.identifier`（UUID）。
+      `mac` 仅作为可选元数据，不再参与唯一约束。
+    - 公共设备查询的 MAC 规范化为小写冒号分隔的 6 字节形式。
     - 所有时间字段为 RFC 3339（UTC）。
     - 契约只增不删，客户端应忽略未知字段。
+    - 与 iOS 端 `docs/consistency.md` 保持一致；字段命名与键规则冲突时以本文件为准并同步修改两端文档。
 servers:
   - url: http://127.0.0.1:8080/api/v1
     description: 本地开发
@@ -42,7 +46,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.1.0"
+                version: "0.2.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -149,6 +153,24 @@ paths:
                     items:
                       $ref: "#/components/schemas/DeviceType"
 
+  /device-types/{type}:
+    get:
+      tags: [metadata]
+      operationId: getDeviceType
+      summary: 按类型查询设备类型元数据
+      description: 供无法获取 MAC 的 iOS 端按型号查询。返回设备类型名称、厂商、描述与 GATT 服务列表。
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceType"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /device-types/{type}/firmwares:
     get:
       tags: [metadata]
@@ -222,8 +244,11 @@ paths:
     get:
       tags: [user]
       operationId: getMyDevice
-      summary: 按 MAC 查询当前用户的单台设备
-      description: 只查询 token 对应用户的数据；其他用户的同 MAC 设备一律返回 404。已删除设备返回 404。
+      summary: 按 MAC 查询当前用户的单台设备（Android 为主）
+      description: |
+        按 mac 元数据查询 token 对应用户的设备；其他用户的设备一律返回 404，已删除返回 404。
+        iOS 无法获取 MAC，应使用 `GET /my/devices` 列表，并用 `platform + externalId` 标识记录。
+        当同一用户存在多条相同 mac 的记录时，返回 updatedAt 最新的一条。
       security:
         - bearerAuth: []
       parameters:
@@ -250,6 +275,9 @@ paths:
       description: |
         `change_log` 按 user_id 隔离，seq 单调递增。客户端保存 `nextCursor`，
         下次携带该值继续拉取。`limit` 默认 100，范围 1-500。
+
+        每条变更的 `payload` 为 `UserDevice`，包含 `platform`、`externalId` 与可选 `mac`；
+        `entityId` 为 `<userId>:<platform>:<externalId>` 派生的稳定字符串。
       security:
         - bearerAuth: []
       parameters:
@@ -318,6 +346,8 @@ paths:
               clientId: android-demo
               devices:
                 - id: "11111111-1111-4111-8111-111111111111"
+                  platform: android
+                  externalId: "AA:BB:CC:00:00:01"
                   mac: "aa:bb:cc:00:00:01"
                   alias: "客厅开发板"
                   group: "客厅"
@@ -326,6 +356,12 @@ paths:
                   scanRecords:
                     - rssi: -55
                       at: "2026-11-05T00:00:00Z"
+                  updatedAt: "2026-11-05T00:00:00Z"
+                  deleted: false
+                - id: "22222222-2222-4222-8222-222222222222"
+                  platform: ios
+                  externalId: "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+                  alias: "iOS 连接的开发板"
                   updatedAt: "2026-11-05T00:00:00Z"
                   deleted: false
       responses:
@@ -616,7 +652,7 @@ components:
 
     UserDevice:
       type: object
-      required: [id, clientId, mac, alias, group, rules, scanRecords, updatedAt, serverSeq]
+      required: [id, clientId, platform, externalId, alias, group, rules, scanRecords, updatedAt, serverSeq]
       properties:
         id:
           type: string
@@ -625,8 +661,18 @@ components:
         clientId:
           type: string
           description: 最后写入该记录的客户端标识
+        platform:
+          type: string
+          enum: [android, ios]
+          description: 设备所属平台；唯一键的一部分
+        externalId:
+          type: string
+          description: |
+            平台内稳定设备标识，唯一键的一部分。
+            Android 为规范化大写 MAC；iOS 为 CBPeripheral.identifier（UUID，大写）。
         mac:
           type: string
+          description: 可选 MAC 元数据；iOS 设备通常为空，不参与唯一约束
         alias:
           type: string
         group:
@@ -654,13 +700,28 @@ components:
 
     PushDevice:
       type: object
-      required: [id, mac, updatedAt]
+      required: [id, updatedAt]
+      description: |
+        设备唯一键为 `platform + externalId`。
+        - 新客户端必须显式携带 `platform` 与 `externalId`；
+        - 兼容旧 Android 客户端：`platform` 缺省为 `android`，`externalId` 可由 `mac` 派生；
+        - iOS 必须携带 `platform="ios"` 与 `externalId`（CBPeripheral.identifier），`mac` 可省略。
       properties:
         id:
           type: string
           format: uuid
+        platform:
+          type: string
+          enum: [android, ios]
+          default: android
+          description: 缺省为 android（兼容旧客户端）
+        externalId:
+          type: string
+          maxLength: 128
+          description: Android 为大写 MAC；iOS 为 CBPeripheral.identifier（UUID）
         mac:
           type: string
+          description: 可选 MAC 元数据；Android 会自动填充为小写 MAC，iOS 可省略
         alias:
           type: string
           maxLength: 100
@@ -699,13 +760,19 @@ components:
 
     AppliedChange:
       type: object
-      required: [id, mac, status, serverSeq]
+      required: [id, platform, externalId, status, serverSeq]
       properties:
         id:
           type: string
           format: uuid
+        platform:
+          type: string
+          enum: [android, ios]
+        externalId:
+          type: string
         mac:
           type: string
+          description: 可选 MAC 元数据；iOS 通常为空
         status:
           type: string
           enum: [applied, unchanged]
@@ -715,16 +782,22 @@ components:
 
     Conflict:
       type: object
-      required: [id, mac, reason, server, client]
+      required: [id, platform, externalId, reason, server, client]
       properties:
         id:
           type: string
           format: uuid
+        platform:
+          type: string
+          enum: [android, ios]
+        externalId:
+          type: string
         mac:
           type: string
         reason:
           type: string
-          enum: [server_newer, clock_clamped, mac_taken]
+          enum: [server_newer, clock_clamped, key_taken]
+          description: key_taken 表示 (platform, externalId) 已被同用户的其他设备占用
         server:
           $ref: "#/components/schemas/UserDevice"
         client:
@@ -758,7 +831,9 @@ components:
           example: user_device
         entityId:
           type: string
-          description: 设备客户端 UUID
+          description: |
+            复合键派生的稳定字符串：`<userId>:<platform>:<externalId>`。
+            旧变更（000003 迁移前）已在迁移时回填为同一形式。
         op:
           type: string
           enum: [upsert, delete]

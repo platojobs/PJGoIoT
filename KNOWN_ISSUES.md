@@ -6,15 +6,15 @@
 
 | 项目 | 状态 | 原因 / 处理 |
 | --- | --- | --- |
-| `docker build` 与 `docker compose up` | 未验证 | 本机未安装 Docker（`docker: command not found`）。Dockerfile、docker-compose.yml 已按 distroless 多阶段方案编写，CI 已包含 `docker build`，首次推送后由 GitHub Actions 实际验证。 |
-| GitHub Actions CI | 未运行 | 仓库首次推送后才会触发。工作流包含 gofmt 检查、`go vet`、`go build`、`go test`、Postgres service、迁移与集成测试、镜像构建。 |
+| `docker compose up` | 未验证 | 本机未安装 Docker。Dockerfile 已通过 GitHub Actions `docker-build` job 验证；compose 依赖的镜像、迁移与健康检查配置尚未在真实 Docker 中启动验证。 |
 | 云环境部署 | 未进行 | 需用户提供服务器、域名、HTTPS 与托管数据库等决策；仓库不擅自开通账号。 |
 
 ## 已在本机验证
 
 - `go build ./...`、`go vet ./...`、`go test ./...` 通过。
-- 真实 PostgreSQL 上执行迁移（version=2）与 `TestPostgresStoreIntegration` 通过。
-- Postgres 模式下 HTTP 全接口 curl 验证通过，包括幂等重放、409、LWW 冲突、tombstone 404、跨用户 404、注销后 401。
+- 真实 PostgreSQL 上执行迁移（version=3）与 `TestPostgresStoreIntegration`、`TestMigrationBackfillsLegacyDevices` 通过。
+- Postgres 模式下 HTTP 全接口 curl 验证通过，包括幂等重放、409、LWW 冲突、tombstone 404、跨用户 404、注销后 401、Android/iOS 同一用户双记录互不覆盖。
+- GitHub Actions v0.1.0 运行通过：gofmt、vet、build、单元测试、迁移、集成测试、distroless 镜像构建。
 
 ## 功能限制
 
@@ -23,4 +23,5 @@
 - 限流为单进程内存令牌桶，多副本部署时各自计数。
 - fixture 模式数据仅存内存，重启丢失。
 - 公共元数据列表未分页。
+- `/my/devices/{mac}` 仍按 mac 元数据查询；iOS 应使用 `/my/devices` 列表并以 `platform + externalId` 定位，暂未提供按复合键查询单台的接口。
 - seed 仅覆盖公开开发板与标准 GATT 服务；真实量产型号、固件发布记录、官方配件 SKU 需可核实来源后再补，未编造。

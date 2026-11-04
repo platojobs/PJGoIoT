@@ -37,6 +37,8 @@ type Store interface {
 	GetPublicDevice(ctx context.Context, mac string) (model.PublicDevice, error)
 	// ListDeviceTypes 返回全部设备类型。
 	ListDeviceTypes(ctx context.Context) ([]model.DeviceType, error)
+	// GetDeviceType 按 type 查询设备类型，供无法获取 MAC 的 iOS 端按型号查询。
+	GetDeviceType(ctx context.Context, deviceType string) (model.DeviceType, error)
 	// DeviceTypeExists 判断设备类型是否存在。
 	DeviceTypeExists(ctx context.Context, deviceType string) (bool, error)
 	// ListFirmwares 返回指定设备类型的固件列表。
@@ -54,6 +56,7 @@ type Store interface {
 	// ListUserDevices 返回用户未删除的设备，按 updated_at 倒序。
 	ListUserDevices(ctx context.Context, userID string) ([]model.UserDevice, error)
 	// GetUserDevice 按 (user_id, mac) 查询，越权或已删除均返回 ErrNotFound。
+	// mac 仅为可选元数据；iOS 设备没有 MAC，应使用设备列表接口。
 	GetUserDevice(ctx context.Context, userID string, mac string) (model.UserDevice, error)
 	// Push 执行一次同步写入；replayed 表示命中幂等缓存并直接返回历史响应。
 	Push(ctx context.Context, userID string, req model.PushRequest, opts PushOptions) (result model.PushResult, replayed bool, err error)

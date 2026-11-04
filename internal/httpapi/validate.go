@@ -45,7 +45,9 @@ type pushPayload struct {
 
 type pushDevicePayload struct {
 	ID          string          `json:"id" binding:"required,uuid"`
-	MAC         string          `json:"mac" binding:"required"`
+	Platform    string          `json:"platform" binding:"omitempty,oneof=android ios"`
+	ExternalID  string          `json:"externalId" binding:"max=128"`
+	MAC         string          `json:"mac" binding:"max=64"`
 	Alias       string          `json:"alias" binding:"max=100"`
 	Group       string          `json:"group" binding:"max=64"`
 	Rules       json.RawMessage `json:"rules"`
@@ -60,6 +62,8 @@ func (p pushPayload) toModel() model.PushRequest {
 	for _, d := range p.Devices {
 		req.Devices = append(req.Devices, model.PushDevice{
 			ID:          d.ID,
+			Platform:    d.Platform,
+			ExternalID:  d.ExternalID,
 			MAC:         d.MAC,
 			Alias:       d.Alias,
 			Group:       d.Group,
@@ -74,6 +78,7 @@ func (p pushPayload) toModel() model.PushRequest {
 
 // normalizePush 校验并规范化一次 push 请求。
 // 返回的错误信息直接作为 400 响应的 message。
+// 设备唯一键为 (platform, externalId)，mac 仅作为可选元数据。
 func normalizePush(req *model.PushRequest) error {
 	req.ClientID = strings.TrimSpace(req.ClientID)
 	if len(req.ClientID) > maxClientIDLength {
@@ -87,7 +92,7 @@ func normalizePush(req *model.PushRequest) error {
 	}
 
 	seenID := make(map[string]struct{}, len(req.Devices))
-	seenMAC := make(map[string]struct{}, len(req.Devices))
+	seenKey := make(map[string]struct{}, len(req.Devices))
 	for i := range req.Devices {
 		dev := &req.Devices[i]
 
@@ -99,15 +104,19 @@ func normalizePush(req *model.PushRequest) error {
 		}
 		seenID[dev.ID] = struct{}{}
 
-		mac, err := validate.NormalizeMAC(dev.MAC)
+		platform, externalID, mac, err := validate.ResolveDeviceKey(dev.Platform, dev.ExternalID, dev.MAC)
 		if err != nil {
-			return fmt.Errorf("devices[%d].mac 非法: %s", i, dev.MAC)
+			return fmt.Errorf("devices[%d] 设备键非法: %s", i, err)
 		}
+		dev.Platform = platform
+		dev.ExternalID = externalID
 		dev.MAC = mac
-		if _, ok := seenMAC[mac]; ok {
-			return fmt.Errorf("devices[%d].mac 重复", i)
+
+		key := platform + "|" + externalID
+		if _, ok := seenKey[key]; ok {
+			return fmt.Errorf("devices[%d] 的 platform + externalId 重复", i)
 		}
-		seenMAC[mac] = struct{}{}
+		seenKey[key] = struct{}{}
 
 		dev.Alias = strings.TrimSpace(dev.Alias)
 		if len([]rune(dev.Alias)) > maxAliasLength {

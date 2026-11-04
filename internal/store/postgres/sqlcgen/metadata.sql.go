@@ -21,6 +21,24 @@ func (q *Queries) DeviceTypeExists(ctx context.Context, type_ string) (bool, err
 	return exists, err
 }
 
+const getDeviceType = `-- name: GetDeviceType :one
+SELECT type, name, vendor, description
+FROM device_types
+WHERE type = $1
+`
+
+func (q *Queries) GetDeviceType(ctx context.Context, type_ string) (DeviceType, error) {
+	row := q.db.QueryRowContext(ctx, getDeviceType, type_)
+	var i DeviceType
+	err := row.Scan(
+		&i.Type,
+		&i.Name,
+		&i.Vendor,
+		&i.Description,
+	)
+	return i, err
+}
+
 const getPublicDevice = `-- name: GetPublicDevice :one
 SELECT mac, vendor, model, device_type, firmware_version, compatibility
 FROM public_devices

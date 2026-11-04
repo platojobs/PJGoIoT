@@ -98,6 +98,8 @@ func TestPublicEndpoints(t *testing.T) {
 	}{
 		{"健康检查", http.MethodGet, "/api/v1/health", http.StatusOK, ""},
 		{"设备类型列表", http.MethodGet, "/api/v1/device-types", http.StatusOK, ""},
+		{"设备类型详情", http.MethodGet, "/api/v1/device-types/nordic_uart", http.StatusOK, ""},
+		{"未知设备类型详情", http.MethodGet, "/api/v1/device-types/unknown", http.StatusNotFound, httpapi.CodeNotFound},
 		{"固件列表", http.MethodGet, "/api/v1/device-types/nordic_uart/firmwares", http.StatusOK, ""},
 		{"配件列表", http.MethodGet, "/api/v1/device-types/environmental_sensor/accessories", http.StatusOK, ""},
 		{"公共设备-大写-MAC", http.MethodGet, "/api/v1/devices/AA:BB:CC:00:00:01", http.StatusOK, ""},
@@ -243,6 +245,11 @@ func TestPushValidation(t *testing.T) {
 		{"rules 非对象", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","mac":"aa:bb:cc:00:00:01","rules":[],"updatedAt":"` + validTime + `"}]}`},
 		{"scanRecords 非数组", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","mac":"aa:bb:cc:00:00:01","scanRecords":{},"updatedAt":"` + validTime + `"}]}`},
 		{"缺少 updatedAt", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","mac":"aa:bb:cc:00:00:01"}]}`},
+		{"非法 platform", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"windows","mac":"aa:bb:cc:00:00:01","updatedAt":"` + validTime + `"}]}`},
+		{"Android 无 mac 且无 externalId", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"android","updatedAt":"` + validTime + `"}]}`},
+		{"iOS 缺少 externalId", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"ios","updatedAt":"` + validTime + `"}]}`},
+		{"iOS externalId 非 UUID", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"ios","externalId":"peripheral-1","updatedAt":"` + validTime + `"}]}`},
+		{"mac 与 externalId 不一致", `{"devices":[{"id":"11111111-1111-4111-8111-111111111111","platform":"android","externalId":"AA:BB:CC:00:00:01","mac":"aa:bb:cc:00:00:02","updatedAt":"` + validTime + `"}]}`},
 	}
 
 	for _, tc := range cases {
@@ -408,6 +415,115 @@ func TestSyncChangesPagination(t *testing.T) {
 	if len(page2.Changes) != 1 || page2.HasMore {
 		t.Fatalf("第二页异常: %s", next.Body.String())
 	}
+}
+
+func TestPlatformKeyIsolation(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+	now := time.Now().UTC()
+
+	androidID := "11111111-1111-4111-8111-111111111111"
+	iosID := "22222222-2222-4222-8222-222222222222"
+	iosExternalID := "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+
+	androidBody := `{"clientId":"android-client","devices":[{"id":"` + androidID + `","platform":"android","externalId":"AA:BB:CC:00:00:01","alias":"Android 设备","updatedAt":"` + now.Format(time.RFC3339) + `"}]}`
+	iosBody := `{"clientId":"ios-client","devices":[{"id":"` + iosID + `","platform":"ios","externalId":"` + iosExternalID + `","alias":"iOS 设备","updatedAt":"` + now.Format(time.RFC3339) + `"}]}`
+
+	rec := do(t, h, http.MethodPost, "/api/v1/sync/push", androidBody, user.Token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Android push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	applied := decode[struct {
+		Applied []struct {
+			Platform   string `json:"platform"`
+			ExternalID string `json:"externalId"`
+		} `json:"applied"`
+	}](t, rec)
+	if applied.Applied[0].Platform != "android" || applied.Applied[0].ExternalID != "AA:BB:CC:00:00:01" {
+		t.Fatalf("Android 键未规范化: %s", rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodPost, "/api/v1/sync/push", iosBody, user.Token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("iOS push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	t.Run("同一用户下 Android 与 iOS 同型号设备是两条记录", func(t *testing.T) {
+		my := decode[itemsResponse[struct {
+			ID         string `json:"id"`
+			Platform   string `json:"platform"`
+			ExternalID string `json:"externalId"`
+			MAC        string `json:"mac"`
+			Alias      string `json:"alias"`
+		}]](t, do(t, h, http.MethodGet, "/api/v1/my/devices", "", user.Token, nil))
+		if len(my.Items) != 2 {
+			t.Fatalf("设备数量=%d body=%s", len(my.Items), rec.Body.String())
+		}
+		seen := map[string]bool{}
+		for _, d := range my.Items {
+			seen[d.Platform] = true
+			if d.Platform == "android" && d.ExternalID != "AA:BB:CC:00:00:01" {
+				t.Fatalf("Android externalId=%q", d.ExternalID)
+			}
+			if d.Platform == "ios" {
+				if d.ExternalID != iosExternalID || d.MAC != "" {
+					t.Fatalf("iOS 记录异常: %+v", d)
+				}
+			}
+		}
+		if !seen["android"] || !seen["ios"] {
+			t.Fatalf("平台记录缺失: %+v", my.Items)
+		}
+	})
+
+	t.Run("更新 Android 设备不影响 iOS 设备", func(t *testing.T) {
+		newer := now.Add(time.Minute)
+		update := `{"clientId":"android-client","devices":[{"id":"` + androidID + `","platform":"android","externalId":"AA:BB:CC:00:00:01","alias":"Android 设备改名","updatedAt":"` + newer.Format(time.RFC3339) + `"}]}`
+		rec := do(t, h, http.MethodPost, "/api/v1/sync/push", update, user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		my := decode[itemsResponse[struct {
+			Platform string `json:"platform"`
+			Alias    string `json:"alias"`
+		}]](t, do(t, h, http.MethodGet, "/api/v1/my/devices", "", user.Token, nil))
+		for _, d := range my.Items {
+			if d.Platform == "ios" && d.Alias != "iOS 设备" {
+				t.Fatalf("iOS 设备被覆盖: %+v", d)
+			}
+			if d.Platform == "android" && d.Alias != "Android 设备改名" {
+				t.Fatalf("Android 设备未更新: %+v", d)
+			}
+		}
+	})
+
+	t.Run("变更事件带 platform/externalId 与复合 entityId", func(t *testing.T) {
+		page := decode[struct {
+			Changes []struct {
+				EntityID string `json:"entityId"`
+				Payload  struct {
+					Platform   string `json:"platform"`
+					ExternalID string `json:"externalId"`
+				} `json:"payload"`
+			} `json:"changes"`
+		}](t, do(t, h, http.MethodGet, "/api/v1/sync/changes?cursor=0&limit=100", "", user.Token, nil))
+		found := false
+		for _, ch := range page.Changes {
+			if ch.Payload.Platform == "ios" {
+				found = true
+				if ch.Payload.ExternalID != iosExternalID {
+					t.Fatalf("iOS 变更 externalId=%q", ch.Payload.ExternalID)
+				}
+				want := user.UserID + ":ios:" + iosExternalID
+				if ch.EntityID != want {
+					t.Fatalf("entityId=%q want %q", ch.EntityID, want)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("未找到 iOS 变更: %s", rec.Body.String())
+		}
+	})
 }
 
 func TestCrossUserIsolation(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/model"
 	"github.com/platojobs/PJGoIoT/internal/store"
 	"github.com/platojobs/PJGoIoT/internal/store/postgres/sqlcgen"
+	"github.com/platojobs/PJGoIoT/internal/validate"
 )
 
 // Store 是 PostgreSQL 实现。查询由 sqlc 生成，Push 在单事务内完成。
@@ -104,6 +105,25 @@ func (s *Store) ListDeviceTypes(ctx context.Context) ([]model.DeviceType, error)
 		})
 	}
 	return out, nil
+}
+
+// GetDeviceType 实现 store.Store。供无法获取 MAC 的 iOS 端按型号查询公共元数据。
+func (s *Store) GetDeviceType(ctx context.Context, deviceType string) (model.DeviceType, error) {
+	row, err := s.q.GetDeviceType(ctx, deviceType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.DeviceType{}, store.ErrNotFound
+		}
+		return model.DeviceType{}, fmt.Errorf("查询设备类型失败: %w", err)
+	}
+	services, err := s.q.ListGATTServicesByDeviceType(ctx, deviceType)
+	if err != nil {
+		return model.DeviceType{}, fmt.Errorf("查询 GATT 服务失败: %w", err)
+	}
+	return model.DeviceType{
+		Type: row.Type, Name: row.Name, Vendor: row.Vendor,
+		Description: row.Description, GATTServices: mapGATTServices(services),
+	}, nil
 }
 
 // DeviceTypeExists 实现 store.Store。
@@ -212,7 +232,7 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	if err != nil {
 		return model.UserDevice{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	row, err := s.q.GetUserDeviceByMAC(ctx, sqlcgen.GetUserDeviceByMACParams{UserID: uid, Mac: mac})
+	row, err := s.q.GetUserDeviceByMAC(ctx, sqlcgen.GetUserDeviceByMACParams{UserID: uid, Mac: nullableString(mac)})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.UserDevice{}, store.ErrNotFound
@@ -265,17 +285,29 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	result := model.PushResult{Applied: []model.AppliedChange{}, Conflicts: []model.Conflict{}}
 
 	for _, dev := range req.Devices {
+		// 存储层再次规范化，避免直接调用 Store 时写入空唯一键。
+		platform, externalID, mac, err := validate.ResolveDeviceKey(dev.Platform, dev.ExternalID, dev.MAC)
+		if err != nil {
+			return model.PushResult{}, false, fmt.Errorf("设备键非法: %w", err)
+		}
+		dev.Platform, dev.ExternalID, dev.MAC = platform, externalID, mac
+
 		devID, err := uuid.Parse(dev.ID)
 		if err != nil {
 			return model.PushResult{}, false, fmt.Errorf("非法设备 id %q: %w", dev.ID, err)
 		}
-		existing, macHolder, err := findExisting(ctx, q, uid, devID, dev.MAC)
+		existing, keyHolder, err := findExisting(ctx, q, uid, devID, dev.Platform, dev.ExternalID)
 		if err != nil {
 			return model.PushResult{}, false, err
 		}
-		if existing != nil && macHolder != nil && existing.ID != macHolder.ID {
+		// 复合键已存在但客户端 id 不同：视为同一设备的新 id（upsert），沿用已有记录。
+		if existing == nil && keyHolder != nil {
+			existing, keyHolder = keyHolder, nil
+		}
+		if existing != nil && keyHolder != nil && existing.ID != keyHolder.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
-				ID: dev.ID, MAC: dev.MAC, Reason: "mac_taken", Server: *macHolder, Client: dev,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Reason: "key_taken", Server: *keyHolder, Client: dev,
 			})
 			continue
 		}
@@ -283,13 +315,15 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
-				ID: dev.ID, MAC: dev.MAC, Reason: decision.Reason, Server: *existing, Client: dev,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Reason: decision.Reason, Server: *existing, Client: dev,
 			})
 			continue
 		}
 		if decision.Noop {
 			result.Applied = append(result.Applied, model.AppliedChange{
-				ID: dev.ID, MAC: dev.MAC, Status: "unchanged", ServerSeq: existing.ServerSeq,
+				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+				Status: "unchanged", ServerSeq: existing.ServerSeq,
 			})
 			continue
 		}
@@ -301,6 +335,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		record := model.UserDevice{
 			ID:          dev.ID,
 			ClientID:    req.ClientID,
+			Platform:    dev.Platform,
+			ExternalID:  dev.ExternalID,
 			MAC:         dev.MAC,
 			Alias:       dev.Alias,
 			Group:       dev.Group,
@@ -317,7 +353,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 
 		if existing == nil {
 			_, err = q.InsertUserDevice(ctx, sqlcgen.InsertUserDeviceParams{
-				UserID: uid, ID: devID, ClientID: req.ClientID, Mac: dev.MAC,
+				UserID: uid, ID: devID, ClientID: req.ClientID,
+				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
 				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
 				DeletedAt: deletedAt, ServerSeq: seq,
@@ -328,7 +365,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 				return model.PushResult{}, false, fmt.Errorf("服务端设备 id 非法: %w", parseErr)
 			}
 			_, err = q.UpdateUserDevice(ctx, sqlcgen.UpdateUserDeviceParams{
-				NewID: devID, ClientID: req.ClientID, Mac: dev.MAC,
+				NewID: devID, ClientID: req.ClientID,
+				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
 				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
 				DeletedAt: deletedAt, ServerSeq: seq,
@@ -347,15 +385,17 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if dev.Deleted {
 			op = "delete"
 		}
+		entityID := userID + ":" + dev.Platform + ":" + dev.ExternalID
 		if err := q.InsertChangeLog(ctx, sqlcgen.InsertChangeLogParams{
-			Seq: seq, UserID: uid, Entity: "user_device", EntityID: dev.ID,
+			Seq: seq, UserID: uid, Entity: "user_device", EntityID: entityID,
 			Op: op, Payload: payload, ServerTs: now,
 		}); err != nil {
 			return model.PushResult{}, false, fmt.Errorf("写入变更日志失败: %w", err)
 		}
 
 		result.Applied = append(result.Applied, model.AppliedChange{
-			ID: dev.ID, MAC: dev.MAC, Status: "applied", ServerSeq: seq,
+			ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
+			Status: "applied", ServerSeq: seq,
 		})
 	}
 
@@ -411,18 +451,23 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	return page, nil
 }
 
-func findExisting(ctx context.Context, q *sqlcgen.Queries, uid uuid.UUID, devID uuid.UUID, mac string) (*model.UserDevice, *model.UserDevice, error) {
+// findExisting 按客户端 id 与复合键 (platform, externalId) 查找已有记录。
+// 返回 (按 id 命中的记录, 按复合键命中的其他记录, error)；两个结果可能同时存在，
+// 调用方据此判断是否发生 key_taken 冲突。
+func findExisting(ctx context.Context, q *sqlcgen.Queries, uid uuid.UUID, devID uuid.UUID, platform, externalID string) (*model.UserDevice, *model.UserDevice, error) {
 	row, err := q.GetUserDeviceByIDForUpdate(ctx, sqlcgen.GetUserDeviceByIDForUpdateParams{UserID: uid, ID: devID})
 	if err == nil {
 		existing := mapUserDevice(row)
-		if row.Mac == mac {
+		if row.Platform == platform && row.ExternalID == externalID {
 			return &existing, nil, nil
 		}
-		// id 相同但 mac 变化：需要确认新 mac 是否已被同用户的其他记录占用。
-		macRow, err := q.GetUserDeviceByMACForUpdate(ctx, sqlcgen.GetUserDeviceByMACForUpdateParams{UserID: uid, Mac: mac})
+		// id 相同但唯一键变化：需要确认新键是否已被同用户的其他记录占用。
+		keyRow, err := q.GetUserDeviceByKeyForUpdate(ctx, sqlcgen.GetUserDeviceByKeyForUpdateParams{
+			UserID: uid, Platform: platform, ExternalID: externalID,
+		})
 		switch {
 		case err == nil:
-			holder := mapUserDevice(macRow)
+			holder := mapUserDevice(keyRow)
 			return &existing, &holder, nil
 		case errors.Is(err, sql.ErrNoRows):
 			return &existing, nil, nil
@@ -434,10 +479,12 @@ func findExisting(ctx context.Context, q *sqlcgen.Queries, uid uuid.UUID, devID 
 		return nil, nil, fmt.Errorf("查询用户设备失败: %w", err)
 	}
 
-	row, err = q.GetUserDeviceByMACForUpdate(ctx, sqlcgen.GetUserDeviceByMACForUpdateParams{UserID: uid, Mac: mac})
+	keyRow, err := q.GetUserDeviceByKeyForUpdate(ctx, sqlcgen.GetUserDeviceByKeyForUpdateParams{
+		UserID: uid, Platform: platform, ExternalID: externalID,
+	})
 	if err == nil {
-		existing := mapUserDevice(row)
-		return &existing, nil, nil
+		existing := mapUserDevice(keyRow)
+		return nil, &existing, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, fmt.Errorf("查询用户设备失败: %w", err)
@@ -445,11 +492,20 @@ func findExisting(ctx context.Context, q *sqlcgen.Queries, uid uuid.UUID, devID 
 	return nil, nil, nil
 }
 
+func nullableString(v string) sql.NullString {
+	if v == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: v, Valid: true}
+}
+
 func mapUserDevice(row sqlcgen.UserDevice) model.UserDevice {
 	d := model.UserDevice{
 		ID:          row.ID.String(),
 		ClientID:    row.ClientID,
-		MAC:         row.Mac,
+		Platform:    row.Platform,
+		ExternalID:  row.ExternalID,
+		MAC:         row.Mac.String,
 		Alias:       row.Alias,
 		Group:       row.Group,
 		Rules:       row.Rules,

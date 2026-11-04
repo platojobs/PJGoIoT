@@ -53,10 +53,14 @@ type Accessory struct {
 }
 
 // UserDevice 是用户私有设备记录。id 由客户端生成，serverSeq 由服务端同步序列填充。
+// 唯一键为 (user_id, platform, externalId)：Android 的 externalId 为大写 MAC，
+// iOS 的 externalId 为 CBPeripheral.identifier。mac 仅作为可选元数据保留。
 type UserDevice struct {
 	ID          string          `json:"id"`
 	ClientID    string          `json:"clientId"`
-	MAC         string          `json:"mac"`
+	Platform    string          `json:"platform"`
+	ExternalID  string          `json:"externalId"`
+	MAC         string          `json:"mac,omitempty"`
 	Alias       string          `json:"alias"`
 	Group       string          `json:"group"`
 	Rules       json.RawMessage `json:"rules"`
@@ -69,7 +73,9 @@ type UserDevice struct {
 // PushDevice 是客户端在一次 push 中提交的单台设备。
 type PushDevice struct {
 	ID          string          `json:"id"`
-	MAC         string          `json:"mac"`
+	Platform    string          `json:"platform"`
+	ExternalID  string          `json:"externalId"`
+	MAC         string          `json:"mac,omitempty"`
 	Alias       string          `json:"alias"`
 	Group       string          `json:"group"`
 	Rules       json.RawMessage `json:"rules"`
@@ -86,19 +92,23 @@ type PushRequest struct {
 
 // AppliedChange 表示一条被服务端接受的变更。
 type AppliedChange struct {
-	ID        string `json:"id"`
-	MAC       string `json:"mac"`
-	Status    string `json:"status"` // applied：已写入；unchanged：内容一致，无新变更
-	ServerSeq int64  `json:"serverSeq"`
+	ID         string `json:"id"`
+	Platform   string `json:"platform"`
+	ExternalID string `json:"externalId"`
+	MAC        string `json:"mac,omitempty"`
+	Status     string `json:"status"` // applied：已写入；unchanged：内容一致，无新变更
+	ServerSeq  int64  `json:"serverSeq"`
 }
 
 // Conflict 表示 LWW 判定服务端获胜、客户端数据未被写入。
 type Conflict struct {
-	ID     string     `json:"id"`
-	MAC    string     `json:"mac"`
-	Reason string     `json:"reason"`
-	Server UserDevice `json:"server"`
-	Client PushDevice `json:"client"`
+	ID         string     `json:"id"`
+	Platform   string     `json:"platform"`
+	ExternalID string     `json:"externalId"`
+	MAC        string     `json:"mac,omitempty"`
+	Reason     string     `json:"reason"`
+	Server     UserDevice `json:"server"`
+	Client     PushDevice `json:"client"`
 }
 
 // PushResult 是 POST /sync/push 的响应体。

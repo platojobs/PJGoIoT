@@ -47,6 +47,21 @@ func (s *Server) handleDeviceTypes(c *gin.Context) {
 	c.JSON(http.StatusOK, listResponse{Items: types})
 }
 
+func (s *Server) handleDeviceType(c *gin.Context) {
+	var param typeURIParam
+	if err := c.ShouldBindUri(&param); err != nil {
+		failValidation(c, err)
+		return
+	}
+	deviceType := strings.ToLower(strings.TrimSpace(param.Type))
+	item, err := s.store.GetDeviceType(c.Request.Context(), deviceType)
+	if err != nil {
+		s.storeFailure(c, "查询设备类型失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
 func (s *Server) handleFirmwares(c *gin.Context) {
 	var param typeURIParam
 	if err := c.ShouldBindUri(&param); err != nil {

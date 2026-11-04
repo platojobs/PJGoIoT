@@ -88,7 +88,7 @@ type UserDevice struct {
 	UserID      uuid.UUID
 	ID          uuid.UUID
 	ClientID    string
-	Mac         string
+	Mac         sql.NullString
 	Alias       string
 	Group       string
 	Rules       json.RawMessage
@@ -97,4 +97,6 @@ type UserDevice struct {
 	DeletedAt   sql.NullTime
 	ServerSeq   int64
 	CreatedAt   time.Time
+	Platform    string
+	ExternalID  string
 }

@@ -56,6 +56,7 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 
 	deviceTypesGroup := api.Group("/device-types")
 	deviceTypesGroup.GET("", s.handleDeviceTypes)
+	deviceTypesGroup.GET("/:type", s.handleDeviceType)
 	deviceTypesGroup.GET("/:type/firmwares", s.handleFirmwares)
 	deviceTypesGroup.GET("/:type/accessories", s.handleAccessories)
 

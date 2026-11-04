@@ -14,6 +14,11 @@ SELECT type, name, vendor, description
 FROM device_types
 ORDER BY type;
 
+-- name: GetDeviceType :one
+SELECT type, name, vendor, description
+FROM device_types
+WHERE type = $1;
+
 -- name: ListAllGATTServices :many
 SELECT device_type, uuid, name
 FROM gatt_services

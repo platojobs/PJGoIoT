@@ -53,8 +53,13 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("创建用户 B 失败: %v", err)
 	}
+	hashC := hashOf("token-c-" + uuid.NewString())
+	userC, err := st.CreateUserWithToken(context.Background(), hashC)
+	if err != nil {
+		t.Fatalf("创建用户 C 失败: %v", err)
+	}
 	t.Cleanup(func() {
-		cleanupDB.Exec("DELETE FROM users WHERE id = $1 OR id = $2", userA, userB)
+		cleanupDB.Exec("DELETE FROM users WHERE id = $1 OR id = $2 OR id = $3", userA, userB, userC)
 	})
 
 	t.Run("token 解析", func(t *testing.T) {
@@ -195,6 +200,68 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		pageB, _ := st.Changes(context.Background(), userB, 0, 100)
 		if len(pageA.Changes) != 3 || len(pageB.Changes) != 1 {
 			t.Fatalf("变更隔离异常: A=%d B=%d", len(pageA.Changes), len(pageB.Changes))
+		}
+	})
+
+	t.Run("同一用户 Android 与 iOS 复合键互不覆盖", func(t *testing.T) {
+		androidID := uuid.NewString()
+		iosID := uuid.NewString()
+		iosExternal := "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+		userCReq := model.PushRequest{ClientID: "multi-platform", Devices: []model.PushDevice{
+			{ID: androidID, Platform: "android", ExternalID: "AA:BB:CC:00:00:03", MAC: "aa:bb:cc:00:00:03", Alias: "Android 设备", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
+			{ID: iosID, Platform: "ios", ExternalID: iosExternal, Alias: "iOS 设备", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
+		}}
+		res, _, err := st.Push(context.Background(), userC, userCReq, store.PushOptions{})
+		if err != nil || len(res.Applied) != 2 {
+			t.Fatalf("多平台 push 失败: %+v err=%v", res, err)
+		}
+		list, err := st.ListUserDevices(context.Background(), userC)
+		if err != nil || len(list) != 2 {
+			t.Fatalf("设备数量=%d err=%v", len(list), err)
+		}
+		for _, d := range list {
+			switch d.Platform {
+			case "android":
+				if d.ExternalID != "AA:BB:CC:00:00:03" || d.MAC != "aa:bb:cc:00:00:03" {
+					t.Fatalf("Android 记录异常: %+v", d)
+				}
+			case "ios":
+				if d.ExternalID != iosExternal || d.MAC != "" {
+					t.Fatalf("iOS 记录异常: %+v", d)
+				}
+			default:
+				t.Fatalf("未知 platform: %+v", d)
+			}
+		}
+
+		// 更新 Android 设备不应影响 iOS 记录。
+		update := userCReq
+		update.Devices = []model.PushDevice{{
+			ID: androidID, Platform: "android", ExternalID: "AA:BB:CC:00:00:03", MAC: "aa:bb:cc:00:00:03",
+			Alias: "Android 改名", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(time.Minute),
+		}}
+		if _, _, err := st.Push(context.Background(), userC, update, store.PushOptions{}); err != nil {
+			t.Fatalf("更新 Android 失败: %v", err)
+		}
+		list, _ = st.ListUserDevices(context.Background(), userC)
+		for _, d := range list {
+			if d.Platform == "ios" && d.Alias != "iOS 设备" {
+				t.Fatalf("iOS 设备被覆盖: %+v", d)
+			}
+		}
+
+		// 复合键相同但客户端 id 变化：应沿用已有记录而不是报唯一键冲突。
+		rekey := model.PushRequest{ClientID: "rekey", Devices: []model.PushDevice{{
+			ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:03",
+			Alias: "换 id 后", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(2 * time.Minute),
+		}}}
+		res, _, err = st.Push(context.Background(), userC, rekey, store.PushOptions{})
+		if err != nil || len(res.Applied) != 1 {
+			t.Fatalf("同一复合键换 id 失败: %+v err=%v", res, err)
+		}
+		list, _ = st.ListUserDevices(context.Background(), userC)
+		if len(list) != 2 {
+			t.Fatalf("换 id 后设备数量=%d", len(list))
 		}
 	})
 }
