@@ -339,6 +339,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
 			dev.DeviceType = *existing.DeviceType
 		}
+		// alias / advertisedName / group 缺省表示未上报，保持原值；空串表示显式清除。
+		alias, advertisedName, group := dev.ResolvePresence(existing)
 		if existing != nil && keyHolder != nil && existing.ID != keyHolder.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
@@ -368,17 +370,18 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			return model.PushResult{}, false, fmt.Errorf("分配变更序列失败: %w", err)
 		}
 		record := model.UserDevice{
-			ID:          dev.ID,
-			ClientID:    req.ClientID,
-			Platform:    dev.Platform,
-			ExternalID:  dev.ExternalID,
-			MAC:         dev.MAC,
-			Alias:       dev.Alias,
-			Group:       dev.Group,
-			Rules:       dev.Rules,
-			ScanRecords: dev.ScanRecords,
-			UpdatedAt:   decision.EffectiveUpdatedAt,
-			ServerSeq:   seq,
+			ID:             dev.ID,
+			ClientID:       req.ClientID,
+			Platform:       dev.Platform,
+			ExternalID:     dev.ExternalID,
+			MAC:            dev.MAC,
+			Alias:          alias,
+			AdvertisedName: advertisedName,
+			Group:          group,
+			Rules:          dev.Rules,
+			ScanRecords:    dev.ScanRecords,
+			UpdatedAt:      decision.EffectiveUpdatedAt,
+			ServerSeq:      seq,
 		}
 		var deletedAt sql.NullTime
 		if dev.Deleted {
@@ -396,7 +399,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			_, err = q.InsertUserDevice(ctx, sqlcgen.InsertUserDeviceParams{
 				UserID: uid, ID: devID, ClientID: req.ClientID,
 				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
-				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
+				Alias: alias, AdvertisedName: advertisedName, GroupName: group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
 				DeletedAt: deletedAt, ServerSeq: seq, DeviceType: nullableString(dev.DeviceType),
 			})
@@ -408,7 +411,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			_, err = q.UpdateUserDevice(ctx, sqlcgen.UpdateUserDeviceParams{
 				NewID: devID, ClientID: req.ClientID,
 				Platform: dev.Platform, ExternalID: dev.ExternalID, Mac: nullableString(dev.MAC),
-				Alias: dev.Alias, GroupName: dev.Group, Rules: dev.Rules,
+				Alias: alias, AdvertisedName: advertisedName, GroupName: group, Rules: dev.Rules,
 				ScanRecords: dev.ScanRecords, UpdatedAt: decision.EffectiveUpdatedAt,
 				DeletedAt: deletedAt, ServerSeq: seq, DeviceType: nullableString(dev.DeviceType),
 				UserID: uid, OldID: oldID,
@@ -542,17 +545,18 @@ func nullableString(v string) sql.NullString {
 
 func mapUserDevice(row sqlcgen.UserDevice) model.UserDevice {
 	d := model.UserDevice{
-		ID:          row.ID.String(),
-		ClientID:    row.ClientID,
-		Platform:    row.Platform,
-		ExternalID:  row.ExternalID,
-		MAC:         row.Mac.String,
-		Alias:       row.Alias,
-		Group:       row.Group,
-		Rules:       row.Rules,
-		ScanRecords: row.ScanRecords,
-		UpdatedAt:   row.UpdatedAt.UTC(),
-		ServerSeq:   row.ServerSeq,
+		ID:             row.ID.String(),
+		ClientID:       row.ClientID,
+		Platform:       row.Platform,
+		ExternalID:     row.ExternalID,
+		MAC:            row.Mac.String,
+		Alias:          row.Alias,
+		AdvertisedName: row.AdvertisedName,
+		Group:          row.Group,
+		Rules:          row.Rules,
+		ScanRecords:    row.ScanRecords,
+		UpdatedAt:      row.UpdatedAt.UTC(),
+		ServerSeq:      row.ServerSeq,
 	}
 	if row.DeletedAt.Valid {
 		t := row.DeletedAt.Time.UTC()

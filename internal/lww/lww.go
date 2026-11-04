@@ -78,7 +78,19 @@ func SameContent(server *model.UserDevice, client model.PushDevice) bool {
 	if server.Platform != client.Platform || server.ExternalID != client.ExternalID {
 		return false
 	}
-	if server.MAC != client.MAC || server.Alias != client.Alias || server.Group != client.Group {
+	if server.MAC != client.MAC {
+		return false
+	}
+	// 可缺省字段仅在客户端上报时参与比较：
+	// 缺失表示「未上报，保持原值」，不应与服务端已存值产生冲突；
+	// 上报空串是显式清除语义，需与服务端值比较。
+	if client.Alias != nil && server.Alias != *client.Alias {
+		return false
+	}
+	if client.AdvertisedName != nil && server.AdvertisedName != *client.AdvertisedName {
+		return false
+	}
+	if client.Group != nil && server.Group != *client.Group {
 		return false
 	}
 	if (server.DeletedAt != nil) != client.Deleted {

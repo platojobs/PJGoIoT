@@ -72,7 +72,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	deviceID := uuid.NewString()
 	now := time.Now().UTC()
 	req := model.PushRequest{ClientID: "integration-client", Devices: []model.PushDevice{{
-		ID: deviceID, MAC: "aa:bb:cc:00:00:01", Alias: "设备 A", Group: "默认",
+		ID: deviceID, MAC: "aa:bb:cc:00:00:01", Alias: strPtr("设备 A"), Group: strPtr("默认"),
 		Rules: []byte(`{"sampleRate":10}`), ScanRecords: []byte(`[]`),
 		UpdatedAt: now,
 	}}}
@@ -116,7 +116,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	t.Run("旧时间冲突不覆盖", func(t *testing.T) {
 		old := req
 		old.Devices[0].UpdatedAt = now.Add(-time.Minute)
-		old.Devices[0].Alias = "过期别名"
+		old.Devices[0].Alias = strPtr("过期别名")
 		res, _, err := st.Push(context.Background(), userA, old, store.PushOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -129,7 +129,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	t.Run("新时间覆盖并写入变更", func(t *testing.T) {
 		newer := req
 		newer.Devices[0].UpdatedAt = now.Add(45 * time.Second)
-		newer.Devices[0].Alias = "设备 A2"
+		newer.Devices[0].Alias = strPtr("设备 A2")
 		res, _, err := st.Push(context.Background(), userA, newer, store.PushOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -184,7 +184,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	t.Run("跨用户隔离", func(t *testing.T) {
 		const macB = "aa:bb:cc:00:00:02"
 		otherReq := model.PushRequest{Devices: []model.PushDevice{{
-			ID: uuid.NewString(), MAC: macB, Alias: "B 的设备",
+			ID: uuid.NewString(), MAC: macB, Alias: strPtr("B 的设备"),
 			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now,
 		}}}
 		if _, _, err := st.Push(context.Background(), userB, otherReq, store.PushOptions{}); err != nil {
@@ -208,8 +208,8 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		iosID := uuid.NewString()
 		iosExternal := "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
 		userCReq := model.PushRequest{ClientID: "multi-platform", Devices: []model.PushDevice{
-			{ID: androidID, Platform: "android", ExternalID: "AA:BB:CC:00:00:03", MAC: "aa:bb:cc:00:00:03", Alias: "Android 设备", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
-			{ID: iosID, Platform: "ios", ExternalID: iosExternal, Alias: "iOS 设备", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
+			{ID: androidID, Platform: "android", ExternalID: "AA:BB:CC:00:00:03", MAC: "aa:bb:cc:00:00:03", Alias: strPtr("Android 设备"), Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
+			{ID: iosID, Platform: "ios", ExternalID: iosExternal, Alias: strPtr("iOS 设备"), Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now},
 		}}
 		res, _, err := st.Push(context.Background(), userC, userCReq, store.PushOptions{})
 		if err != nil || len(res.Applied) != 2 {
@@ -251,7 +251,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		update := userCReq
 		update.Devices = []model.PushDevice{{
 			ID: androidID, Platform: "android", ExternalID: "AA:BB:CC:00:00:03", MAC: "aa:bb:cc:00:00:03",
-			Alias: "Android 改名", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(time.Minute),
+			Alias: strPtr("Android 改名"), Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(time.Minute),
 		}}
 		if _, _, err := st.Push(context.Background(), userC, update, store.PushOptions{}); err != nil {
 			t.Fatalf("更新 Android 失败: %v", err)
@@ -266,7 +266,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		// 复合键相同但客户端 id 变化：应沿用已有记录而不是报唯一键冲突。
 		rekey := model.PushRequest{ClientID: "rekey", Devices: []model.PushDevice{{
 			ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:03",
-			Alias: "换 id 后", Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(2 * time.Minute),
+			Alias: strPtr("换 id 后"), Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(2 * time.Minute),
 		}}}
 		res, _, err = st.Push(context.Background(), userC, rekey, store.PushOptions{})
 		if err != nil || len(res.Applied) != 1 {
@@ -310,7 +310,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		typedExternal := "0F1E2D3C-4B5A-4968-8777-666655554444"
 		typedReq := model.PushRequest{ClientID: "typed", Devices: []model.PushDevice{{
 			ID: uuid.NewString(), Platform: "ios", ExternalID: typedExternal,
-			DeviceType: "environmental_sensor", Alias: "上报型号",
+			DeviceType: "environmental_sensor", Alias: strPtr("上报型号"),
 			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(3 * time.Minute),
 		}}}
 		if _, _, err := st.Push(context.Background(), userC, typedReq, store.PushOptions{}); err != nil {
@@ -337,7 +337,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		unknownExternal := "9A8B7C6D-5E4F-4A3B-8C2D-1E0F9A8B7C6D"
 		unknownReq := model.PushRequest{ClientID: "unknown", Devices: []model.PushDevice{{
 			ID: uuid.NewString(), Platform: "ios", ExternalID: unknownExternal,
-			DeviceType: "unregistered_model", Alias: "未注册",
+			DeviceType: "unregistered_model", Alias: strPtr("未注册"),
 			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(4 * time.Minute),
 		}}}
 		if _, _, err := st.Push(context.Background(), userC, unknownReq, store.PushOptions{}); err != nil {
@@ -352,6 +352,85 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		}
 		if unknown.Vendor != nil || unknown.FirmwareVersion != nil || len(unknown.Compatibility) != 0 {
 			t.Fatalf("未注册型号关联字段应为 null: %+v", unknown)
+		}
+	})
+
+	t.Run("可缺省字段语义与广播名隔离", func(t *testing.T) {
+		const external = "ABC12345-1234-4ABC-8DEF-1234567890AB"
+		deviceID := uuid.NewString()
+		ctx := context.Background()
+
+		base := model.PushRequest{ClientID: "presence", Devices: []model.PushDevice{{
+			ID: deviceID, Platform: "ios", ExternalID: external,
+			Alias: strPtr("我的设备"), AdvertisedName: strPtr("PJ-Sensor"), Group: strPtr("客厅"),
+			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(-40 * time.Minute),
+		}}}
+		if _, _, err := st.Push(ctx, userC, base, store.PushOptions{}); err != nil {
+			t.Fatalf("初始化设备失败: %v", err)
+		}
+
+		// 只上报广播名：alias/group 保持原值。
+		advertisedOnly := model.PushRequest{Devices: []model.PushDevice{{
+			ID: deviceID, Platform: "ios", ExternalID: external,
+			AdvertisedName: strPtr("PJ-Sensor-2"),
+			Rules:          []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(-39 * time.Minute),
+		}}}
+		if _, _, err := st.Push(ctx, userC, advertisedOnly, store.PushOptions{}); err != nil {
+			t.Fatalf("上报广播名失败: %v", err)
+		}
+		got, err := st.GetUserDeviceByKey(ctx, userC, "ios", external)
+		if err != nil {
+			t.Fatalf("查询失败: %v", err)
+		}
+		if got.Alias != "我的设备" || got.Group != "客厅" || got.AdvertisedName != "PJ-Sensor-2" {
+			t.Fatalf("广播名更新影响了别名或分组: %+v", got)
+		}
+
+		// 只上报别名：广播名保持原值。
+		aliasOnly := model.PushRequest{Devices: []model.PushDevice{{
+			ID: deviceID, Platform: "ios", ExternalID: external,
+			Alias: strPtr("用户改名"),
+			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(-38 * time.Minute),
+		}}}
+		if _, _, err := st.Push(ctx, userC, aliasOnly, store.PushOptions{}); err != nil {
+			t.Fatalf("上报别名失败: %v", err)
+		}
+		got, err = st.GetUserDeviceByKey(ctx, userC, "ios", external)
+		if err != nil {
+			t.Fatalf("查询失败: %v", err)
+		}
+		if got.Alias != "用户改名" || got.AdvertisedName != "PJ-Sensor-2" || got.Group != "客厅" {
+			t.Fatalf("别名更新影响了广播名: %+v", got)
+		}
+
+		// group 空串：显式清除；后续缺省 group 不得让旧分组复活。
+		clearGroup := model.PushRequest{Devices: []model.PushDevice{{
+			ID: deviceID, Platform: "ios", ExternalID: external,
+			Group: strPtr(""),
+			Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(-37 * time.Minute),
+		}}}
+		if _, _, err := st.Push(ctx, userC, clearGroup, store.PushOptions{}); err != nil {
+			t.Fatalf("清空分组失败: %v", err)
+		}
+		got, err = st.GetUserDeviceByKey(ctx, userC, "ios", external)
+		if err != nil || got.Group != "" {
+			t.Fatalf("分组未被清空: group=%q err=%v", got.Group, err)
+		}
+
+		keepGroup := model.PushRequest{Devices: []model.PushDevice{{
+			ID: deviceID, Platform: "ios", ExternalID: external,
+			AdvertisedName: strPtr("PJ-Sensor-3"),
+			Rules:          []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now.Add(-36 * time.Minute),
+		}}}
+		if _, _, err := st.Push(ctx, userC, keepGroup, store.PushOptions{}); err != nil {
+			t.Fatalf("缺省 group 写入失败: %v", err)
+		}
+		got, err = st.GetUserDeviceByKey(ctx, userC, "ios", external)
+		if err != nil {
+			t.Fatalf("查询失败: %v", err)
+		}
+		if got.Group != "" || got.Alias != "用户改名" || got.AdvertisedName != "PJ-Sensor-3" {
+			t.Fatalf("缺省字段未保持或分组复活: %+v", got)
 		}
 	})
 }
@@ -385,3 +464,6 @@ func hashOf(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
+
+// strPtr 用于构造可缺省字段：非 nil 表示显式上报，nil 表示未上报。
+func strPtr(s string) *string { return &s }

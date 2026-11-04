@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	maxPushDevices    = 100
-	maxAliasLength    = 100
-	maxGroupLength    = 64
-	maxClientIDLength = 128
-	maxIdempotencyKey = 128
+	maxPushDevices          = 100
+	maxAliasLength          = 100
+	maxAdvertisedNameLength = 248
+	maxGroupLength          = 64
+	maxClientIDLength       = 128
+	maxIdempotencyKey       = 128
 )
 
 // macURIParam 用 ShouldBindUri 读取路径参数。
@@ -44,17 +45,18 @@ type pushPayload struct {
 }
 
 type pushDevicePayload struct {
-	ID          string          `json:"id" binding:"required,uuid"`
-	Platform    string          `json:"platform" binding:"omitempty,oneof=android ios"`
-	ExternalID  string          `json:"externalId" binding:"max=128"`
-	MAC         string          `json:"mac" binding:"max=64"`
-	DeviceType  string          `json:"deviceType" binding:"omitempty,max=64"`
-	Alias       string          `json:"alias" binding:"max=100"`
-	Group       string          `json:"group" binding:"max=64"`
-	Rules       json.RawMessage `json:"rules"`
-	ScanRecords json.RawMessage `json:"scanRecords"`
-	UpdatedAt   time.Time       `json:"updatedAt" binding:"required"`
-	Deleted     bool            `json:"deleted"`
+	ID             string          `json:"id" binding:"required,uuid"`
+	Platform       string          `json:"platform" binding:"omitempty,oneof=android ios"`
+	ExternalID     string          `json:"externalId" binding:"max=128"`
+	MAC            string          `json:"mac" binding:"max=64"`
+	DeviceType     string          `json:"deviceType" binding:"omitempty,max=64"`
+	Alias          *string         `json:"alias"`
+	AdvertisedName *string         `json:"advertisedName"`
+	Group          *string         `json:"group"`
+	Rules          json.RawMessage `json:"rules"`
+	ScanRecords    json.RawMessage `json:"scanRecords"`
+	UpdatedAt      time.Time       `json:"updatedAt" binding:"required"`
+	Deleted        bool            `json:"deleted"`
 }
 
 // toModel 把 DTO 转成领域请求；字段 JSON 结构对外保持不变。
@@ -62,17 +64,18 @@ func (p pushPayload) toModel() model.PushRequest {
 	req := model.PushRequest{ClientID: p.ClientID, Devices: make([]model.PushDevice, 0, len(p.Devices))}
 	for _, d := range p.Devices {
 		req.Devices = append(req.Devices, model.PushDevice{
-			ID:          d.ID,
-			Platform:    d.Platform,
-			ExternalID:  d.ExternalID,
-			MAC:         d.MAC,
-			DeviceType:  d.DeviceType,
-			Alias:       d.Alias,
-			Group:       d.Group,
-			Rules:       d.Rules,
-			ScanRecords: d.ScanRecords,
-			UpdatedAt:   d.UpdatedAt,
-			Deleted:     d.Deleted,
+			ID:             d.ID,
+			Platform:       d.Platform,
+			ExternalID:     d.ExternalID,
+			MAC:            d.MAC,
+			DeviceType:     d.DeviceType,
+			Alias:          d.Alias,
+			AdvertisedName: d.AdvertisedName,
+			Group:          d.Group,
+			Rules:          d.Rules,
+			ScanRecords:    d.ScanRecords,
+			UpdatedAt:      d.UpdatedAt,
+			Deleted:        d.Deleted,
 		})
 	}
 	return req
@@ -120,17 +123,31 @@ func normalizePush(req *model.PushRequest) error {
 		}
 		seenKey[key] = struct{}{}
 
-		dev.Alias = strings.TrimSpace(dev.Alias)
-		if len([]rune(dev.Alias)) > maxAliasLength {
-			return fmt.Errorf("devices[%d].alias 长度不能超过 %d", i, maxAliasLength)
+		if dev.Alias != nil {
+			alias := strings.TrimSpace(*dev.Alias)
+			dev.Alias = &alias
+			if len([]rune(alias)) > maxAliasLength {
+				return fmt.Errorf("devices[%d].alias 长度不能超过 %d", i, maxAliasLength)
+			}
+		}
+		if dev.AdvertisedName != nil {
+			name := strings.TrimSpace(*dev.AdvertisedName)
+			dev.AdvertisedName = &name
+			if len([]rune(name)) > maxAdvertisedNameLength {
+				return fmt.Errorf("devices[%d].advertisedName 长度不能超过 %d", i, maxAdvertisedNameLength)
+			}
 		}
 		dev.DeviceType = strings.ToLower(strings.TrimSpace(dev.DeviceType))
 		if len([]rune(dev.DeviceType)) > 64 {
 			return fmt.Errorf("devices[%d].deviceType 长度不能超过 64", i)
 		}
-		dev.Group = strings.TrimSpace(dev.Group)
-		if len([]rune(dev.Group)) > maxGroupLength {
-			return fmt.Errorf("devices[%d].group 长度不能超过 %d", i, maxGroupLength)
+		if dev.Group != nil {
+			// 空串保留：表示显式清除分组，不能当作「未上报」。
+			group := strings.TrimSpace(*dev.Group)
+			dev.Group = &group
+			if len([]rune(group)) > maxGroupLength {
+				return fmt.Errorf("devices[%d].group 长度不能超过 %d", i, maxGroupLength)
+			}
 		}
 
 		if dev.UpdatedAt.IsZero() {

@@ -81,6 +81,7 @@ type UserDevice struct {
 	ExternalID      string          `json:"externalId"`
 	MAC             string          `json:"mac,omitempty"`
 	Alias           string          `json:"alias"`
+	AdvertisedName  string          `json:"advertisedName"`
 	Group           string          `json:"group"`
 	Rules           json.RawMessage `json:"rules"`
 	ScanRecords     json.RawMessage `json:"scanRecords"`
@@ -94,19 +95,45 @@ type UserDevice struct {
 }
 
 // PushDevice 是客户端在一次 push 中提交的单台设备。
-// deviceType 可选；客户端已知型号时应上报，便于服务端关联公共元数据。
+//
+// 可缺省字段使用指针区分「未上报」与「显式置空」：
+//   - nil：未上报，服务端保持原值；
+//   - 非 nil 的 ""：显式清除（group 为空串即清除分组）；
+//   - 非 nil 的其他值：覆盖原值。
+//
+// alias 是用户设置的别名，只应在用户操作时上报；advertisedName 是设备广播名，
+// 客户端扫描时可覆盖上报，二者互不影响。
 type PushDevice struct {
-	ID          string          `json:"id"`
-	Platform    string          `json:"platform"`
-	ExternalID  string          `json:"externalId"`
-	MAC         string          `json:"mac,omitempty"`
-	DeviceType  string          `json:"deviceType,omitempty"`
-	Alias       string          `json:"alias"`
-	Group       string          `json:"group"`
-	Rules       json.RawMessage `json:"rules"`
-	ScanRecords json.RawMessage `json:"scanRecords"`
-	UpdatedAt   time.Time       `json:"updatedAt"`
-	Deleted     bool            `json:"deleted"`
+	ID             string          `json:"id"`
+	Platform       string          `json:"platform"`
+	ExternalID     string          `json:"externalId"`
+	MAC            string          `json:"mac,omitempty"`
+	DeviceType     string          `json:"deviceType,omitempty"`
+	Alias          *string         `json:"alias,omitempty"`
+	AdvertisedName *string         `json:"advertisedName,omitempty"`
+	Group          *string         `json:"group,omitempty"`
+	Rules          json.RawMessage `json:"rules"`
+	ScanRecords    json.RawMessage `json:"scanRecords"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
+	Deleted        bool            `json:"deleted"`
+}
+
+// ResolvePresence 按「未上报保持原值、显式值覆盖」的规则，解析出本次写入应采用的值。
+// existing 为 nil（新建）时未上报字段取空串。
+func (d PushDevice) ResolvePresence(existing *UserDevice) (alias, advertisedName, group string) {
+	if existing != nil {
+		alias, advertisedName, group = existing.Alias, existing.AdvertisedName, existing.Group
+	}
+	if d.Alias != nil {
+		alias = *d.Alias
+	}
+	if d.AdvertisedName != nil {
+		advertisedName = *d.AdvertisedName
+	}
+	if d.Group != nil {
+		group = *d.Group
+	}
+	return alias, advertisedName, group
 }
 
 // PushRequest 是 POST /sync/push 的请求体。

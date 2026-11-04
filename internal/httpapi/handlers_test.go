@@ -901,6 +901,84 @@ func isJSONNull(raw json.RawMessage) bool {
 	return trimmed == "" || trimmed == "null"
 }
 
+// TestPresenceSemantics 覆盖 v0.3.3 的可缺省字段语义：
+// 字段缺失=未上报、保持原值；group 空串=显式清除；alias 与 advertisedName 互不覆盖。
+func TestPresenceSemantics(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+
+	const (
+		external = "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+		deviceID = "66666666-6666-4666-8666-666666666666"
+	)
+	path := "/api/v1/my/devices/ios/" + external
+	base := time.Now().UTC().Add(-10 * time.Minute)
+
+	type deviceView struct {
+		Alias          string `json:"alias"`
+		AdvertisedName string `json:"advertisedName"`
+		Group          string `json:"group"`
+	}
+
+	push := func(t *testing.T, at time.Time, fields string) {
+		t.Helper()
+		body := `{"clientId":"presence","devices":[{"id":"` + deviceID + `","platform":"ios","externalId":"` + external + `",` + fields + `"updatedAt":"` + at.Format(time.RFC3339) + `"}]}`
+		rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	current := func(t *testing.T) deviceView {
+		t.Helper()
+		rec := do(t, h, http.MethodGet, path, "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("查询 status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return decode[deviceView](t, rec)
+	}
+
+	push(t, base, `"alias":"我的设备","advertisedName":"PJ-Sensor","group":"客厅",`)
+	got := current(t)
+	if got.Alias != "我的设备" || got.AdvertisedName != "PJ-Sensor" || got.Group != "客厅" {
+		t.Fatalf("首次写入字段异常: %+v", got)
+	}
+
+	// 只上报广播名：不得覆盖用户别名与分组。
+	push(t, base.Add(time.Minute), `"advertisedName":"PJ-Sensor-2",`)
+	got = current(t)
+	if got.Alias != "我的设备" || got.Group != "客厅" || got.AdvertisedName != "PJ-Sensor-2" {
+		t.Fatalf("广播名更新影响了其他字段: %+v", got)
+	}
+
+	// 只上报别名：不得覆盖广播名。
+	push(t, base.Add(2*time.Minute), `"alias":"用户改名",`)
+	got = current(t)
+	if got.Alias != "用户改名" || got.AdvertisedName != "PJ-Sensor-2" || got.Group != "客厅" {
+		t.Fatalf("别名更新影响了广播名: %+v", got)
+	}
+
+	// group 空串：显式清除分组。
+	push(t, base.Add(3*time.Minute), `"group":"",`)
+	got = current(t)
+	if got.Group != "" || got.Alias != "用户改名" || got.AdvertisedName != "PJ-Sensor-2" {
+		t.Fatalf("清空分组异常: %+v", got)
+	}
+
+	// 清空后再次上报广播名（缺省 group）：分组必须保持为空，不能长回来。
+	push(t, base.Add(4*time.Minute), `"advertisedName":"PJ-Sensor-3",`)
+	got = current(t)
+	if got.Group != "" || got.AdvertisedName != "PJ-Sensor-3" {
+		t.Fatalf("缺省 group 导致分组复活: %+v", got)
+	}
+
+	// 缺省 alias 时同样保持原值。
+	push(t, base.Add(5*time.Minute), `"advertisedName":"PJ-Sensor-4",`)
+	got = current(t)
+	if got.Alias != "用户改名" || got.Group != "" || got.AdvertisedName != "PJ-Sensor-4" {
+		t.Fatalf("缺省 alias 未保持原值: %+v", got)
+	}
+}
+
 // TestUnauthorizedDoesNotIssueToken 固化 401 契约：
 // token 失效时只返回错误体，绝不自动新建匿名账号或下发新 token。
 func TestUnauthorizedDoesNotIssueToken(t *testing.T) {

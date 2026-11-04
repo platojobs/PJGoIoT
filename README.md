@@ -6,7 +6,7 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.3.2**（在 v0.3.1 契约上补齐设备详情与市场字段）
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.3.3**（在 v0.3.2 字段扩展上明确分组清除与别名/广播名语义）
 
 ## 快速开始
 
@@ -91,6 +91,23 @@ make dev-postgres   # Postgres 模式启动 API
 - `compatibility`：型号级或配件兼容性（如 `platforms` / `features` / `deviceTypes`）；
 - `accessories` 保留 `sku` 与 `name`，市场模块可据此按厂商与兼容性筛选。
 
+### 可缺省字段语义与别名隔离（v0.3.3）
+
+`POST /sync/push` 的 `alias`、`advertisedName`、`group` 均为可选字段，JSON 类型不变，语义如下：
+
+| 上报形式 | 服务端行为 |
+| --- | --- |
+| 字段缺失（absent） | 视为「未上报」，保持原值，且不参与 LWW 内容比较 |
+| `"group": ""` | **显式清除分组**，`user_devices.group` 置为空串 |
+| 显式非空值 | 覆盖原值 |
+| `"alias": ""` / `"advertisedName": ""` | 显式清空对应字段 |
+
+`alias` 与 `advertisedName` 相互独立：
+
+- `alias`：用户设置的别名，只在用户编辑时上报，服务端不会被广播名覆盖；
+- `advertisedName`：设备广播名（BLE Local Name），客户端扫描时可覆盖上报，不会改动 `alias`；
+- `UserDevice` 同时返回两者（`advertisedName` 为 v0.3.3 新增字段）。
+
 ### curl 示例
 
 ```bash
@@ -159,6 +176,7 @@ curl -s -X POST $BASE/sync/push \
       "platform": "ios",
       "externalId": "E621E1F8-C36C-495A-93FC-0C247A3E6E5F",
       "deviceType": "environmental_sensor",
+      "advertisedName": "Polar H10",
       "alias": "iOS 连接的开发板",
       "updatedAt": "2026-11-05T01:00:00Z",
       "deleted": false
@@ -226,6 +244,7 @@ PostgreSQL
 - 契约只增不删：新增了 `/device-types/{type}/catalog` 聚合端点与 `/my/devices/{platform}/{externalId}` 单台查询，历史端点保持不变。
 - 设备详情不再必须依赖 MAC：公共元数据用 `/device-types/{type}`，用户私有数据用 `/my/devices/{platform}/{externalId}`。
 - v0.3.2 起 `UserDevice` 直接返回 `deviceType` / `vendor` / `firmwareVersion` / `compatibility`，iOS/Android 详情页无需自行拼装公共元数据；缺失时为 `null`。
+- v0.3.3 起 `UserDevice` 增加 `advertisedName`；分组删除请上报 `"group": ""`，不要在本地省略该字段。
 - `401` 语义见下节；iOS 端已确认不在 401 后自动匿名重登。
 - 字段命名以 `api/openapi.yaml` 为准；若与 iOS 端 `docs/consistency.md` 有出入，需同步修改两份文档并在此处记录。
 
@@ -316,7 +335,7 @@ PJGoIoT/
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.3.2` | 健康接口与日志中展示的版本 |
+| `APP_VERSION` | `0.3.3` | 健康接口与日志中展示的版本 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -346,6 +365,10 @@ go run ./cmd/migrate -direction up -steps 1   # 只前进一步
   - `accessories` 新增 `vendor` / `compatibility`，只回填 Polar Electro / Espressif Systems 与适配型号，通用电池厂商留空；
   - 新增索引 `user_devices_user_device_type_idx (user_id, device_type)`；
   - down 迁移删除新增列与索引，不影响其余数据。
+- `000005_alias_advertised_name`：区分用户别名与设备广播名：
+  - `user_devices` 新增 `advertised_name text NOT NULL DEFAULT ''`，旧记录默认空串，`alias` 原值保留；
+  - 分组清除不需要改表：既有 `group` 列已为 `NOT NULL DEFAULT ''`，空串即表示未分组；
+  - 通过 `COMMENT ON COLUMN` 固化三列语义；down 迁移只删除 `advertised_name`。
 
 seed 数据来源与边界：
 
@@ -360,10 +383,10 @@ seed 数据来源与边界：
 
 测试覆盖：
 
-- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500。
-- `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType` 仅在客户端上报时参与内容比较。
-- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，以及公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null）。
-- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=4，验证 000003 的键回填、000004 的 `device_type`/厂商回填与旧数据可读。
+- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然。
+- `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType`、`alias`、`advertisedName`、`group` 仅在客户端上报时参与内容比较（缺失保持原值不产生冲突）。
+- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）。
+- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=5，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值与旧数据可读。
 
 本机实际执行结果（2026-11-05）：
 
@@ -372,12 +395,14 @@ seed 数据来源与边界：
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
 | `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok） |
-| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=4；含旧数据与字段回填） |
+| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=5；含旧数据与字段回填） |
 | v0.3.2 字段测试 | 通过：`TestDeviceMetadataEnrichment`（列表/单查 200 字段、catalog 固件配件完整性、未注册型号与无 MAC 降级 null）、`TestDeviceTypeComparison`、集成测试「公共元数据补全与缺失降级」 |
-| 真实库迁移 | 通过：`cmd/migrate up` → version=4 dirty=false；`firmwares.vendor` 与 `accessories.vendor` 按预期回填，AA 电池厂商为空 |
+| v0.3.3 语义测试 | 通过：`TestPresenceSemantics`（`"group": ""` 清除、缺失保持、清空后拉回为空、广播名与别名互不覆盖）、`TestPresenceOnlyComparison`、集成测试「可缺省字段语义与广播名隔离」、迁移测试 `advertised_name` 默认空串 |
+| 真实库迁移 | 通过：`cmd/migrate up` → version=5 dirty=false；`firmwares.vendor` / `accessories.vendor` 按预期回填，AA 电池厂商为空；`user_devices.advertised_name` 已新增且默认空串 |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
 | fixture 模式新增接口验证 | 通过：`/device-types/{type}/catalog` 200 且含固件/配件、未知类型 404；`/my/devices/android/{mac}` 与 `/my/devices/ios/{uuid}` 200；非法 platform 400；旧 `/my/devices/{mac}` 兼容 |
 | fixture 字段补全验证 | 通过：`/my/devices` 中 Android 设备返回 `nordic_uart / Nordic Semiconductor / nRF Connect SDK v2.9.0` 与 UART 兼容性；iOS 上报 `environmental_sensor` 返回厂商与温度/湿度/气压兼容性、`firmwareVersion=null`；未注册型号仅回显 `deviceType`，其余为 `null`；catalog 固件/配件均带 `vendor` 与 `compatibility` |
+| fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
 | `docker build` | 通过（GitHub Actions `docker-build` job，v0.3.2 提交 10fb27b，run 41897825528） |

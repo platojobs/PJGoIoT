@@ -426,6 +426,8 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
 			dev.DeviceType = *existing.DeviceType
 		}
+		// alias / advertisedName / group 缺省表示未上报，保持原值；空串表示显式清除。
+		alias, advertisedName, group := dev.ResolvePresence(existing)
 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
@@ -446,17 +448,18 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		seq := s.nextSeq
 		s.nextSeq++
 		record := &model.UserDevice{
-			ID:          dev.ID,
-			ClientID:    req.ClientID,
-			Platform:    dev.Platform,
-			ExternalID:  dev.ExternalID,
-			MAC:         dev.MAC,
-			Alias:       dev.Alias,
-			Group:       dev.Group,
-			Rules:       dev.Rules,
-			ScanRecords: dev.ScanRecords,
-			UpdatedAt:   decision.EffectiveUpdatedAt,
-			ServerSeq:   seq,
+			ID:             dev.ID,
+			ClientID:       req.ClientID,
+			Platform:       dev.Platform,
+			ExternalID:     dev.ExternalID,
+			MAC:            dev.MAC,
+			Alias:          alias,
+			AdvertisedName: advertisedName,
+			Group:          group,
+			Rules:          dev.Rules,
+			ScanRecords:    dev.ScanRecords,
+			UpdatedAt:      decision.EffectiveUpdatedAt,
+			ServerSeq:      seq,
 		}
 		if dev.Deleted {
 			deletedAt := decision.EffectiveUpdatedAt

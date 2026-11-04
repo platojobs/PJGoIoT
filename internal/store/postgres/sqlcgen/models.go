@@ -90,11 +90,13 @@ type User struct {
 }
 
 type UserDevice struct {
-	UserID      uuid.UUID
-	ID          uuid.UUID
-	ClientID    string
-	Mac         sql.NullString
-	Alias       string
+	UserID   uuid.UUID
+	ID       uuid.UUID
+	ClientID string
+	Mac      sql.NullString
+	// 用户设置的别名，只在用户操作时更新
+	Alias string
+	// 用户分组；空串表示未分组（显式清除）
 	Group       string
 	Rules       json.RawMessage
 	ScanRecords json.RawMessage
@@ -105,4 +107,6 @@ type UserDevice struct {
 	Platform    string
 	ExternalID  string
 	DeviceType  sql.NullString
+	// 设备广播名（BLE Local Name），客户端扫描时可覆盖，不影响 alias
+	AdvertisedName string
 }

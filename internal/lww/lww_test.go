@@ -17,8 +17,9 @@ func serverAt(t time.Time) *model.UserDevice {
 }
 
 func clientAt(t time.Time, alias string) model.PushDevice {
+	group := "默认"
 	return model.PushDevice{
-		ID: "client-id", MAC: "aa:bb:cc:00:00:01", Alias: alias, Group: "默认",
+		ID: "client-id", MAC: "aa:bb:cc:00:00:01", Alias: &alias, Group: &group,
 		Rules: json.RawMessage(`{"a": 1}`), ScanRecords: json.RawMessage(`[]`),
 		UpdatedAt: t,
 	}
@@ -87,6 +88,51 @@ func TestDecide(t *testing.T) {
 		}
 	})
 }
+
+// TestPresenceOnlyComparison 固化可缺省字段的比较规则：
+// 缺失表示「未上报，保持原值」，不参与比较；空串是显式清除，需要参与比较。
+func TestPresenceOnlyComparison(t *testing.T) {
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	server := serverAt(now)
+	server.AdvertisedName = "PJ-Sensor"
+
+	t.Run("缺省 alias/group/advertisedName 时视为内容一致", func(t *testing.T) {
+		client := model.PushDevice{
+			ID: "client-id", MAC: "aa:bb:cc:00:00:01",
+			Rules: json.RawMessage(`{"a": 1}`), ScanRecords: json.RawMessage(`[]`),
+			UpdatedAt: now,
+		}
+		if !SameContent(server, client) {
+			t.Fatalf("缺省字段不应造成内容差异")
+		}
+	})
+
+	t.Run("group 空串是显式清除，与服务端旧值不同", func(t *testing.T) {
+		client := model.PushDevice{
+			ID: "client-id", MAC: "aa:bb:cc:00:00:01",
+			Group: strPtr(""),
+			Rules: json.RawMessage(`{"a": 1}`), ScanRecords: json.RawMessage(`[]`),
+			UpdatedAt: now,
+		}
+		if SameContent(server, client) {
+			t.Fatalf("显式清除分组应视为内容差异")
+		}
+	})
+
+	t.Run("advertisedName 上报不同值视为内容差异", func(t *testing.T) {
+		client := model.PushDevice{
+			ID: "client-id", MAC: "aa:bb:cc:00:00:01",
+			AdvertisedName: strPtr("PJ-Sensor-2"),
+			Rules:          json.RawMessage(`{"a": 1}`), ScanRecords: json.RawMessage(`[]`),
+			UpdatedAt: now,
+		}
+		if SameContent(server, client) {
+			t.Fatalf("广播名不同应视为内容差异")
+		}
+	})
+}
+
+func strPtr(s string) *string { return &s }
 
 // TestDeviceTypeComparison 固化 deviceType 的比较规则：
 // 客户端上报型号时参与内容比较；旧客户端不传该字段时不影响幂等判定。

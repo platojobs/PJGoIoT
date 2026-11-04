@@ -52,7 +52,7 @@ func (q *Queries) GetMaxSeqForUser(ctx context.Context, userID uuid.UUID) (int64
 
 const getUserDeviceByIDForUpdate = `-- name: GetUserDeviceByIDForUpdate :one
 
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 FROM user_devices
 WHERE user_id = $1 AND id = $2
 FOR UPDATE
@@ -84,12 +84,13 @@ func (q *Queries) GetUserDeviceByIDForUpdate(ctx context.Context, arg GetUserDev
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }
 
 const getUserDeviceByKey = `-- name: GetUserDeviceByKey :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 FROM user_devices
 WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL
 `
@@ -119,12 +120,13 @@ func (q *Queries) GetUserDeviceByKey(ctx context.Context, arg GetUserDeviceByKey
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }
 
 const getUserDeviceByKeyForUpdate = `-- name: GetUserDeviceByKeyForUpdate :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 FROM user_devices
 WHERE user_id = $1 AND platform = $2 AND external_id = $3
 FOR UPDATE
@@ -155,12 +157,13 @@ func (q *Queries) GetUserDeviceByKeyForUpdate(ctx context.Context, arg GetUserDe
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }
 
 const getUserDeviceByMAC = `-- name: GetUserDeviceByMAC :one
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 FROM user_devices
 WHERE user_id = $1 AND mac = $2 AND deleted_at IS NULL
 ORDER BY updated_at DESC
@@ -191,6 +194,7 @@ func (q *Queries) GetUserDeviceByMAC(ctx context.Context, arg GetUserDeviceByMAC
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }
@@ -248,31 +252,32 @@ func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotenc
 
 const insertUserDevice = `-- name: InsertUserDevice :one
 INSERT INTO user_devices (
-    user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, platform, external_id, device_type
+    user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, platform, external_id, device_type, advertised_name
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7, $8,
     $9, $10, $11,
-    $12, $13, $14
+    $12, $13, $14, $15
 )
-RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 `
 
 type InsertUserDeviceParams struct {
-	UserID      uuid.UUID
-	ID          uuid.UUID
-	ClientID    string
-	Mac         sql.NullString
-	Alias       string
-	GroupName   string
-	Rules       json.RawMessage
-	ScanRecords json.RawMessage
-	UpdatedAt   time.Time
-	DeletedAt   sql.NullTime
-	ServerSeq   int64
-	Platform    string
-	ExternalID  string
-	DeviceType  sql.NullString
+	UserID         uuid.UUID
+	ID             uuid.UUID
+	ClientID       string
+	Mac            sql.NullString
+	Alias          string
+	GroupName      string
+	Rules          json.RawMessage
+	ScanRecords    json.RawMessage
+	UpdatedAt      time.Time
+	DeletedAt      sql.NullTime
+	ServerSeq      int64
+	Platform       string
+	ExternalID     string
+	DeviceType     sql.NullString
+	AdvertisedName string
 }
 
 func (q *Queries) InsertUserDevice(ctx context.Context, arg InsertUserDeviceParams) (UserDevice, error) {
@@ -291,6 +296,7 @@ func (q *Queries) InsertUserDevice(ctx context.Context, arg InsertUserDevicePara
 		arg.Platform,
 		arg.ExternalID,
 		arg.DeviceType,
+		arg.AdvertisedName,
 	)
 	var i UserDevice
 	err := row.Scan(
@@ -309,6 +315,7 @@ func (q *Queries) InsertUserDevice(ctx context.Context, arg InsertUserDevicePara
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }
@@ -359,7 +366,7 @@ func (q *Queries) ListChanges(ctx context.Context, arg ListChangesParams) ([]Cha
 }
 
 const listUserDevices = `-- name: ListUserDevices :many
-SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 FROM user_devices
 WHERE user_id = $1 AND deleted_at IS NULL
 ORDER BY updated_at DESC, id
@@ -390,6 +397,7 @@ func (q *Queries) ListUserDevices(ctx context.Context, userID uuid.UUID) ([]User
 			&i.Platform,
 			&i.ExternalID,
 			&i.DeviceType,
+			&i.AdvertisedName,
 		); err != nil {
 			return nil, err
 		}
@@ -432,33 +440,35 @@ SET id = $1,
     external_id = $4,
     mac = $5,
     alias = $6,
-    "group" = $7,
-    rules = $8,
-    scan_records = $9,
-    updated_at = $10,
-    deleted_at = $11,
-    server_seq = $12,
-    device_type = $13
-WHERE user_id = $14 AND id = $15
-RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type
+    advertised_name = $7,
+    "group" = $8,
+    rules = $9,
+    scan_records = $10,
+    updated_at = $11,
+    deleted_at = $12,
+    server_seq = $13,
+    device_type = $14
+WHERE user_id = $15 AND id = $16
+RETURNING user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
 `
 
 type UpdateUserDeviceParams struct {
-	NewID       uuid.UUID
-	ClientID    string
-	Platform    string
-	ExternalID  string
-	Mac         sql.NullString
-	Alias       string
-	GroupName   string
-	Rules       json.RawMessage
-	ScanRecords json.RawMessage
-	UpdatedAt   time.Time
-	DeletedAt   sql.NullTime
-	ServerSeq   int64
-	DeviceType  sql.NullString
-	UserID      uuid.UUID
-	OldID       uuid.UUID
+	NewID          uuid.UUID
+	ClientID       string
+	Platform       string
+	ExternalID     string
+	Mac            sql.NullString
+	Alias          string
+	AdvertisedName string
+	GroupName      string
+	Rules          json.RawMessage
+	ScanRecords    json.RawMessage
+	UpdatedAt      time.Time
+	DeletedAt      sql.NullTime
+	ServerSeq      int64
+	DeviceType     sql.NullString
+	UserID         uuid.UUID
+	OldID          uuid.UUID
 }
 
 func (q *Queries) UpdateUserDevice(ctx context.Context, arg UpdateUserDeviceParams) (UserDevice, error) {
@@ -469,6 +479,7 @@ func (q *Queries) UpdateUserDevice(ctx context.Context, arg UpdateUserDevicePara
 		arg.ExternalID,
 		arg.Mac,
 		arg.Alias,
+		arg.AdvertisedName,
 		arg.GroupName,
 		arg.Rules,
 		arg.ScanRecords,
@@ -496,6 +507,7 @@ func (q *Queries) UpdateUserDevice(ctx context.Context, arg UpdateUserDevicePara
 		&i.Platform,
 		&i.ExternalID,
 		&i.DeviceType,
+		&i.AdvertisedName,
 	)
 	return i, err
 }

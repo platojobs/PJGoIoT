@@ -20,10 +20,11 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
 )
 
-// TestMigrationBackfillsLegacyDevices 验证 000003 与 000004 迁移：
+// TestMigrationBackfillsLegacyDevices 验证 000003、000004 与 000005 迁移：
 // 旧 (user_id, mac) 记录在迁移后变为 platform=android、external_id=大写 MAC，
 // 仍可通过 MAC 读取；旧 change_log 也会补 platform/externalId 与新 entity_id；
-// 000004 按 mac 回填 user_devices.device_type，并为固件/配件补厂商信息。
+// 000004 按 mac 回填 user_devices.device_type，并为固件/配件补厂商信息；
+// 000005 新增 advertised_name，旧记录的别名保持不变，广播名默认空串。
 //
 // 使用临时数据库，避免破坏 TEST_DATABASE_URL 指向的测试库。
 func TestMigrationBackfillsLegacyDevices(t *testing.T) {
@@ -148,6 +149,16 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	}
 	if accVendor != "" {
 		t.Fatalf("未核实配件厂商应为空: %q", accVendor)
+	}
+
+	// 000005：新增 advertised_name，旧记录的 alias 视为用户别名，广播名默认空串。
+	var advertisedName string
+	if err := db.QueryRow(`SELECT advertised_name FROM user_devices WHERE user_id = $1`, userID).
+		Scan(&advertisedName); err != nil {
+		t.Fatalf("读取 advertised_name 失败: %v", err)
+	}
+	if advertisedName != "" {
+		t.Fatalf("旧记录 advertised_name 应为空串: %q", advertisedName)
 	}
 
 	// 旧数据通过 Store 仍可读。

@@ -5,6 +5,7 @@ sql:
       - "db/migrations/000001_init.up.sql"
       - "db/migrations/000003_platform_external_id.up.sql"
       - "db/migrations/000004_metadata_enrichment.up.sql"
+      - "db/migrations/000005_alias_advertised_name.up.sql"
     queries: "db/queries"
     gen:
       go:

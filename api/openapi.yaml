@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.3.2
+  version: 0.3.3
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -48,7 +48,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.3.2"
+                version: "0.3.3"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -386,6 +386,13 @@ paths:
 
         `Idempotency-Key` 在同一用户下唯一。相同 key + 相同请求体重复提交直接返回历史响应，
         响应头带 `Idempotent-Replayed: true`；相同 key + 不同请求体返回 409。
+
+        可缺省字段语义（自 `0.3.3`，字段 JSON 类型不变）：
+        - 字段缺失（absent）：未上报，服务端保持原值，不参与内容比较；
+        - `"group": ""`：显式清除分组，服务端把 `group` 置为空串；
+        - 显式非空值：覆盖原值；
+        - `alias` 与 `advertisedName` 独立：上报广播名不会覆盖用户别名，反之亦然。
+          客户端扫描时应只上报 `advertisedName`，只有用户编辑别名时才上报 `alias`。
       security:
         - bearerAuth: []
       parameters:
@@ -410,6 +417,7 @@ paths:
                   externalId: "AA:BB:CC:00:00:01"
                   mac: "aa:bb:cc:00:00:01"
                   alias: "客厅开发板"
+                  advertisedName: "PJ-Sensor"
                   group: "客厅"
                   rules:
                     sampleRate: 10
@@ -421,6 +429,7 @@ paths:
                 - id: "22222222-2222-4222-8222-222222222222"
                   platform: ios
                   externalId: "E621E1F8-C36C-495A-93FC-0C247A3E6E5F"
+                  advertisedName: "Polar H10"
                   alias: "iOS 连接的开发板"
                   updatedAt: "2026-11-05T00:00:00Z"
                   deleted: false
@@ -770,7 +779,7 @@ components:
 
     UserDevice:
       type: object
-      required: [id, clientId, platform, externalId, alias, group, rules, scanRecords, updatedAt, serverSeq]
+      required: [id, clientId, platform, externalId, alias, advertisedName, group, rules, scanRecords, updatedAt, serverSeq]
       properties:
         id:
           type: string
@@ -793,8 +802,13 @@ components:
           description: 可选 MAC 元数据；iOS 设备通常为空，不参与唯一约束
         alias:
           type: string
+          description: 用户设置的别名；不会因设备广播名变化而被覆盖
+        advertisedName:
+          type: string
+          description: 设备广播名（BLE Local Name）；与 alias 独立，可为空串
         group:
           type: string
+          description: 用户分组；空串表示未分组（已显式清除）
         rules:
           type: object
           additionalProperties: true
@@ -869,9 +883,21 @@ components:
         alias:
           type: string
           maxLength: 100
+          description: |
+            用户设置的别名。缺省（absent）= 未上报，保持服务端原值；
+            只有用户编辑别名时才应上报。上报不会影响 `advertisedName`。
+        advertisedName:
+          type: string
+          maxLength: 248
+          description: |
+            设备广播名（BLE Local Name）。缺省 = 未上报，保持原值；
+            客户端扫描到广播名变化时可覆盖上报，不会影响用户别名 `alias`。
         group:
           type: string
           maxLength: 64
+          description: |
+            用户分组。缺省（absent）= 未上报，保持原值；
+            空串 `""` = 显式清除分组，服务端将 `group` 置为空串。
         rules:
           type: object
           additionalProperties: true
