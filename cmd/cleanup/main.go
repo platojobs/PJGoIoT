@@ -33,7 +33,7 @@ func main() {
 
 	cutoff := time.Now().UTC().Add(-time.Duration(*retentionDays) * 24 * time.Hour)
 	if *dryRun {
-		fmt.Printf("dry-run: 将删除 recorded_at < %s 的读数\n", cutoff.Format(time.RFC3339))
+		fmt.Printf("dry-run: 将删除 recorded_at < %s 的读数，并清理过期配对码\n", cutoff.Format(time.RFC3339))
 		return
 	}
 
@@ -52,5 +52,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "清理读数失败:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("清理完成 deleted=%d cutoff=%s retention_days=%d\n", deleted, cutoff.Format(time.RFC3339), *retentionDays)
+	codes, err := st.CleanupPairingCodes(ctx, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "清理配对码失败:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("清理完成 deleted=%d cutoff=%s retention_days=%d pairing_codes_deleted=%d\n",
+		deleted, cutoff.Format(time.RFC3339), *retentionDays, codes)
 }

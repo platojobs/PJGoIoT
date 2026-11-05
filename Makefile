@@ -1,5 +1,5 @@
 GO ?= go
-APP_VERSION ?= 0.5.1
+APP_VERSION ?= 0.6.0
 DATABASE_URL ?= postgres://platojobs@127.0.0.1:5432/pjgoiot?sslmode=disable
 
 .PHONY: help dev dev-postgres test lint build migrate migrate-down migrate-version sqlc docker-build docker-up docker-down

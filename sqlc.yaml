@@ -7,6 +7,7 @@ sql:
       - "db/migrations/000004_metadata_enrichment.up.sql"
       - "db/migrations/000005_alias_advertised_name.up.sql"
       - "db/migrations/000006_readings.up.sql"
+      - "db/migrations/000007_pairing_codes.up.sql"
     queries: "db/queries"
     gen:
       go:

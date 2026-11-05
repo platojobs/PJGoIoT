@@ -41,6 +41,17 @@ type userData struct {
 	byKey map[string]*model.UserDevice // key: platform|externalId
 
 	readings map[string]*readingRecord // key: reading id
+
+	kind      string
+	createdAt time.Time
+}
+
+// pairingRecord 是内存版配对码，与 pairing_codes 表一一对应。
+// userID 为空表示失败尝试计数行。
+type pairingRecord struct {
+	userID    string
+	attempts  int
+	expiresAt time.Time
 }
 
 // readingRecord 是内存版读数，字段与 readings 表一一对应。
@@ -75,6 +86,8 @@ type Store struct {
 	changes     []changeRecord
 	nextSeq     int64
 	idempotency map[string]idempotencyRecord
+
+	pairingCodes map[string]*pairingRecord // codeHash -> record
 }
 
 // New 从 fixtures 目录加载公共元数据。
@@ -84,8 +97,10 @@ func New(dir string) (*Store, error) {
 		deviceTypeSet: map[string]struct{}{},
 		tokens:        map[string]string{},
 		users:         map[string]*userData{},
+		changes:       []changeRecord{},
 		nextSeq:       1,
 		idempotency:   map[string]idempotencyRecord{},
+		pairingCodes:  map[string]*pairingRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))
@@ -220,9 +235,11 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (stri
 	defer s.mu.Unlock()
 	userID := uuid.NewString()
 	s.users[userID] = &userData{
-		byID:     map[string]*model.UserDevice{},
-		byKey:    map[string]*model.UserDevice{},
-		readings: map[string]*readingRecord{},
+		byID:      map[string]*model.UserDevice{},
+		byKey:     map[string]*model.UserDevice{},
+		readings:  map[string]*readingRecord{},
+		kind:      "anonymous",
+		createdAt: time.Now().UTC(),
 	}
 	s.tokens[tokenHash] = userID
 	return userID, nil

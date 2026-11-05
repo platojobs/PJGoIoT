@@ -117,6 +117,7 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
 		default:
+			s.metrics.incDBErrors()
 			s.log.Error("请求处理失败",
 				"error", last,
 				"request_id", c.GetString(ctxKeyRequestID),

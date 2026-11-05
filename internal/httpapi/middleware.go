@@ -1,8 +1,6 @@
 package httpapi
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"net/http"
 	"regexp"
@@ -11,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/platojobs/PJGoIoT/internal/auth"
 	"github.com/platojobs/PJGoIoT/internal/store"
@@ -73,18 +72,21 @@ func (s *Server) accessLog() gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 
+		status := c.Writer.Status()
+		s.metrics.observeRequest(c.Request.Method, status, time.Since(start))
+
 		attrs := []any{
 			"request_id", c.GetString(ctxKeyRequestID),
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
-			"status", c.Writer.Status(),
+			"status", status,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ip", c.ClientIP(),
 		}
 		if uid := c.GetString(ctxKeyUserID); uid != "" {
 			attrs = append(attrs, "user_id", uid)
 		}
-		if c.Writer.Status() >= 500 {
+		if status >= 500 {
 			s.log.Error("http request", attrs...)
 			return
 		}
@@ -103,9 +105,9 @@ func (s *Server) cors() gin.HandlerFunc {
 			if allowed, value := s.allowedOrigin(origin); allowed {
 				c.Header("Access-Control-Allow-Origin", value)
 				c.Header("Vary", "Origin")
-				c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 				c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
-				c.Header("Access-Control-Expose-Headers", "X-Request-Id, Idempotent-Replayed")
+				c.Header("Access-Control-Expose-Headers", "X-Request-Id, Idempotent-Replayed, Content-Disposition")
 				c.Header("Access-Control-Max-Age", "600")
 			}
 		}
@@ -134,8 +136,8 @@ func (s *Server) rateLimit() gin.HandlerFunc {
 		return func(c *gin.Context) { c.Next() }
 	}
 	return func(c *gin.Context) {
-		// 健康探针不应被限流，否则容器健康检查可能被误杀。
-		if c.Request.URL.Path == "/api/v1/health" {
+		// 健康探针与指标端点不应被业务限流误伤。
+		if c.Request.URL.Path == "/api/v1/health" || c.Request.URL.Path == "/metrics" {
 			c.Next()
 			return
 		}
@@ -191,9 +193,5 @@ func tokenHash(c *gin.Context) string {
 }
 
 func newRequestID() string {
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		return "req-fallback"
-	}
-	return hex.EncodeToString(buf)
+	return uuid.NewString()
 }

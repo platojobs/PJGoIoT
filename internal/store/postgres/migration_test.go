@@ -210,4 +210,39 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("回滚后重新迁移失败: %v", err)
 	}
+
+	// 000007：pairing_codes 表存在，down 可回滚且不影响用户数据，随后可再次 up。
+	var hasPairing bool
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables WHERE table_name = 'pairing_codes'
+	)`).Scan(&hasPairing); err != nil {
+		t.Fatalf("查询 pairing_codes 表失败: %v", err)
+	}
+	if !hasPairing {
+		t.Fatalf("迁移到最新版本后缺少 pairing_codes 表")
+	}
+	if _, err := db.Exec(`INSERT INTO pairing_codes (code_hash, user_id, expires_at)
+		VALUES ('legacy-hash', $1, now() + interval '10 minutes')`, userID); err != nil {
+		t.Fatalf("写入配对码失败: %v", err)
+	}
+	if err := m.Migrate(6); err != nil {
+		t.Fatalf("回滚 000007 失败: %v", err)
+	}
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables WHERE table_name = 'pairing_codes'
+	)`).Scan(&hasPairing); err != nil {
+		t.Fatalf("回滚后查询 pairing_codes 表失败: %v", err)
+	}
+	if hasPairing {
+		t.Fatalf("回滚 000007 后 pairing_codes 表仍存在")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚 000007 后查询用户失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000007 破坏了用户数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚 000007 后重新迁移失败: %v", err)
+	}
 }

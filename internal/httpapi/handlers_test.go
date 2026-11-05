@@ -28,6 +28,7 @@ func newHandler(t *testing.T, rateLimit int) http.Handler {
 		CORSAllowedOrigins: []string{"*"},
 		RateLimitPerMin:    rateLimit,
 		RateLimitBurst:     rateLimit,
+		MetricsEnabled:     true,
 	}, st, logger)
 }
 

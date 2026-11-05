@@ -46,6 +46,14 @@ func main() {
 	}
 	defer st.Close()
 
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if n, err := st.CleanupPairingCodes(cleanupCtx, time.Now().UTC()); err != nil {
+		logger.Warn("启动清理过期配对码失败", "error", err)
+	} else if n > 0 {
+		logger.Info("启动清理过期配对码完成", "deleted", n)
+	}
+	cleanupCancel()
+
 	handler := httpapi.New(cfg, st, logger)
 	server := &http.Server{
 		Addr:              cfg.Addr,

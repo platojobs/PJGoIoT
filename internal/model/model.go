@@ -285,3 +285,40 @@ type ChangesPage struct {
 	NextCursor int64    `json:"nextCursor"`
 	HasMore    bool     `json:"hasMore"`
 }
+
+// User 是 GET /me/export 中返回的账号信息。
+type User struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ExportReading 是数据导出中的一条读数，包含平台与设备键等完整字段。
+type ExportReading struct {
+	ID         string    `json:"id"`
+	Platform   string    `json:"platform"`
+	ExternalID string    `json:"externalId"`
+	Metric     string    `json:"metric"`
+	Value      float64   `json:"value"`
+	Unit       string    `json:"unit"`
+	RecordedAt time.Time `json:"recordedAt"`
+	DeviceType string    `json:"deviceType,omitempty"`
+}
+
+// ExportPage 是 GET /me/export 的响应体。
+// readings 按 recordedAt 升序；nextCursor 为空且 hasMore=false 表示导出结束。
+type ExportPage struct {
+	User       User            `json:"user"`
+	Devices    []UserDevice    `json:"devices"`
+	Readings   []ExportReading `json:"readings"`
+	ExportedAt time.Time       `json:"exportedAt"`
+	NextCursor string          `json:"nextCursor"`
+	HasMore    bool            `json:"hasMore"`
+}
+
+// StoreCounts 是用于 /metrics 的近似行数，Postgres 通过 pg_class.reltuples 读取。
+type StoreCounts struct {
+	Users    int64
+	Devices  int64
+	Readings int64
+}

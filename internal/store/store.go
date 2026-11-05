@@ -55,6 +55,23 @@ type Store interface {
 	UserIDByTokenHash(ctx context.Context, tokenHash string) (userID string, err error)
 	// RevokeToken 吊销 token，重复吊销不报错。
 	RevokeToken(ctx context.Context, tokenHash string) error
+	// GetUser 返回账号基础信息，供数据导出使用。
+	GetUser(ctx context.Context, userID string) (model.User, error)
+	// DeleteUser 硬删除用户及其设备、读数、变更日志、token 与配对码。
+	// 用户不存在时返回 ErrUnauthorized，保证重复注销仍是 401。
+	DeleteUser(ctx context.Context, userID string) error
+
+	// CreatePairingCode 为当前用户签发一次性配对码；同一用户的新码使旧码失效。
+	CreatePairingCode(ctx context.Context, userID string, codeHash string, expiresAt time.Time) error
+	// ClaimPairingCode 校验配对码并在同一事务内签发新 token，返回配对用户 id。
+	// 过期、已用过、不存在统一返回 ErrNotFound；失败尝试按码计数，满 5 次作废。
+	ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration) (userID string, err error)
+	// CleanupPairingCodes 删除 expiresAt 早于 before 的配对码（含失败尝试记录）。
+	CleanupPairingCodes(ctx context.Context, before time.Time) (int64, error)
+
+	// ApproxCounts 返回用户、设备、读数的近似行数，供 /metrics 使用。
+	// Postgres 实现读取 pg_class.reltuples，不对大表做 COUNT。
+	ApproxCounts(ctx context.Context) (model.StoreCounts, error)
 
 	// ListUserDevices 返回用户未删除的设备，按 updated_at 倒序。
 	ListUserDevices(ctx context.Context, userID string) ([]model.UserDevice, error)
@@ -80,4 +97,10 @@ type Store interface {
 	ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error)
 	// CleanupReadings 删除 recorded_at 早于 before 的读数，返回删除条数。
 	CleanupReadings(ctx context.Context, before time.Time) (int64, error)
+
+	// ListUserDevicesForExport 返回用户全部设备（含已删除的 tombstone），按 updated_at 倒序。
+	ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error)
+	// ExportReadings 按 recorded_at 升序导出读数，cursor 为不透明游标。
+	// 返回下一页游标与是否还有更多；非法游标返回 ErrBadCursor。
+	ExportReadings(ctx context.Context, userID string, cursor string, limit int) ([]model.ExportReading, string, bool, error)
 }

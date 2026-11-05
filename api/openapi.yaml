@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.5.1
+  version: 0.6.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -21,6 +21,11 @@ info:
       服务端保留 90 天。读数按客户端生成的 `id` 幂等，不要求设备已存在于 `user_devices`。
     - 自 `0.5.0` 起读数链路新增长周期分桶序列 `/readings/series` 与指标清单 `/readings/metrics`：
       前者按 **UTC** 对齐做 `1m`/`1h`/`1d` 聚合，后者列出设备已上报的指标及其计数与时间范围。
+    - 自 `0.6.0` 起支持跨设备接管与合规能力：
+      `/auth/pairing-code` 生成一次性配对码，`/auth/pairing-code/claim` 用码换取**同一 userId** 的新 token；
+      `/me/export` 导出账号全部数据（读数按 `recordedAt` 升序、游标分页），`DELETE /me` 硬删除账号及全部关联数据；
+      `/metrics` 提供 Prometheus 文本指标（无需鉴权，可用 `METRICS_ENABLED=false` 关闭）。
+      所有响应带 `X-Request-Id`（客户端可透传，服务端原样回写）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -53,7 +58,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.5.1"
+                version: "0.6.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -114,6 +119,160 @@ paths:
       responses:
         "204":
           description: 吊销成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/pairing-code:
+    post:
+      tags: [auth]
+      operationId: createPairingCode
+      summary: 生成一次性配对码（换设备接管同一账号）
+      description: |
+        为当前用户签发 8 位大写配对码，字符集为 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`
+        （去掉易混的 `0/O/1/I`），有效期 10 分钟。
+
+        - 同一用户重复调用时，**新码立即使旧码失效**（旧码领取返回 404）；
+        - 服务端只保存码的 SHA-256 哈希，码仅在本响应出现一次，不会写入日志；
+        - 客户端应在用户主动点击「配对 / 迁移到新设备」时调用，并把 `code` 展示给用户在另一台设备输入。
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: 配对码已生成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingCodeResponse"
+              example:
+                code: "K7M2QX9P"
+                expiresAt: "2026-11-05T01:10:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/pairing-code/claim:
+    post:
+      tags: [auth]
+      operationId: claimPairingCode
+      summary: 用配对码换取同一账号的新 token
+      description: |
+        无需鉴权。校验通过后为该码所属账号签发**新 token**（同一 `userId`，数据天然共用），
+        **原 token 保持有效，不吊销**。返回体不包含账号的其他信息。
+
+        安全语义：
+        - 过期、已用过、不存在、格式错误统一返回 `404 NOT_FOUND`，不区分原因，避免枚举；
+        - 同一码累计失败 5 次即作废（失败计数按提交的码哈希落库，TTL 与签发一致，到期由清理任务回收）；
+        - 码哈希比对使用常量时间比较；完整码不写入日志；
+        - 本接口按 IP 独立限流（默认 20 次/分钟、突发 10，可用
+          `PAIRING_CLAIM_RATE_PER_MINUTE` / `PAIRING_CLAIM_BURST` 调整），触发时返回 429。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairingClaimRequest"
+            example:
+              code: "K7M2QX9P"
+      responses:
+        "200":
+          description: 配对成功，返回该账号的新 token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingClaimResponse"
+              example:
+                userId: "4f0c2b1e-8a55-4c3f-9c1f-2b7a6d0e9a11"
+                token: "pj_7Yk2mQ9xP4rT8sV1"
+        "400":
+          description: 请求体不是合法 JSON，或缺 `code`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: INVALID_JSON
+                  message: "请求体不是合法 JSON"
+        "404":
+          description: 配对码无效、已过期或已被使用（不区分原因）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: "配对码无效或已过期"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /me/export:
+    get:
+      tags: [user]
+      operationId: exportMyData
+      summary: 导出当前账号全部数据
+      description: |
+        返回 `{user, devices, readings, exportedAt}`，并附分页字段 `nextCursor` / `hasMore`。
+
+        - `devices` 包含该账号全部设备（含已删除的 tombstone），按 `updatedAt` 倒序；
+        - `readings` 按 `recordedAt` **升序**，同一时刻按 `id` 升序，保证翻页稳定；
+        - `limit` 默认 5000、最大 5000；账号读数超过限制时客户端携带 `nextCursor` 继续拉取，
+          直到 `hasMore=false`（此时 `nextCursor` 为空串）；
+        - `cursor` 为不透明串，客户端不得解析或构造；
+        - 响应头 `Content-Disposition: attachment; filename="pjkotlinapp-export-<userId>.json"`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页的 nextCursor；第一页省略
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: 单页读数条数
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 5000
+      responses:
+        "200":
+          description: 导出 JSON
+          headers:
+            Content-Disposition:
+              description: 附件文件名，含当前 userId
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /me:
+    delete:
+      tags: [user]
+      operationId: deleteMyAccount
+      summary: 注销账号并硬删除全部数据
+      description: |
+        硬删除当前用户，以及其设备（含 tombstone）、读数、变更日志、幂等键、token 与配对码
+        （数据库外键 `ON DELETE CASCADE`），成功返回 `204`。
+
+        语义：
+        - 该账号已签发的**所有 token 立即失效**，后续请求返回 401；
+        - 幂等：重复调用（原 token 已失效）返回 **401**，而不是 404；
+        - 不可恢复；客户端调用前必须二次确认。
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: 账号及其全部数据已删除
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -770,6 +929,55 @@ paths:
                 $ref: "#/components/schemas/Error"
         "429":
           $ref: "#/components/responses/RateLimited"
+
+  /metrics:
+    servers:
+      - url: http://127.0.0.1:8080
+        description: 根路径（/metrics 不在 /api/v1 前缀下）
+    get:
+      tags: [system]
+      operationId: getMetrics
+      summary: Prometheus 文本指标
+      description: |
+        无需鉴权，且**不受 API 限流影响**（与 `/api/v1/health` 同样跳过每 IP 限流）。
+        默认开启；设置 `METRICS_ENABLED=false` 后该路由不注册（返回 404）。
+
+        指标清单（均为近似/聚合值，不暴露可定位到个人的精确业务数据）：
+        - `pjgoiot_http_requests_total{method,status}`：累计请求数；
+        - `pjgoiot_http_request_duration_seconds_bucket{method,le}` / `_sum` / `_count`：请求延迟直方图（秒）；
+        - `pjgoiot_db_errors_total`：存储层错误计数；
+        - `pjgoiot_users_approx` / `pjgoiot_devices_approx` / `pjgoiot_readings_approx`：
+          用户/设备/读数行数近似值，读取 `pg_class.reltuples`，不对大表执行 `COUNT`。
+
+        部署建议：仅在监听内网或由反向代理限制访问的实例上暴露本端点。
+      security: []
+      responses:
+        "200":
+          description: Prometheus 文本格式（version=0.0.4）
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP pjgoiot_http_requests_total HTTP 请求总数，按 method 与 status 分组。
+                # TYPE pjgoiot_http_requests_total counter
+                pjgoiot_http_requests_total{method="GET",status="200"} 12
+                # HELP pjgoiot_http_request_duration_seconds HTTP 请求耗时直方图。
+                # TYPE pjgoiot_http_request_duration_seconds histogram
+                pjgoiot_http_request_duration_seconds_bucket{method="GET",le="0.005"} 10
+                pjgoiot_http_request_duration_seconds_bucket{method="GET",le="+Inf"} 12
+                pjgoiot_http_request_duration_seconds_sum{method="GET"} 0.031000
+                pjgoiot_http_request_duration_seconds_count{method="GET"} 12
+                # TYPE pjgoiot_db_errors_total counter
+                pjgoiot_db_errors_total 0
+                # TYPE pjgoiot_users_approx gauge
+                pjgoiot_users_approx 3
+                # TYPE pjgoiot_devices_approx gauge
+                pjgoiot_devices_approx 5
+                # TYPE pjgoiot_readings_approx gauge
+                pjgoiot_readings_approx 140
+        "404":
+          description: 未注册该路由（`METRICS_ENABLED=false`）
 
 components:
   securitySchemes:
@@ -1554,3 +1762,107 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ReadingMetric"
+
+    PairingCodeResponse:
+      type: object
+      required: [code, expiresAt]
+      description: 一次性配对码；仅在本响应出现，服务端只保存哈希。
+      properties:
+        code:
+          type: string
+          pattern: "^[A-HJ-NP-Z2-9]{8}$"
+          description: 8 位大写字母数字，已剔除易混的 0/O/1/I
+          example: K7M2QX9P
+        expiresAt:
+          type: string
+          format: date-time
+          description: 过期时间（签发后 10 分钟，UTC）
+
+    PairingClaimRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          maxLength: 16
+          description: 用户输入的配对码；服务端去空白并转大写后校验
+          example: K7M2QX9P
+
+    PairingClaimResponse:
+      type: object
+      required: [userId, token]
+      description: 配对成功；token 为同一 userId 的新 token，原 token 仍然有效。
+      properties:
+        userId:
+          type: string
+          format: uuid
+        token:
+          type: string
+          description: 新的不透明 token，客户端应持久化并替换当前 token
+
+    ExportUser:
+      type: object
+      required: [id, kind, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          example: anonymous
+        createdAt:
+          type: string
+          format: date-time
+
+    ExportReading:
+      type: object
+      required: [id, platform, externalId, metric, value, unit, recordedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端生成的读数 id
+        platform:
+          type: string
+          enum: [android, ios]
+        externalId:
+          type: string
+        metric:
+          type: string
+        value:
+          type: number
+          format: double
+        unit:
+          type: string
+        recordedAt:
+          type: string
+          format: date-time
+        deviceType:
+          type: string
+          nullable: true
+          description: 读数上报时携带的设备类型；未上报时省略
+
+    ExportPage:
+      type: object
+      required: [user, devices, readings, exportedAt, nextCursor, hasMore]
+      properties:
+        user:
+          $ref: "#/components/schemas/ExportUser"
+        devices:
+          type: array
+          description: 全部设备，含已删除（tombstone），按 updatedAt 倒序
+          items:
+            $ref: "#/components/schemas/UserDevice"
+        readings:
+          type: array
+          description: 按 recordedAt 升序（同一时刻按 id 升序）
+          items:
+            $ref: "#/components/schemas/ExportReading"
+        exportedAt:
+          type: string
+          format: date-time
+        nextCursor:
+          type: string
+          description: 下一页游标；`hasMore=false` 时为空串
+        hasMore:
+          type: boolean

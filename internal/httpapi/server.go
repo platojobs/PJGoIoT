@@ -14,10 +14,12 @@ import (
 
 // Server 持有路由所需的依赖。
 type Server struct {
-	store   store.Store
-	log     *slog.Logger
-	cfg     config.Config
-	limiter *ipLimiter
+	store        store.Store
+	log          *slog.Logger
+	cfg          config.Config
+	limiter      *ipLimiter
+	claimLimiter *ipLimiter
+	metrics      *metricsRegistry
 }
 
 // New 构建基于 Gin 的 HTTP handler（含全局中间件与路由分组）。
@@ -27,10 +29,12 @@ func New(cfg config.Config, st store.Store, logger *slog.Logger) http.Handler {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
-		store:   st,
-		log:     logger,
-		cfg:     cfg,
-		limiter: newIPLimiter(cfg.RateLimitPerMin, cfg.RateLimitBurst),
+		store:        st,
+		log:          logger,
+		cfg:          cfg,
+		limiter:      newIPLimiter(cfg.RateLimitPerMin, cfg.RateLimitBurst),
+		claimLimiter: newIPLimiter(cfg.PairingClaimPerMin, cfg.PairingClaimBurst),
+		metrics:      newMetricsRegistry(),
 	}
 
 	r := gin.New()
@@ -50,6 +54,12 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	authGroup.POST("/anonymous", s.handleAnonymous)
 	authGroup.POST("/login", s.handleLogin)
 	authGroup.POST("/logout", s.requireAuth(), s.handleLogout)
+	authGroup.POST("/pairing-code", s.requireAuth(), s.handleCreatePairingCode)
+	authGroup.POST("/pairing-code/claim", s.claimRateLimit(), s.handleClaimPairingCode)
+
+	meGroup := api.Group("/me", s.requireAuth())
+	meGroup.GET("/export", s.handleExport)
+	meGroup.DELETE("", s.handleDeleteMe)
 
 	devicesGroup := api.Group("/devices")
 	devicesGroup.GET("/:mac", s.handlePublicDevice)
@@ -70,6 +80,10 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	syncGroup := api.Group("/sync", s.requireAuth())
 	syncGroup.GET("/changes", s.handleChanges)
 	syncGroup.POST("/push", s.handlePush)
+
+	if s.cfg.MetricsEnabled {
+		r.GET("/metrics", s.handleMetrics)
+	}
 
 	r.NoRoute(func(c *gin.Context) {
 		writeError(c.Writer, http.StatusNotFound, CodeNotFound, "接口不存在")

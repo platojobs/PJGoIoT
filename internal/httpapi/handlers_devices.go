@@ -244,5 +244,6 @@ func (s *Server) storeFailure(c *gin.Context, operation string, err error) {
 		return
 	}
 	s.log.Error(operation, "error", err, "request_id", c.GetString(ctxKeyRequestID))
+	s.metrics.incDBErrors()
 	fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
 }
