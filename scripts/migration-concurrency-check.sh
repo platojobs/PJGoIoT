@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317,SC2329  # trap 回调由信号触发，静态分析会误判为不可达/未调用
 # 并发迁移验证：两个 API 进程同时启动、共享同一个空数据库。
 #
 # 目的：证明 golang-migrate 的数据库级 advisory lock 让“只有一个实例真正执行迁移，
