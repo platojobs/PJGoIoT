@@ -939,7 +939,7 @@ seed 数据来源与边界：
 | v0.8.0 保留期集成测试 | 通过（真实 Postgres）：`TestCleanupAndRetentionLifecycle`——`expiresAt` 与库内一致到微秒；3 条 change_log 老化 1 条后 cleanup 删除 1 行；旧游标 `seq0-1` → `ErrCursorExpired`，新游标 `seq0` 返回剩余 2 条且 `nextCursor=seq2`；`user_devices=3` / `readings=1` 不受影响；幂等键清理后同 key 重放 `replayed=false`（不 409）；过期 token `ErrUnauthorized`，`CleanupTokens` 后行数 0 |
 | v0.8.0 端到端（真实 compose 栈） | 通过：匿名 `expiresAt=2027-05-04`；push 3 台设备得 `serverSeq=[246402,246403,246404]`；`cursor=0` 返回 3 条；cleanup 输出 `readings=1628 / change_log=1 / idempotency=0 / tokens=0`；旧游标 → `410 RESYNC_REQUIRED`；新游标返回 2 条；`/my/devices` 仍 3 台；过期 token → 401；token 清理后库内 0 行 |
 | v0.8.0 压测 | 通过（真实 compose 栈，Docker Desktop VM 2 vCPU / 4 GB）：devices 100 并发 30s → 1 065.6 RPS、p50 75 / p95 215 / p99 395 ms、0% 错误；push 50 并发（100 设备+200 读数）→ 51.5 RPS、801 / 2 005 / 2 818 ms、0%；series 50 并发（1d/90 天）→ 802.2 RPS、55 / 127 / 183 ms、0%。详见「容量与压测结果」 |
-| v0.8.0 GitHub Actions | **待补**：push tag 后回填 run 号 |
+| v0.8.0 GitHub Actions | **通过**（run 41969477796，commit b879f72）：`构建与测试`（含 `TestCleanupAndRetentionLifecycle`、迁移测试）、`构建镜像`、`配置与脚本校验`（cleanup/loadgen 编译与 `-h`、脚本 `bash -n`）均 success；tag `v0.8.0` 指向 b879f72 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
