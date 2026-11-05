@@ -6,7 +6,7 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.5.0**（读数链路新增 UTC 对齐分桶序列与指标清单）
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.5.1**（契约核对：四个读数路径与 push 读数字段齐全；补齐 metrics 的 400 响应与公共端点 `security: []`）
 
 ## 快速开始
 
@@ -516,7 +516,7 @@ PJGoIoT/
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.5.0` | 健康接口与日志中展示的版本 |
+| `APP_VERSION` | `0.5.1` | 健康接口与日志中展示的版本 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -596,6 +596,7 @@ seed 数据来源与边界：
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.5.0 提交 791b501，run 41946830487） |
 | GitHub Actions | 通过（v0.5.0：gofmt、vet、build、单元测试、迁移到 version=6、Postgres 集成测试、distroless 镜像构建；run 41946830487） |
+| OpenAPI 静态校验 | 通过：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（10 条非阻断 warning）；四个读数路径、push 的 `readings` 与 `appliedReadings`/`skippedReadings`、所有 `$ref` 均可解析 |
 
 集成测试运行方式：
 

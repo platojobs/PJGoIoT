@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.5.0
+  version: 0.5.1
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -40,6 +40,7 @@ paths:
     get:
       tags: [system]
       operationId: getHealth
+      security: []
       summary: 健康检查
       description: 容器探针使用；不受限流影响。存储不可用时返回 503。
       responses:
@@ -52,7 +53,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.5.0"
+                version: "0.5.1"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -62,6 +63,7 @@ paths:
     post:
       tags: [auth]
       operationId: createAnonymousUser
+      security: []
       summary: 创建匿名用户并签发 token
       description: |
         请求体可为空。返回的 token 只在本次响应中出现，服务端保存 SHA-256 哈希。
@@ -87,6 +89,7 @@ paths:
     post:
       tags: [auth]
       operationId: login
+      security: []
       summary: 账号密码登录（后续实现）
       description: 当前固定返回 501，客户端应使用匿名登录。
       responses:
@@ -118,6 +121,7 @@ paths:
     get:
       tags: [metadata]
       operationId: getPublicDevice
+      security: []
       summary: 查询公共设备元数据
       description: 按 MAC 返回厂商、型号、设备类型、参考固件版本、GATT 服务与兼容性。无需鉴权。
       parameters:
@@ -148,6 +152,7 @@ paths:
     get:
       tags: [metadata]
       operationId: listDeviceTypes
+      security: []
       summary: 设备类型列表
       responses:
         "200":
@@ -167,6 +172,7 @@ paths:
     get:
       tags: [metadata]
       operationId: getDeviceType
+      security: []
       summary: 按类型查询设备类型元数据
       description: 供无法获取 MAC 的 iOS 端按型号查询。返回设备类型名称、厂商、描述与 GATT 服务列表。
       parameters:
@@ -185,6 +191,7 @@ paths:
     get:
       tags: [metadata]
       operationId: getDeviceCatalog
+      security: []
       summary: 按类型聚合设备元数据、固件与配件
       description: |
         一次返回型号详情、固件列表与配件列表，不依赖 MAC，供 iOS 产品/市场/详情页使用。
@@ -208,6 +215,7 @@ paths:
     get:
       tags: [metadata]
       operationId: listFirmwares
+      security: []
       summary: 指定设备类型的固件列表
       parameters:
         - $ref: "#/components/parameters/DeviceType"
@@ -231,6 +239,7 @@ paths:
     get:
       tags: [metadata]
       operationId: listAccessories
+      security: []
       summary: 指定设备类型的配件列表
       parameters:
         - $ref: "#/components/parameters/DeviceType"
@@ -595,6 +604,8 @@ paths:
                     count: 168
                     firstAt: "2026-10-30T00:00:00Z"
                     lastAt: "2026-11-04T23:00:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1001,9 +1012,10 @@ components:
           items:
             $ref: "#/components/schemas/GATTService"
         compatibility:
+          type: object
+          nullable: true
           allOf:
             - $ref: "#/components/schemas/Compatibility"
-          nullable: true
           description: 型号级兼容性；未核实的型号为 null
 
     Firmware:
@@ -1025,9 +1037,10 @@ components:
           type: string
           description: 发布日期；未核实的记录为空字符串，不编造
         compatibility:
+          type: object
+          nullable: true
           allOf:
             - $ref: "#/components/schemas/Compatibility"
-          nullable: true
           description: 固件兼容性；供市场模块按平台/协议筛选
 
     Accessory:
@@ -1049,9 +1062,10 @@ components:
         description:
           type: string
         compatibility:
+          type: object
+          nullable: true
           allOf:
             - $ref: "#/components/schemas/Compatibility"
-          nullable: true
           description: 配件兼容性（如 `deviceTypes`）；供市场模块按适配型号筛选
 
     DeviceCatalog:
@@ -1137,9 +1151,10 @@ components:
           nullable: true
           description: 参考固件版本，来自公共设备元数据；未命中时为 null
         compatibility:
+          type: object
+          nullable: true
           allOf:
             - $ref: "#/components/schemas/Compatibility"
-          nullable: true
           description: 兼容性；优先取公共设备元数据，缺失时回退到型号元数据，仍无则为 null
 
     PushDevice:
@@ -1255,7 +1270,7 @@ components:
         unit:
           type: string
           maxLength: 16
-          description: 单位，1–16 字符；空串表示无量纲
+          description: 单位，0–16 字符（允许空串，空串表示无量纲）
         recordedAt:
           type: string
           format: date-time

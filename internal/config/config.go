@@ -35,7 +35,7 @@ func Load() (Config, error) {
 		RateLimitBurst:  getEnvInt("RATE_LIMIT_BURST", 40),
 		LogLevel:        parseLogLevel(getEnv("LOG_LEVEL", "info")),
 		ShutdownTimeout: 10 * time.Second,
-		Version:         getEnv("APP_VERSION", "0.5.0"),
+		Version:         getEnv("APP_VERSION", "0.5.1"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")
