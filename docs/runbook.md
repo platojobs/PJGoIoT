@@ -263,6 +263,10 @@ bash -n deploy/scripts/backup.sh         # 通过
 bash -n deploy/scripts/restore.sh        # 通过
 ```
 
+GitHub Actions（run 41956560178，commit 06eb0d3）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success；
+其中 lint-configs 的 YAML/编排约束/`bash -n`/shellcheck/`docker compose config` 通过，
+`promtool` 在 runner 不可用，日志明确跳过语义校验（未伪造通过）。
+
 启动迁移 / 探针（真实 PostgreSQL）：
 
 ```text
