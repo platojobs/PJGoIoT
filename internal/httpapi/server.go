@@ -20,7 +20,10 @@ type Server struct {
 	cfg          config.Config
 	limiter      rateLimiter
 	claimLimiter *ipLimiter
-	metrics      *metricsRegistry
+	// 反馈接口按账号与来源 IP 双维度限流，额度独立于全局 / 配对码限流。
+	feedbackUserLimiter rateLimiter
+	feedbackIPLimiter   rateLimiter
+	metrics             *metricsRegistry
 	// draining 为 true 时 readiness 立即返回 503，用于滚动发布时先摘流量再退出。
 	draining *atomic.Bool
 }
@@ -38,8 +41,12 @@ func New(cfg config.Config, st store.Store, logger *slog.Logger, draining *atomi
 		cfg:          cfg,
 		limiter:      newRateLimiter(cfg, st, logger),
 		claimLimiter: newIPLimiter(cfg.PairingClaimPerMin, cfg.PairingClaimBurst),
-		metrics:      newMetricsRegistry(),
-		draining:     draining,
+		feedbackUserLimiter: newRateLimiterFor(cfg.RateLimitBackend, cfg.FeedbackUserPerMin,
+			cfg.FeedbackUserBurst, st, logger),
+		feedbackIPLimiter: newRateLimiterFor(cfg.RateLimitBackend, cfg.FeedbackIPPerMin,
+			cfg.FeedbackIPBurst, st, logger),
+		metrics:  newMetricsRegistry(),
+		draining: draining,
 	}
 
 	r := gin.New()
@@ -87,6 +94,10 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	syncGroup := api.Group("/sync", s.requireAuth())
 	syncGroup.GET("/changes", s.handleChanges)
 	syncGroup.POST("/push", s.handlePush)
+
+	feedbackGroup := api.Group("/feedback", s.requireAuth())
+	feedbackGroup.POST("", s.feedbackRateLimit(), s.handleCreateFeedback)
+	feedbackGroup.GET("/mine", s.handleListMyFeedback)
 
 	households := api.Group("/households", s.requireAuth())
 	households.GET("", s.handleListHouseholds)

@@ -312,4 +312,47 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("回滚 000008 后重新迁移失败: %v", err)
 	}
+
+	// 000013：feedback 表与索引存在；down 删除表后数据不受影响，随后可再次 up。
+	var hasFeedback bool
+	feedbackTableExists := func() bool {
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables WHERE table_name = 'feedback'
+		)`).Scan(&hasFeedback); err != nil {
+			t.Fatalf("查询 feedback 表失败: %v", err)
+		}
+		return hasFeedback
+	}
+	if !feedbackTableExists() {
+		t.Fatalf("迁移到最新版本后缺少 feedback 表")
+	}
+	for _, idx := range []string{"feedback_user_created_idx", "feedback_user_idem_idx"} {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1
+		)`, idx).Scan(&exists); err != nil {
+			t.Fatalf("查询索引 %s 失败: %v", idx, err)
+		}
+		if !exists {
+			t.Fatalf("000013 迁移后缺少索引 %s", idx)
+		}
+	}
+	if err := m.Migrate(12); err != nil {
+		t.Fatalf("回滚 000013 失败: %v", err)
+	}
+	if feedbackTableExists() {
+		t.Fatalf("回滚 000013 后 feedback 表仍存在")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚 000013 后查询用户失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000013 破坏了用户数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚 000013 后重新迁移失败: %v", err)
+	}
+	if !feedbackTableExists() {
+		t.Fatalf("重新迁移后缺少 feedback 表")
+	}
 }

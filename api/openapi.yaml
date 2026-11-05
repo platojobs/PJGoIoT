@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.11.0
+  version: 0.12.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -32,6 +32,10 @@ info:
     - 自 `0.13.0` 起补齐家庭成员与邀请码管理、房间整段重排与 `roomCount`。
     - 自 `0.10.0`（服务 v0.14.0）起新增家庭所有权转让 `POST /households/{id}/transfer-ownership`，
       成员列表增加 `isSelf`，房间整段重排的 409 携带可机读 `ROOM_SET_MISMATCH`。
+    - 自契约 `0.12.0`（服务 v0.16.0）起提供意见反馈 `POST /feedback` 与 `GET /feedback/mine`：
+      提交按幂等键去重（客户端 `Idempotency-Key` 或规范化请求体哈希），重复提交返回同一 `feedbackId`；
+      列表只返回本人数据，联系方式与诊断文本不进入列表响应；提交同时受账号与 IP 双维度限流
+      （`429 FEEDBACK_RATE_LIMITED`）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -46,6 +50,7 @@ tags:
   - name: user
   - name: sync
   - name: household
+  - name: feedback
 
 paths:
   /health:
@@ -65,7 +70,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.11.0"
+                version: "0.12.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -1639,6 +1644,151 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /feedback:
+    post:
+      tags: [feedback]
+      operationId: createFeedback
+      summary: 提交意见反馈
+      description: |
+        提交一条意见反馈（bug / 功能建议 / 体验问题 / 其他）。
+
+        **幂等**：客户端可携带 `Idempotency-Key` 头；未携带时服务端按规范化请求体
+        （去除首尾空白后的字段）计算哈希作为幂等键。同一账号重复提交同一内容不会产生第二条记录，
+        始终返回同一个 `feedbackId`，并在重放时返回 `200` 且带 `Idempotent-Replayed: true`。
+        同一 `Idempotency-Key` 用于不同内容时返回 `409 IDEMPOTENCY_CONFLICT`。
+
+        **限流**：同时按账号与来源 IP 两个维度计数，任一超限返回 `429 FEEDBACK_RATE_LIMITED`
+        （带 `Retry-After`），不会静默丢弃。
+
+        `contact` 属于个人信息，只在服务端保存用于回访；它不会出现在任何列表响应中，也不会写入日志明文。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: 可选的幂等键，最长 128 字符；相同 key + 相同内容返回同一 feedbackId
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackCreate"
+            example:
+              kind: bug
+              body: "添加设备后偶发闪退"
+              contact: "user@example.com"
+              context:
+                platform: android
+                appVersion: "1.2.3"
+                buildType: release
+                osVersion: "Android 14"
+                deviceModel: "Pixel 7"
+              diagnostics: "java.lang.NullPointerException at DeviceListFragment"
+      responses:
+        "201":
+          description: 提交成功（新建记录）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackCreated"
+        "200":
+          description: "幂等重放，返回已存在的 feedbackId（响应头 Idempotent-Replayed: true）"
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: string
+              description: 固定为 true
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackCreated"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: 同一 Idempotency-Key 被用于不同的请求体
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: IDEMPOTENCY_CONFLICT
+                  message: "该 Idempotency-Key 已用于不同的请求体"
+        "413":
+          description: 请求体过大（超过 256 KiB）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: PAYLOAD_TOO_LARGE
+                  message: "请求体过大"
+        "429":
+          description: 反馈提交超过账号或 IP 维度额度
+          headers:
+            Retry-After:
+              schema:
+                type: string
+              description: 建议等待秒数
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: FEEDBACK_RATE_LIMITED
+                  message: "反馈提交过于频繁，请稍后再试"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /feedback/mine:
+    get:
+      tags: [feedback]
+      operationId: listMyFeedback
+      summary: 查看本人提交的反馈
+      description: |
+        只返回当前 token 对应账号提交的反馈，按 `createdAt` 倒序游标分页。
+        响应不包含 `contact` 与 `diagnostics`：联系方式是个人信息，诊断文本仅用于服务端排查。
+        不存在「按 id 读取他人反馈」的接口；列表隔离即为跨账号访问边界。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页返回的 nextCursor；首页省略
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数，默认 20，范围 1-100
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
   /metrics:
     servers:
       - url: http://127.0.0.1:8080
@@ -1910,6 +2060,7 @@ components:
                 - RESYNC_REQUIRED
                 - TIMEOUT
                 - ROOM_SET_MISMATCH
+                - FEEDBACK_RATE_LIMITED
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -2946,3 +3097,112 @@ components:
           items:
             type: string
             format: uuid
+
+    FeedbackClientContext:
+      type: object
+      description: 客户端上下文，用于定位问题；五个字段均为必填
+      required: [platform, appVersion, buildType, osVersion, deviceModel]
+      properties:
+        platform:
+          type: string
+          enum: [android, ios]
+        appVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        buildType:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: 构建类型，如 release / debug / beta；服务端不限定枚举
+        osVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        deviceModel:
+          type: string
+          minLength: 1
+          maxLength: 128
+
+    FeedbackCreate:
+      type: object
+      required: [kind, body, context]
+      properties:
+        kind:
+          type: string
+          enum: [bug, feature, experience, other]
+          description: bug 缺陷、feature 功能建议、experience 体验问题、other 其他
+        body:
+          type: string
+          description: 描述正文；去除首尾空白后不能为空
+          minLength: 1
+          maxLength: 4000
+        contact:
+          type: string
+          nullable: true
+          maxLength: 200
+          description: 可选联系方式，属于个人信息：不会出现在列表响应中，也不会明文写入日志
+        context:
+          $ref: "#/components/schemas/FeedbackClientContext"
+        diagnostics:
+          type: string
+          nullable: true
+          maxLength: 8000
+          description: 可选诊断文本（日志片段等），仅用于服务端排查，不会出现在列表响应中
+
+    FeedbackCreated:
+      type: object
+      required: [feedbackId, createdAt]
+      properties:
+        feedbackId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+
+    FeedbackItem:
+      type: object
+      description: 本人反馈列表项；不含 contact 与 diagnostics
+      required: [feedbackId, kind, body, platform, appVersion, buildType, osVersion, deviceModel, status, createdAt]
+      properties:
+        feedbackId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [bug, feature, experience, other]
+        body:
+          type: string
+        platform:
+          type: string
+          enum: [android, ios]
+        appVersion:
+          type: string
+        buildType:
+          type: string
+        osVersion:
+          type: string
+        deviceModel:
+          type: string
+        status:
+          type: string
+          enum: [submitted, received, closed]
+          description: submitted 已提交、received 已受理、closed 已关闭
+        createdAt:
+          type: string
+          format: date-time
+
+    FeedbackPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/FeedbackItem"
+        nextCursor:
+          type: string
+          description: 下一页游标；`hasMore=false` 时为空串
+        hasMore:
+          type: boolean

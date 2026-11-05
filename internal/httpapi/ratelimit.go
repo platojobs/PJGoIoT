@@ -110,11 +110,17 @@ type sharedLimiter struct {
 }
 
 func newRateLimiter(cfg config.Config, st store.Store, logger *slog.Logger) rateLimiter {
-	local := newIPLimiter(cfg.RateLimitPerMin, cfg.RateLimitBurst)
+	return newRateLimiterFor(cfg.RateLimitBackend, cfg.RateLimitPerMin, cfg.RateLimitBurst, st, logger)
+}
+
+// newRateLimiterFor 按显式参数构造限流器；反馈接口的用户/IP 双维度限流复用同一套实现，
+// 只是额度不同。perMinute<=0 返回 nil 表示该维度不启用。
+func newRateLimiterFor(backend string, perMinute, burst int, st store.Store, logger *slog.Logger) rateLimiter {
+	local := newIPLimiter(perMinute, burst)
 	if local == nil {
 		return nil
 	}
-	if cfg.RateLimitBackend != "postgres" {
+	if backend != "postgres" {
 		return local
 	}
 	shared, ok := st.(sharedRateLimitStore)
@@ -123,13 +129,12 @@ func newRateLimiter(cfg config.Config, st store.Store, logger *slog.Logger) rate
 		logger.Warn("存储不支持共享限流，回退进程内计数", "store", st.Backend())
 		return local
 	}
-	burst := cfg.RateLimitBurst
 	if burst <= 0 {
-		burst = cfg.RateLimitPerMin
+		burst = perMinute
 	}
 	return &sharedLimiter{
 		store:     shared,
-		perMinute: cfg.RateLimitPerMin,
+		perMinute: perMinute,
 		burst:     burst,
 		fallback:  local,
 		log:       logger,

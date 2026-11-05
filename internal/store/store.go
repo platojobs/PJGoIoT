@@ -50,6 +50,13 @@ type PushOptions struct {
 	RequestHash    string
 }
 
+// FeedbackOptions 携带反馈写入的幂等参数。
+// IdempotencyKey 由 HTTP 层统一派生（客户端提供或按规范化请求体哈希），存储层只负责唯一约束。
+type FeedbackOptions struct {
+	IdempotencyKey string
+	RequestHash    string
+}
+
 // Store 是服务端依赖的全部存储能力。
 type Store interface {
 	// Backend 返回存储类型（fixture/postgres），用于健康检查与日志。
@@ -172,6 +179,12 @@ type Store interface {
 	CleanupIdempotencyKeys(ctx context.Context, before time.Time) (int64, error)
 	// CleanupTokens 删除 expires_at 早于 before 的 token，返回删除条数。
 	CleanupTokens(ctx context.Context, before time.Time) (int64, error)
+
+	// CreateFeedback 写入一条反馈；同一 (userID, IdemKey) 重复提交返回已存记录且 replayed=true。
+	// 同一幂等键对应不同请求体时返回 ErrIdempotencyConflict。
+	CreateFeedback(ctx context.Context, userID string, sub model.FeedbackSubmission, opts FeedbackOptions) (item model.Feedback, replayed bool, err error)
+	// ListUserFeedback 只返回本人反馈，按 createdAt 倒序游标分页；非法游标返回 ErrBadCursor。
+	ListUserFeedback(ctx context.Context, userID string, cursor string, limit int) (model.FeedbackPage, error)
 
 	// ListUserDevicesForExport 返回用户全部设备（含已删除的 tombstone），按 updated_at 倒序。
 	ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error)

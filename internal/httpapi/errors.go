@@ -39,6 +39,9 @@ const (
 	CodeTimeout             = "TIMEOUT"
 	// CodeRoomSetMismatch 用于整段房间重排时集合不一致，客户端可直接据此代码触发「重新拉取再提交」。
 	CodeRoomSetMismatch = "ROOM_SET_MISMATCH"
+	// CodeFeedbackRateLimited 表示反馈提交超过账号或 IP 维度的额度；
+	// 与全局 RATE_LIMITED 区分，便于客户端提示「反馈提交过于频繁」而不是泛化重试。
+	CodeFeedbackRateLimited = "FEEDBACK_RATE_LIMITED"
 )
 
 type errorBody struct {

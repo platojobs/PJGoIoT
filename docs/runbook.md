@@ -1,10 +1,10 @@
-# PJGoIoT 运行手册（v0.15.0）
+# PJGoIoT 运行手册（v0.16.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
 > 本手册区分「已验证」与「未验证」，未实际执行的步骤不得当作已验证结论。
 
-## 0. 本机验证状态（2026-11-05）
+## 0. 本机验证状态（2026-11-06）
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
@@ -66,6 +66,12 @@
 | v0.15.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.11.0 |
 | v0.15.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
 | v0.15.0 CI | **已验证** | GitHub Actions [run 42058675285](https://github.com/platojobs/PJGoIoT/actions/runs/42058675285) 四 job 全绿；日志确认 `TestHouseholdStructureChangesPostgres` / `...CursorExpiredPostgres` 实际 PASS，`OpenAPI 契约校验` 读到 `version: 0.11.0` |
+| v0.16.0 反馈提交与幂等 | **已验证** | 真实 PG `TestPostgresFeedbackIntegration`：提交成功、空白/超长描述被约束拒绝、幂等重复提交同 `feedbackId` 且不新增、同幂等键不同内容冲突、初始状态 `submitted` |
+| v0.16.0 本人列表与隔离 | **已验证** | 同一测试验证 A/B 列表互不可见、游标分页不重不漏、非法游标 `ErrBadCursor`；fixture HTTP 测试断言列表不含 `contact` |
+| v0.16.0 校验与限流 | **已验证** | `TestFeedbackValidation` + `TestFeedbackRateLimitByUserAndIP` + 真实 PG HTTP 子测试：空白/超长/未知类型/非法平台 400，账号与 IP 双维度 429 `FEEDBACK_RATE_LIMITED`（带 `Retry-After`），未登录 401 |
+| v0.16.0 契约一致性 | **已验证** | `TestOpenAPIFeedbackContract`：`FeedbackItem` 字段与 `model.Feedback` JSON 标签一致，kind/platform/status 枚举与实现一致，错误码枚举含 `FEEDBACK_RATE_LIMITED` |
+| v0.16.0 迁移 | **已验证** | `000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000012）→ up`，索引 `feedback_user_created_idx` / `feedback_user_idem_idx` 存在 |
+| v0.16.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 0.12.0 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -749,6 +755,20 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   ```
 - 设备归属变更仍走已有的 `user_device` 变更，不会重复写结构变更；查家庭内设备变更归属看
   `change_log.household_id`，查结构变更看 `user_id` 扇出。
+
+### 7.14 意见反馈接口排障（v0.16.0）
+
+- **429 `FEEDBACK_RATE_LIMITED`**：账号与 IP 双维度独立计数，默认账号 10/min（桶 5）、IP 30/min（桶 10）。
+  先看 `FEEDBACK_USER_*` / `FEEDBACK_IP_*`，再按访问日志的 `ip` 与 `user_id` 判断是单个账号刷量还是共享出口 IP；
+  `RATE_LIMIT_BACKEND=memory` 时多实例额度按实例数放大，与全局限流一致。
+- **409 `IDEMPOTENCY_CONFLICT`**：同一个 `Idempotency-Key` 被用于不同内容。客户端应为每条草稿固定一个 key，
+  不要在内容变化后复用旧 key；未携带 key 时服务端按规范化请求体哈希去重，不会出现该冲突。
+- **重复提交仍返回同一条**：响应码 `200` 且带 `Idempotent-Replayed: true` 属于正常幂等重放，不是新建。
+- **列表看不到刚提交的反馈**：确认请求 token 与提交时是同一账号；`GET /feedback/mine` 不存在跨账号读取路径。
+  当前没有后台受理工作流，状态会停留在 `submitted`（已知限制）。
+- **个人信息核查**：`contact` 只落 `feedback.contact` 列，不出现在列表响应；排查时不要把它拼进日志或告警文本。
+  需要核查可直接查库：`SELECT id, user_id, created_at, status FROM feedback ORDER BY created_at DESC LIMIT 20;`
+- **账号注销**：`feedback.user_id` 为 `ON DELETE CASCADE`，注销后自动清理，无需额外清理任务。
 
 ## 8. 监控与告警
 

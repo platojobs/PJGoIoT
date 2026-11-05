@@ -359,6 +359,42 @@ type ChangesPage struct {
 	HasMore    bool     `json:"hasMore"`
 }
 
+// FeedbackSubmission 是 POST /feedback 的规范化内容（服务端负责校验与去重）。
+// contact / diagnostics 属于可选个人信息或大段文本，只在写入时使用，不进入任何列表响应。
+type FeedbackSubmission struct {
+	Kind        string  `json:"kind"`
+	Body        string  `json:"body"`
+	Contact     *string `json:"contact,omitempty"`
+	Platform    string  `json:"platform"`
+	AppVersion  string  `json:"appVersion"`
+	BuildType   string  `json:"buildType"`
+	OSVersion   string  `json:"osVersion"`
+	DeviceModel string  `json:"deviceModel"`
+	Diagnostics *string `json:"diagnostics,omitempty"`
+}
+
+// Feedback 是 GET /feedback/mine 中的一条反馈视图。
+// 不包含 contact 与 diagnostics：前者是个人信息，后者体积大且仅用于排查。
+type Feedback struct {
+	FeedbackID  string    `json:"feedbackId"`
+	Kind        string    `json:"kind"`
+	Body        string    `json:"body"`
+	Platform    string    `json:"platform"`
+	AppVersion  string    `json:"appVersion"`
+	BuildType   string    `json:"buildType"`
+	OSVersion   string    `json:"osVersion"`
+	DeviceModel string    `json:"deviceModel"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// FeedbackPage 是 GET /feedback/mine 的响应体，按 createdAt 倒序游标分页。
+type FeedbackPage struct {
+	Items      []Feedback `json:"items"`
+	NextCursor string     `json:"nextCursor"`
+	HasMore    bool       `json:"hasMore"`
+}
+
 // User 是 GET /me/export 中返回的账号信息。
 type User struct {
 	ID        string    `json:"id"`

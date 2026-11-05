@@ -60,6 +60,25 @@ type householdInvitationRecord struct {
 	createdAt   time.Time
 }
 
+// feedbackRecord 是内存版反馈；contact/diagnostics 只保存，不进入列表响应。
+type feedbackRecord struct {
+	id          string
+	userID      string
+	kind        string
+	body        string
+	contact     *string
+	platform    string
+	appVersion  string
+	buildType   string
+	osVersion   string
+	deviceModel string
+	diagnostics *string
+	status      string
+	idemKey     string
+	requestHash string
+	createdAt   time.Time
+}
+
 type userData struct {
 	byID  map[string]*model.UserDevice
 	byKey map[string]*model.UserDevice // key: platform|externalId
@@ -116,6 +135,9 @@ type Store struct {
 	households  map[string]*householdRecord
 	rooms       map[string]model.HouseholdRoom
 	invitations map[string]*householdInvitationRecord
+
+	feedback     []*feedbackRecord
+	feedbackIdem map[string]*feedbackRecord // key: userID|idemKey
 }
 
 // New 从 fixtures 目录加载公共元数据。
@@ -132,6 +154,8 @@ func New(dir string) (*Store, error) {
 		households:    map[string]*householdRecord{},
 		rooms:         map[string]model.HouseholdRoom{},
 		invitations:   map[string]*householdInvitationRecord{},
+		feedback:      []*feedbackRecord{},
+		feedbackIdem:  map[string]*feedbackRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))

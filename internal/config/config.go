@@ -12,15 +12,21 @@ import (
 
 // Config 是 API 服务的全部运行时配置。
 type Config struct {
-	Addr                string
-	StoreBackend        string // fixture 或 postgres
-	DatabaseURL         string
-	FixturesDir         string
-	RateLimitBackend    string // memory（进程内）或 postgres（跨实例共享）
-	RateLimitPerMin     int
-	RateLimitBurst      int
-	PairingClaimPerMin  int
-	PairingClaimBurst   int
+	Addr               string
+	StoreBackend       string // fixture 或 postgres
+	DatabaseURL        string
+	FixturesDir        string
+	RateLimitBackend   string // memory（进程内）或 postgres（跨实例共享）
+	RateLimitPerMin    int
+	RateLimitBurst     int
+	PairingClaimPerMin int
+	PairingClaimBurst  int
+	// FeedbackUserPerMin / FeedbackUserBurst 是反馈接口按账号的每分钟令牌数，
+	// FeedbackIPPerMin / FeedbackIPBurst 是按来源 IP 的额度；两个维度同时生效。
+	FeedbackUserPerMin  int
+	FeedbackUserBurst   int
+	FeedbackIPPerMin    int
+	FeedbackIPBurst     int
 	MetricsEnabled      bool
 	RunMigrationsOnBoot bool
 	CORSAllowedOrigins  []string
@@ -47,6 +53,10 @@ func Load() (Config, error) {
 		RateLimitBurst:      getEnvInt("RATE_LIMIT_BURST", 40),
 		PairingClaimPerMin:  getEnvInt("PAIRING_CLAIM_RATE_PER_MINUTE", 20),
 		PairingClaimBurst:   getEnvInt("PAIRING_CLAIM_BURST", 10),
+		FeedbackUserPerMin:  getEnvInt("FEEDBACK_USER_RATE_PER_MINUTE", 10),
+		FeedbackUserBurst:   getEnvInt("FEEDBACK_USER_BURST", 5),
+		FeedbackIPPerMin:    getEnvInt("FEEDBACK_IP_RATE_PER_MINUTE", 30),
+		FeedbackIPBurst:     getEnvInt("FEEDBACK_IP_BURST", 10),
 		MetricsEnabled:      getEnvBool("METRICS_ENABLED", true),
 		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
 		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
@@ -54,7 +64,7 @@ func Load() (Config, error) {
 		ShutdownDrain:       time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
 		InstanceID:          getEnv("INSTANCE_ID", ""),
 		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:             getEnv("APP_VERSION", "0.15.0"),
+		Version:             getEnv("APP_VERSION", "0.16.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")
@@ -92,6 +102,9 @@ func Load() (Config, error) {
 	}
 	if cfg.PairingClaimPerMin < 0 || cfg.PairingClaimBurst < 0 {
 		return Config{}, fmt.Errorf("配对码限流参数不能为负数")
+	}
+	if cfg.FeedbackUserPerMin < 0 || cfg.FeedbackUserBurst < 0 || cfg.FeedbackIPPerMin < 0 || cfg.FeedbackIPBurst < 0 {
+		return Config{}, fmt.Errorf("反馈限流参数不能为负数")
 	}
 	if cfg.TokenTTLDays <= 0 {
 		return Config{}, fmt.Errorf("TOKEN_TTL_DAYS 必须大于 0，当前为 %d", cfg.TokenTTLDays)

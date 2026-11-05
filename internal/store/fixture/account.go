@@ -55,6 +55,16 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 		}
 	}
 	s.changes = kept
+
+	keptFeedback := s.feedback[:0]
+	for _, rec := range s.feedback {
+		if rec.userID != userID {
+			keptFeedback = append(keptFeedback, rec)
+			continue
+		}
+		delete(s.feedbackIdem, userID+"|"+rec.idemKey)
+	}
+	s.feedback = keptFeedback
 	return nil
 }
 

@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.11.0**（v0.15.0 把家庭/房间结构变更纳入增量同步）；服务版本 **v0.15.0**（家庭结构变更进入 `/sync/changes`）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.12.0**（v0.16.0 新增意见反馈 `POST /feedback` 与 `GET /feedback/mine`）；服务版本 **v0.16.0**（意见反馈闭环）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -92,6 +92,8 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/my/devices/{platform}/{externalId}/readings/metrics` | Bearer | 200 | 指标清单，`{items:[{metric,unit,count,firstAt,lastAt}]}` |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}`；范围=本人+家庭 |
 | POST | `/sync/push` | Bearer | 200 | 批量写入设备与读数，`{applied,conflicts,nextCursor,appliedReadings,skippedReadings}` |
+| POST | `/feedback` | Bearer | 201 / 200 | 提交意见反馈；同内容重复提交返回同一 `feedbackId`（200 重放）；超限 429 `FEEDBACK_RATE_LIMITED` |
+| GET | `/feedback/mine?cursor=&limit=` | Bearer | 200 | 本人反馈列表，`{items,nextCursor,hasMore}`；只含本人数据，不含 `contact`/`diagnostics` |
 | GET | `/households` | Bearer | 200 | 我所在的家庭列表（含角色/成员数/设备数/房间数） |
 | POST | `/households` | Bearer | 201 | 创建家庭，创建者为 owner |
 | GET | `/households/{id}` | Bearer | 200 | 家庭详情（成员可读，跨家庭 404） |
@@ -245,6 +247,53 @@ make dev-postgres   # Postgres 模式启动 API
   这一点与设备变更不同（设备变更由 `household_id` 共享可见），是刻意取舍：结构变更只在“发生那一刻”推给当时在册的人。
 - **向后兼容**：客户端必须忽略未知 `entity` 并照常推进 `nextCursor`；payload 字段只加不删。
 - **90 天保留与 410**：结构变更同样受 `change_log` 保留期约束，`cursor` 早于最老 `seq` 时返回 `410 RESYNC_REQUIRED`。
+
+### 意见反馈（v0.16.0）
+
+客户端此前只能把反馈写入本地待发队列并标注「未发送」；v0.16.0 补上服务端接收与本人查询，形成真闭环。
+
+**提交 `POST /feedback`**：
+
+```json
+{
+  "kind": "bug",
+  "body": "添加设备后偶发闪退",
+  "contact": "user@example.com",
+  "context": {
+    "platform": "android",
+    "appVersion": "1.2.3",
+    "buildType": "release",
+    "osVersion": "Android 14",
+    "deviceModel": "Pixel 7"
+  },
+  "diagnostics": "java.lang.NullPointerException at DeviceListFragment"
+}
+```
+
+- `kind` 枚举：`bug` / `feature` / `experience` / `other`；`body` 去首尾空白后不能为空，最长 4000 字符；
+  `context` 五个字段必填（`platform` 只能是 `android` / `ios`），`contact` ≤ 200、`diagnostics` ≤ 8000，均可省略。
+- 成功返回 `201 {feedbackId, createdAt}`。
+- **幂等**：优先使用请求头 `Idempotency-Key`（≤128 字符）；未携带时服务端对**规范化后的请求体**
+  （字段去首尾空白、空串视为未提供）做 SHA-256 作为幂等键。同一账号重复提交同一内容返回同一个
+  `feedbackId`（第二次为 `200` + `Idempotent-Replayed: true`），不会产生第二条记录；
+  同一 `Idempotency-Key` 用于不同内容返回 `409 IDEMPOTENCY_CONFLICT`。存储层由 `(user_id, idem_key)`
+  唯一索引兜底，`INSERT ... ON CONFLICT DO NOTHING` 后回读既有行。
+- **限流**：账号与 IP 双维度同时生效，默认账号 `10/min`（桶容量 5）、IP `30/min`（桶容量 10），
+  每维度独立计数；任一超限返回 `429 FEEDBACK_RATE_LIMITED` 并带 `Retry-After: 60`，不静默丢弃。
+  参数可分别用 `FEEDBACK_USER_RATE_PER_MINUTE` / `FEEDBACK_USER_BURST` /
+  `FEEDBACK_IP_RATE_PER_MINUTE` / `FEEDBACK_IP_BURST` 覆盖；`RATE_LIMIT_BACKEND=postgres` 时与全局限流共用共享桶。
+
+**查看 `GET /feedback/mine?cursor=&limit=`**：
+
+- 只返回当前 token 对应账号的数据，按 `createdAt` 倒序游标分页（默认 20，最大 100），
+  响应 `{items,nextCursor,hasMore}`；状态 `submitted` / `received` / `closed`。
+- 响应项不含 `contact` 与 `diagnostics`：联系方式属于个人信息，诊断文本体积大且仅用于服务端排查。
+  不存在「按 id 读取他人反馈」的接口，列表隔离即为跨账号访问边界。
+- 联系方式不会写入日志明文。
+
+**数据落点**：现有 `user_devices` / `households` / `readings` 都不承载自由文本反馈，因此新增独立表
+`feedback`（迁移 `000013`），索引 `(user_id, created_at DESC, id)` 与唯一索引 `(user_id, idem_key)`。
+账号注销时 `ON DELETE CASCADE` 一并删除。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1171,12 +1220,16 @@ PJGoIoT/
 | `INSTANCE_ID` | 空 | 写入响应头 `X-Instance`，用于确认请求由哪个实例处理 |
 | `PAIRING_CLAIM_RATE_PER_MINUTE` | `20` | 配对码领取接口的每 IP 每分钟令牌数；`<=0` 关闭该接口独立限流 |
 | `PAIRING_CLAIM_BURST` | `10` | 配对码领取接口的每 IP 令牌桶容量 |
+| `FEEDBACK_USER_RATE_PER_MINUTE` | `10` | 反馈提交按账号的每分钟令牌数 |
+| `FEEDBACK_USER_BURST` | `5` | 反馈提交按账号的令牌桶容量（允许的瞬时连发数） |
+| `FEEDBACK_IP_RATE_PER_MINUTE` | `30` | 反馈提交按来源 IP 的每分钟令牌数 |
+| `FEEDBACK_IP_BURST` | `10` | 反馈提交按来源 IP 的令牌桶容量 |
 | `METRICS_ENABLED` | `true` | 是否注册根路径 `/metrics`；生产可关闭或仅内网暴露 |
 | `RUN_MIGRATIONS_ON_BOOT` | `true` | postgres 模式下启动时执行迁移；失败进程非零退出（fixture 模式忽略） |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.15.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.11.0 不是同一个号 |
+| `APP_VERSION` | `0.16.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.12.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1333,6 +1386,12 @@ seed 数据来源与边界：
 | v0.15.0 迁移 | 本轮无 schema 变更（`change_log` 已有 `user_id`/`entity`/`entity_id` 列），未新增迁移；版本保持 `000012` |
 | v0.15.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.11.0** |
 | v0.15.0 CI | 通过：GitHub Actions [run 42058675285](https://github.com/platojobs/PJGoIoT/actions/runs/42058675285)，四个 job 全绿；日志确认 `TestHouseholdStructureChangesPostgres` 与 `TestHouseholdStructureChangesCursorExpiredPostgres` 在 `Postgres 集成测试` 中实际 PASS，`OpenAPI 契约校验` 步骤实际执行且读到 `version: 0.11.0` |
+| v0.16.0 反馈提交与幂等 | 通过（真实 PostgreSQL）：`TestPostgresFeedbackIntegration` 覆盖提交成功、空白/超长描述被约束拒绝、幂等重复提交返回同一 `feedbackId` 且不新增记录、同幂等键不同内容 `ErrIdempotencyConflict`、`submitted` 初始状态 |
+| v0.16.0 本人列表与隔离 | 通过（真实 PostgreSQL）：同一测试断言 A/B 列表互不可见、游标分页不重不漏、非法游标 `ErrBadCursor`；`TestFeedbackMineIsolationAndPagination`（fixture HTTP 层）断言列表响应不含 `contact` |
+| v0.16.0 校验与限流 | 通过：`TestFeedbackValidation` 覆盖空白/超长/未知类型/非法平台/缺上下文/非法 JSON；`TestFeedbackRateLimitByUserAndIP` 与真实 PG 中的 HTTP 子测试验证账号与 IP 双维度 429 `FEEDBACK_RATE_LIMITED`，未登录 401 |
+| v0.16.0 契约一致性 | 通过：`TestOpenAPIFeedbackContract` 解析 `api/openapi.yaml`，比对 `FeedbackItem` 的 required/properties 与 `model.Feedback` 的 JSON 字段、kind/platform/status 枚举、错误码枚举与实现常量一致 |
+| v0.16.0 迁移 | 通过：`000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（回到 000012）→ up`，并断言 `feedback_user_created_idx` 与 `feedback_user_idem_idx` 存在、回滚不影响用户数据 |
+| v0.16.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 **0.12.0** |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1432,8 +1491,8 @@ git push origin main
 gh run watch --exit-status
 
 # 4. 打 annotated tag 并推送（不要动历史 tag）
-git tag -a v0.15.0 -m 'v0.15.0: 家庭结构变更进入增量同步（household/room entity）'
-git push origin v0.15.0
+git tag -a v0.16.0 -m 'v0.16.0: 意见反馈提交与本人列表（幂等 + 双维度限流）'
+git push origin v0.16.0
 ```
 
 - CI 的 `OpenAPI 契约校验` 步骤（`npx @redocly/cli lint api/openapi.yaml`）是发布门槛，失败即不发 tag。
