@@ -1143,6 +1143,10 @@ seed 数据来源与边界：
 | v0.9.0 dashboard 校验 | 通过：`bash scripts/validate-dashboard.sh` → JSON 结构有效（9 面板），`probe_success` 豁免，其余 `pjgoiot_*` 指标均在 Go 代码中存在 |
 | v0.9.0 单元/集成测试 | 通过：`gofmt`/`go build`/`go vet`/`go test ./...` 全绿；真实 PostgreSQL 集成测试（`TEST_DATABASE_URL`）全绿；`TestMetricsEndpoint` 已断言 `route` 标签 |
 | v0.9.0 GitHub Actions | **通过**（run 41974670052，commit c0f93ba）：`构建与测试`、`压测门槛（smoke）`（devices p95 16ms / series 11ms / push 313ms，错误率 0%，`SMOKE PASS`）、`构建镜像`、`配置与脚本校验`（含 dashboard 校验与新脚本 shellcheck）均 success |
+| v0.10.0 事务边界与崩溃注入 | 通过（真实 PostgreSQL）：`TestPushTransactionBoundaries` 覆盖重复 id/键 400、读数校验失败整批回滚、`devices_written`/`change_log_written`/`readings_written`/`idempotency_written`/`before_commit` 五个崩溃注入点零残留、同 key 重试成功、`applied+skipped==len(readings)`、并发 push 游标无缺口 |
+| v0.10.0 故障注入 | 通过（本机 Docker PG + 本机 API）：停机 36s 期间 `my/devices`/`push` 30/30 为 503 `UNAVAILABLE`，`/healthz` 30/30 为 200，`/api/v1/health` 30/30 为 503；重启后 0s 自愈；`statement_timeout=100ms` → 3 次 503 `TIMEOUT` 且 `db_errors_total` 0→3；池=2 时 devices 200 并发 7 330 请求 p95 540ms 0% 错误，push 100 并发 113×200 + 137×503 p95 10.2s |
+| v0.10.0 迁移演练 | 通过：`scripts/migrate-drill.sh` 三场景可重复执行——空库→9；000001 数据→9 且 `platform/external_id/device_type/expires_at` 回填正确；down 8 步→1 再 up→9，`users/tokens/user_devices/change_log` 行数 1/1/1/1 不丢（readings 因 000006 down 归零，已知语义） |
+| v0.10.0 GitHub Actions | **通过**（run 42007845297，commit c61e0c6）：`构建与测试`、`构建镜像`、`配置与脚本校验`（含 `scripts/migrate-drill.sh` 的 `bash -n`/shellcheck）、`压测门槛（smoke）`（devices p95 11ms / push 392ms / series 6ms，错误率 0%，`SMOKE PASS`）均 success；tag `v0.10.0` 指向 c61e0c6 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |

@@ -788,6 +788,10 @@ DB_MAX_OPEN_CONNS=2 DB_MAX_IDLE_CONNS=1 ./api   # 独立进程，端口 55902
 `users` / `tokens` / `user_devices` / `change_log` 行数不丢。该演练发现并修复了 `000004`
 对大写 MAC 的漏回填（新增 `000009_mac_case_backfill`）。
 
+GitHub Actions（run 42007845297，commit c61e0c6，tag `v0.10.0`）：`构建与测试`、`构建镜像`、
+`配置与脚本校验`（含 `scripts/migrate-drill.sh` 的 `bash -n`/shellcheck）、`压测门槛（smoke）`
+（devices p95 11ms / push 392ms / series 6ms，错误率 0%）均 success。
+
 ## 10. 本地栈自检步骤（可复现）
 
 ```bash
