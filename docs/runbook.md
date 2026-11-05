@@ -350,6 +350,8 @@ docker compose down（不加 -v）
    pjgoiot_caddy_config / pjgoiot_caddy_data / pjgoiot_pgdata
 ```
 
+GitHub Actions（run 41962617787，commit ef0c7af）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success。
+
 ### 9.6 仍未验证
 
 - 真实域名 / ACME 证书签发（未开通任何云账号）；

@@ -800,7 +800,7 @@ seed 数据来源与边界：
 | g) 容器启动迁移 | **已验证**：`docker compose logs api` 两次启动均输出 `启动迁移完成 version=7 dirty=false` |
 | v0.7.1 PromQL 语义校验 | **已验证**：`docker run --entrypoint /bin/promtool prom/prometheus:latest check rules /cfg/alerts.yml` → `SUCCESS: 6 rules found`；`check config /cfg/scrape.yml` → `SUCCESS: ... valid prometheus config file syntax` |
 | v0.7.1 docker 模式备份/恢复 | **已验证**：`BACKUP_MODE=docker backup.sh` → `pjgoiot-20261105T031905Z.dump.gz`（8 193 bytes）+ SHA-256；`RESTORE_MODE=docker restore.sh --confirm` → 校验 `OK`、`version=7 dirty=f`、行数 `1/1/0/1/0`；恢复后 API `healthy` 且原设备仍可查 |
-| v0.7.1 GitHub Actions | **通过**（run 待回填）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success |
+| v0.7.1 GitHub Actions | **通过**（run 41962617787，commit ef0c7af）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success |
 | v0.7.0 GitHub Actions（历史） | 通过（run 41956560178，commit 06eb0d3）：三个 job 均 success；lint-configs 中 `promtool` 在 runner 不可用而跳过，本轮已用本地容器补做语义校验 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
