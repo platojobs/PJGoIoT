@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.10.0**（v0.14.0 新增所有权转让、成员 `isSelf` 与 `ROOM_SET_MISMATCH` 错误码）；服务版本 **v0.14.0**（家庭共享 + 成员/邀请码管理 + 房间排序 + 所有权转让）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.11.0**（v0.15.0 把家庭/房间结构变更纳入增量同步）；服务版本 **v0.15.0**（家庭结构变更进入 `/sync/changes`）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -112,7 +112,7 @@ make dev-postgres   # Postgres 模式启动 API
 | DELETE | `/households/{id}/rooms/{roomId}` | Bearer | 204 | 删房间（仅 owner；设备 `roomId` 置 null） |
 | GET | `/metrics`（根路径） | 否 | 200 | Prometheus 文本指标；不受限流，`METRICS_ENABLED=false` 时 404 |
 
-### 家庭、房间与成员（v0.12.0 引入，v0.13.0 补齐管理与排序，v0.14.0 补所有权转让）
+### 家庭、房间与成员（v0.12.0 引入，v0.13.0 补齐管理与排序，v0.14.0 补所有权转让，v0.15.0 纳入增量同步）
 
 对齐米家的「账号 → 家庭 → 房间 → 设备」结构：设备仍由写入它的账号拥有，家庭只决定可见范围与房间归类。
 
@@ -215,7 +215,7 @@ make dev-postgres   # Postgres 模式启动 API
 **删除家庭的级联行为**（仅 owner、需客户端二次确认）：
 - 成员行、房间、邀请码随家庭级联删除；
 - 家庭内每台设备回到**其各自 owner** 的个人家庭，`room_id` 置 NULL，设备与读数本身不删除；
-- 家庭内的历史变更保留，但 `household_id` 置 NULL，原成员不再能看到；
+- 家庭内的设备历史变更保留，但 `household_id` 置 NULL，原成员不再能看到；结构变更行按接收者各自保留（含一条 `household delete`）。
 - 个人家庭不可删除（403）。
 
 **家庭计数**：`GET /households` 的每个家庭返回 `memberCount`（含 owner）、`deviceCount`（该家庭内 `household_id` 指向它的设备数）、`roomCount`（房间数），供客户端首页直接展示，无需再逐个家庭拉详情。计数为读取时实时统计，不做缓存。
@@ -225,10 +225,26 @@ make dev-postgres   # Postgres 模式启动 API
   `entityId` 仍由设备 owner 的 userId 派生，因此同一条共享变更对不同成员呈现相同的 `entityId`。
 - `POST /sync/push` **只匹配并写入调用者自己的设备行**，不会改写其他成员的记录，因此不存在“两个成员同时改同一设备互相覆盖”；
   代价是：若两位成员各自扫描同一台物理设备，会产生两条独立记录（已知限制，后续可按外部设备指纹合并）。
-- 家庭/房间的结构变更（建房、改名、删房、删家庭、邀请加入）**不写入 `change_log`**；客户端需通过 `GET /households*` 主动刷新。
-  删房间只把设备 `room_id` 置 NULL，也不会为受影响设备追加变更，其他成员可能短暂保留旧房间归属直到重新拉取设备列表。
 - 设备 alias/room/household 的修改通过 `PATCH /my/devices/{platform}/{externalId}` 会写入 `change_log`，家庭成员可见。
 - 家庭内设备视为共享**只读**：成员可看、可读读数，但不能编辑他人设备（404），不能管理家庭结构（403）。
+
+**家庭结构变更进入增量同步（v0.15.0）**：
+
+| entity | entityId | op | payload |
+| --- | --- | --- | --- |
+| `household` | `<householdId>` | `upsert` / `delete` | `id`、`name`、`ownerUserId`、`role`（**接收者本人**角色）、`memberCount`、`deleted` |
+| `room` | `<roomId>` | `upsert` / `delete` | `id`、`householdId`、`name`、`sortOrder`、`deleted` |
+
+- 写入范围：创建家庭、改名/删除家庭、创建/改名/删除/重排房间、成员加入/移除/退出、所有权转让，全部与业务写入在**同一事务**内提交。
+  整段重排会为每间房各发一条 `upsert`；删除家庭只发一条 `household delete`（成员/房间/邀请码随之消失，客户端整段移除即可）。
+  设备归属变更复用已有的 `user_device` 变更，**不重复写**结构变更。
+- **可见性（按「当时属于该家庭」）**：结构变更按写入时刻的成员集合**逐人**各写一行（`user_id=接收者`、`household_id` 留空）。因此
+  成员被移除/退出后不再收到离开之后的结构变更；已经写入的历史结构行也不会因为退出而消失（不会误报 410）；
+  非成员完全看不到。
+- **不回放历史**：新成员加入后不会收到加入之前的结构变更，首次基线请用 `GET /households`（全量）。
+  这一点与设备变更不同（设备变更由 `household_id` 共享可见），是刻意取舍：结构变更只在“发生那一刻”推给当时在册的人。
+- **向后兼容**：客户端必须忽略未知 `entity` 并照常推进 `nextCursor`；payload 字段只加不删。
+- **90 天保留与 410**：结构变更同样受 `change_log` 保留期约束，`cursor` 早于最老 `seq` 时返回 `410 RESYNC_REQUIRED`。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1160,7 +1176,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.14.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.10.0 不是同一个号 |
+| `APP_VERSION` | `0.15.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.11.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1310,6 +1326,12 @@ seed 数据来源与边界：
 | v0.14.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.10.0** |
 | v0.14.0 CI | 通过：GitHub Actions [run 42051601765](https://github.com/platojobs/PJGoIoT/actions/runs/42051601765)，四个 job 全绿；`Postgres 集成测试` 正则已放宽为 `TestHousehold`，日志可见 `TestHouseholdOwnershipPostgres`、`TestHouseholdOwnershipTransferConcurrentPostgres` 实际执行并通过；`OpenAPI 契约校验` 步骤实际执行（0 error） |
 | v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
+| v0.15.0 结构变更同步 | 通过（真实 PostgreSQL）：`TestHouseholdStructureChangesPostgres` 覆盖创建家庭/改名/建房/重排/转让/移除各阶段的 `household` 与 `room` 变更，断言两账号各自 `role` 视角正确（owner→member、member→owner）、重排后 `sortOrder` 直接可用、无关账号看不到、被移除者不再收到后续结构变更但仍能看到离开前的历史、新成员不回放历史房间变更 |
+| v0.15.0 结构变更 410 | 通过（真实 PostgreSQL）：`TestHouseholdStructureChangesCursorExpiredPostgres` 模拟保留期清理后，仅由结构变更造成的缺口同样触发 `store.ErrCursorExpired`（HTTP 层 `410 RESYNC_REQUIRED`） |
+| v0.15.0 未知 entity 兼容 | 通过：`TestSyncChangesUnknownEntityIgnoredByOldClient` 用固定 JSON 断言老客户端可解析含 `household`/`room`/`future_widget` 的响应，未知 entity 计数忽略且 `nextCursor` 照常推进 |
+| v0.15.0 HTTP 层结构同步 | 通过：`TestSyncChangesHouseholdStructure` 经 fixture 走完整 HTTP 链路（建房→邀请→建房→改名→移除→改名），验证两个账号 `GET /sync/changes` 的条目与可见性 |
+| v0.15.0 迁移 | 本轮无 schema 变更（`change_log` 已有 `user_id`/`entity`/`entity_id` 列），未新增迁移；版本保持 `000012` |
+| v0.15.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.11.0** |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1409,8 +1431,8 @@ git push origin main
 gh run watch --exit-status
 
 # 4. 打 annotated tag 并推送（不要动历史 tag）
-git tag -a v0.14.0 -m 'v0.14.0: 家庭所有权转让、成员 isSelf、ROOM_SET_MISMATCH'
-git push origin v0.14.0
+git tag -a v0.15.0 -m 'v0.15.0: 家庭结构变更进入增量同步（household/room entity）'
+git push origin v0.15.0
 ```
 
 - CI 的 `OpenAPI 契约校验` 步骤（`npx @redocly/cli lint api/openapi.yaml`）是发布门槛，失败即不发 tag。

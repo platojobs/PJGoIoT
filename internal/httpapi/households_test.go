@@ -344,6 +344,176 @@ func TestHouseholdRoomSetMismatchCode(t *testing.T) {
 	}
 }
 
+// changeItem / changesPage 用于解码 GET /sync/changes。
+type changeItem struct {
+	Seq      int64           `json:"seq"`
+	Entity   string          `json:"entity"`
+	EntityID string          `json:"entityId"`
+	Op       string          `json:"op"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+type changesPage struct {
+	Changes    []changeItem `json:"changes"`
+	NextCursor int64        `json:"nextCursor"`
+	HasMore    bool         `json:"hasMore"`
+}
+
+func TestSyncChangesHouseholdStructure(t *testing.T) {
+	h := newHandler(t, 0)
+	owner := newUser(t, h)
+	member := newUser(t, h)
+	outsider := newUser(t, h)
+
+	home := decode[householdResp](t, do(t, h, http.MethodPost, "/api/v1/households", `{"name":"同步家庭"}`, owner.Token, nil))
+	inv := decode[invitationResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/invitations", "", owner.Token, nil))
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/invitations/claim", `{"code":"`+inv.Code+`"}`, member.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("成员加入失败: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	room := decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"客厅"}`, owner.Token, nil))
+	decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"卧室"}`, owner.Token, nil))
+	do(t, h, http.MethodPatch, "/api/v1/households/"+home.ID, `{"name":"同步家庭-改名"}`, owner.Token, nil)
+
+	pull := func(token string, cursor int64) changesPage {
+		t.Helper()
+		rec := do(t, h, http.MethodGet, fmt.Sprintf("/api/v1/sync/changes?cursor=%d&limit=200", cursor), "", token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("拉取变更失败: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return decode[changesPage](t, rec)
+	}
+	findHousehold := func(p changesPage) *changeItem {
+		var found *changeItem
+		for i := range p.Changes {
+			if p.Changes[i].Entity == "household" && p.Changes[i].EntityID == home.ID {
+				found = &p.Changes[i]
+			}
+		}
+		return found
+	}
+
+	ownerPage := pull(owner.Token, 0)
+	memberPage := pull(member.Token, 0)
+
+	ch := findHousehold(memberPage)
+	if ch == nil {
+		t.Fatalf("成员未见家庭结构变更: %+v", memberPage)
+	}
+	var payload model.HouseholdChangePayload
+	if err := json.Unmarshal(ch.Payload, &payload); err != nil {
+		t.Fatalf("解析 household payload 失败: %v", err)
+	}
+	if ch.Op != "upsert" || payload.Name != "同步家庭-改名" || payload.Role != "member" ||
+		payload.MemberCount != 2 || payload.OwnerUserID != owner.UserID || payload.Deleted {
+		t.Fatalf("成员视角 household payload 不正确: op=%s %+v", ch.Op, payload)
+	}
+	if ch := findHousehold(ownerPage); ch == nil {
+		t.Fatalf("owner 未见家庭结构变更: %+v", ownerPage)
+	} else {
+		var p model.HouseholdChangePayload
+		if err := json.Unmarshal(ch.Payload, &p); err != nil {
+			t.Fatalf("解析 owner payload 失败: %v", err)
+		}
+		if p.Role != "owner" {
+			t.Fatalf("owner 视角 role 应为 owner: %+v", p)
+		}
+	}
+
+	// room 变更两个账号都能看到，且 payload 可直接驱动刷新
+	roomPayloads := func(p changesPage) []model.RoomChangePayload {
+		out := []model.RoomChangePayload{}
+		for _, c := range p.Changes {
+			if c.Entity != "room" || c.EntityID != room.ID {
+				continue
+			}
+			var rp model.RoomChangePayload
+			if err := json.Unmarshal(c.Payload, &rp); err != nil {
+				t.Fatalf("解析 room payload 失败: %v", err)
+			}
+			if c.Op != "upsert" || rp.Name != "客厅" || rp.HouseholdID != home.ID || rp.Deleted {
+				t.Fatalf("room payload 不正确: op=%s %+v", c.Op, rp)
+			}
+			out = append(out, rp)
+		}
+		return out
+	}
+	if ps := roomPayloads(ownerPage); len(ps) == 0 {
+		t.Fatalf("owner 未见房间变更: %+v", ownerPage)
+	}
+	if ps := roomPayloads(memberPage); len(ps) == 0 {
+		t.Fatalf("成员未见房间变更: %+v", memberPage)
+	}
+
+	// 无关账号看不到该家庭的任何结构变更
+	for _, c := range pull(outsider.Token, 0).Changes {
+		if (c.Entity == "household" && c.EntityID == home.ID) || (c.Entity == "room" && c.EntityID == room.ID) {
+			t.Fatalf("无关账号不应看到该家庭的结构变更: %+v", c)
+		}
+	}
+
+	// 移除成员：被移除者不再收到后续结构变更
+	memberCursor := memberPage.NextCursor
+	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+home.ID+"/members/"+member.UserID, "", owner.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("移除成员失败: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	do(t, h, http.MethodPatch, "/api/v1/households/"+home.ID, `{"name":"移除后的改名"}`, owner.Token, nil)
+	decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"移除后的房间"}`, owner.Token, nil))
+
+	for _, c := range pull(member.Token, memberCursor).Changes {
+		if c.Entity == "household" || c.Entity == "room" {
+			t.Fatalf("被移除成员不应再收到结构变更: %+v", c)
+		}
+	}
+	seenRename := false
+	for _, c := range pull(owner.Token, ownerPage.NextCursor).Changes {
+		if c.Entity != "household" || c.EntityID != home.ID {
+			continue
+		}
+		var p model.HouseholdChangePayload
+		if err := json.Unmarshal(c.Payload, &p); err != nil {
+			t.Fatalf("解析 owner payload 失败: %v", err)
+		}
+		if p.Name == "移除后的改名" && p.MemberCount == 1 {
+			seenRename = true
+		}
+	}
+	if !seenRename {
+		t.Fatalf("owner 应收到移除后的改名事件")
+	}
+}
+
+func TestSyncChangesUnknownEntityIgnoredByOldClient(t *testing.T) {
+	// 老客户端只认识 user_device；household/room 以及未来新增的未知 entity 都必须能安全忽略，
+	// 且游标照常推进（否则会被未知实体永久卡住）。
+	raw := `{"changes":[
+		{"seq":1,"entity":"user_device","entityId":"d1","op":"upsert","payload":{"id":"d1"},"serverTs":"2026-01-01T00:00:00Z"},
+		{"seq":2,"entity":"household","entityId":"h1","op":"upsert","payload":{"id":"h1"},"serverTs":"2026-01-01T00:00:00Z"},
+		{"seq":3,"entity":"room","entityId":"r1","op":"delete","payload":{"id":"r1","deleted":true},"serverTs":"2026-01-01T00:00:00Z"},
+		{"seq":4,"entity":"future_widget","entityId":"w1","op":"upsert","payload":{"id":"w1"},"serverTs":"2026-01-01T00:00:00Z"}
+	],"nextCursor":4,"hasMore":false}`
+
+	var page changesPage
+	if err := json.Unmarshal([]byte(raw), &page); err != nil {
+		t.Fatalf("老客户端解析失败（必须向后兼容）: %v", err)
+	}
+	if len(page.Changes) != 4 || page.NextCursor != 4 {
+		t.Fatalf("按原始顺序解析并推进游标: %+v", page)
+	}
+	applied, skipped := 0, 0
+	for _, c := range page.Changes {
+		switch c.Entity {
+		case "user_device":
+			applied++
+		default:
+			skipped++
+		}
+	}
+	if applied != 1 || skipped != 3 {
+		t.Fatalf("未知 entity 应被忽略而非报错: applied=%d skipped=%d", applied, skipped)
+	}
+}
+
 func TestHouseholdMemberAndInvitationManagement(t *testing.T) {
 	h := newHandler(t, 0)
 	owner := newUser(t, h)

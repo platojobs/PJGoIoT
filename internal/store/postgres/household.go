@@ -76,6 +76,13 @@ func (s *Store) CreateHousehold(ctx context.Context, ownerUserID string, name st
 		hid, uid); err != nil {
 		return model.Household{}, fmt.Errorf("写入家庭成员失败: %w", err)
 	}
+	snapshot, err := householdSnapshot(ctx, tx, hid)
+	if err != nil {
+		return model.Household{}, err
+	}
+	if err := emitHouseholdChange(ctx, tx, snapshot, "upsert", false); err != nil {
+		return model.Household{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return model.Household{}, fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -177,15 +184,31 @@ func (s *Store) RenameHousehold(ctx context.Context, userID string, householdID 
 	}
 	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
 	defer cancel()
-	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE households SET name = $2 WHERE id = $1`, hid, name)
+	res, err := tx.ExecContext(ctx, `UPDATE households SET name = $2 WHERE id = $1`, hid, name)
 	if err != nil {
 		return fmt.Errorf("更新家庭失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return store.ErrNotFound
+	}
+	snapshot, err := householdSnapshot(ctx, tx, hid)
+	if err != nil {
+		return err
+	}
+	if err := emitHouseholdChange(ctx, tx, snapshot, "upsert", false); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
 	}
 	return nil
 }
@@ -236,8 +259,16 @@ func (s *Store) DeleteHousehold(ctx context.Context, userID string, householdID 
 		UPDATE user_devices SET household_id = NULL, room_id = NULL WHERE household_id = $1`, hid); err != nil {
 		return fmt.Errorf("清理家庭设备归属失败: %w", err)
 	}
+	snapshot, err := householdSnapshot(ctx, tx, hid)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM households WHERE id = $1`, hid); err != nil {
 		return fmt.Errorf("删除家庭失败: %w", err)
+	}
+	// 解散家庭只扇出一条 household delete：成员/房间随家庭一并消失，客户端按家庭整段移除即可。
+	if err := emitHouseholdChange(ctx, tx, snapshot, "delete", true); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交事务失败: %w", err)
@@ -335,6 +366,14 @@ func (s *Store) RemoveHouseholdMember(ctx context.Context, userID string, househ
 		DELETE FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, tid); err != nil {
 		return fmt.Errorf("移除成员失败: %w", err)
 	}
+	// 移除后快照只含剩余成员：被移除者不会收到这条（含后续所有）结构变更。
+	snapshot, err := householdSnapshot(ctx, tx, hid)
+	if err != nil {
+		return err
+	}
+	if err := emitHouseholdChange(ctx, tx, snapshot, "upsert", false); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -398,16 +437,46 @@ func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID s
 		if err := moveMemberDevicesToPersonal(ctx, tx, uid, hid); err != nil {
 			return err
 		}
+		snapshot, err := householdSnapshot(ctx, tx, hid)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM households WHERE id = $1`, hid); err != nil {
 			return fmt.Errorf("删除家庭失败: %w", err)
 		}
+		if err := emitHouseholdChange(ctx, tx, snapshot, "delete", true); err != nil {
+			return err
+		}
 	} else {
+		// 退出者本人收到一条 delete（其他设备上的同账号也能立刻移除该家庭），
+		// 剩余成员收到成员数变化后的 upsert。
+		before, err := householdSnapshot(ctx, tx, hid)
+		if err != nil {
+			return err
+		}
 		if err := moveMemberDevicesToPersonal(ctx, tx, uid, hid); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, uid); err != nil {
 			return fmt.Errorf("退出家庭失败: %w", err)
+		}
+		for _, r := range before {
+			if r.UserID != uid {
+				continue
+			}
+			p := r.Payload
+			p.Deleted = true
+			if err := insertStructuralChanges(ctx, tx, []uuid.UUID{uid}, "household", p.ID, "delete", p); err != nil {
+				return err
+			}
+		}
+		after, err := householdSnapshot(ctx, tx, hid)
+		if err != nil {
+			return err
+		}
+		if err := emitHouseholdChange(ctx, tx, after, "upsert", false); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -497,6 +566,13 @@ func (s *Store) TransferHouseholdOwnership(ctx context.Context, userID string, h
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return store.ErrForbidden
+	}
+	snapshot, err := householdSnapshot(ctx, tx, hid)
+	if err != nil {
+		return err
+	}
+	if err := emitHouseholdChange(ctx, tx, snapshot, "upsert", false); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交事务失败: %w", err)
@@ -717,6 +793,14 @@ func (s *Store) ClaimHouseholdInvitation(ctx context.Context, userID string, cod
 	if _, err := tx.ExecContext(ctx, `DELETE FROM household_invitations WHERE code_hash = $1`, codeHash); err != nil {
 		return model.Household{}, fmt.Errorf("删除已用邀请码失败: %w", err)
 	}
+	// 新成员不会收到加入之前的历史结构变更（历史行里没有他的 user_id），首次基线走 GET /households。
+	snapshot, err := householdSnapshot(ctx, tx, hid.UUID)
+	if err != nil {
+		return model.Household{}, err
+	}
+	if err := emitHouseholdChange(ctx, tx, snapshot, "upsert", false); err != nil {
+		return model.Household{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return model.Household{}, fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -823,17 +907,22 @@ func (s *Store) CreateHouseholdRoom(ctx context.Context, userID string, househol
 	}
 	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
 	defer cancel()
-	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.HouseholdRoom{}, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
 		return model.HouseholdRoom{}, err
 	}
 	rid := uuid.New()
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO household_rooms (id, household_id, name, sort_order) VALUES ($1, $2, $3, $4)`,
 		rid, hid, name, sortOrder); err != nil {
 		return model.HouseholdRoom{}, fmt.Errorf("创建房间失败: %w", err)
 	}
 	var r model.HouseholdRoom
-	if err := s.db.QueryRowContext(ctx, `
+	if err := tx.QueryRowContext(ctx, `
 		SELECT id, household_id, name, sort_order, created_at FROM household_rooms WHERE id = $1`, rid).
 		Scan(&rid, &hid, &r.Name, &r.SortOrder, &r.CreatedAt); err != nil {
 		return model.HouseholdRoom{}, fmt.Errorf("查询房间失败: %w", err)
@@ -841,6 +930,12 @@ func (s *Store) CreateHouseholdRoom(ctx context.Context, userID string, househol
 	r.ID = rid.String()
 	r.HouseholdID = hid.String()
 	r.CreatedAt = r.CreatedAt.UTC()
+	if err := emitRoomChange(ctx, tx, hid, "upsert", false, r); err != nil {
+		return model.HouseholdRoom{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.HouseholdRoom{}, fmt.Errorf("提交事务失败: %w", err)
+	}
 	return r, nil
 }
 
@@ -860,21 +955,26 @@ func (s *Store) UpdateHouseholdRoom(ctx context.Context, userID string, househol
 	}
 	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
 	defer cancel()
-	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.HouseholdRoom{}, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
 		return model.HouseholdRoom{}, err
 	}
 	if name != nil {
-		if _, err := s.db.ExecContext(ctx, `UPDATE household_rooms SET name = $3 WHERE id = $1 AND household_id = $2`, rid, hid, *name); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE household_rooms SET name = $3 WHERE id = $1 AND household_id = $2`, rid, hid, *name); err != nil {
 			return model.HouseholdRoom{}, fmt.Errorf("更新房间失败: %w", err)
 		}
 	}
 	if sortOrder != nil {
-		if _, err := s.db.ExecContext(ctx, `UPDATE household_rooms SET sort_order = $3 WHERE id = $1 AND household_id = $2`, rid, hid, *sortOrder); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE household_rooms SET sort_order = $3 WHERE id = $1 AND household_id = $2`, rid, hid, *sortOrder); err != nil {
 			return model.HouseholdRoom{}, fmt.Errorf("更新房间排序失败: %w", err)
 		}
 	}
 	var r model.HouseholdRoom
-	err = s.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, household_id, name, sort_order, created_at FROM household_rooms WHERE id = $1 AND household_id = $2`, rid, hid).
 		Scan(&rid, &hid, &r.Name, &r.SortOrder, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -886,6 +986,12 @@ func (s *Store) UpdateHouseholdRoom(ctx context.Context, userID string, househol
 	r.ID = rid.String()
 	r.HouseholdID = hid.String()
 	r.CreatedAt = r.CreatedAt.UTC()
+	if err := emitRoomChange(ctx, tx, hid, "upsert", false, r); err != nil {
+		return model.HouseholdRoom{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.HouseholdRoom{}, fmt.Errorf("提交事务失败: %w", err)
+	}
 	return r, nil
 }
 
@@ -969,6 +1075,12 @@ func (s *Store) ReorderHouseholdRooms(ctx context.Context, userID string, househ
 	if err := roomRows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历房间失败: %w", err)
 	}
+	// 每间房各发一条 upsert，客户端按 sortOrder 重新排列即可。
+	for _, r := range out {
+		if err := emitRoomChange(ctx, tx, hid, "upsert", false, r); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -991,15 +1103,37 @@ func (s *Store) DeleteHouseholdRoom(ctx context.Context, userID string, househol
 	}
 	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
 	defer cancel()
-	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM household_rooms WHERE id = $1 AND household_id = $2`, rid, hid)
+	// 删除前先取快照，因为删除后行已不存在，payload 需要带着 name/sortOrder。
+	var r model.HouseholdRoom
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, household_id, name, sort_order, created_at
+		FROM household_rooms WHERE id = $1 AND household_id = $2 FOR UPDATE`, rid, hid).
+		Scan(&rid, &hid, &r.Name, &r.SortOrder, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
 	if err != nil {
+		return fmt.Errorf("查询房间失败: %w", err)
+	}
+	r.ID = rid.String()
+	r.HouseholdID = hid.String()
+	r.CreatedAt = r.CreatedAt.UTC()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM household_rooms WHERE id = $1 AND household_id = $2`, rid, hid); err != nil {
 		return fmt.Errorf("删除房间失败: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return store.ErrNotFound
+	if err := emitRoomChange(ctx, tx, hid, "delete", true, r); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
 	}
 	return nil
 }
@@ -1188,4 +1322,130 @@ func nullUUID(v uuid.NullUUID) any {
 		return nil
 	}
 	return v.UUID
+}
+
+// householdRecipient 是一个结构变更接收者及其专属 payload（role 随接收者不同）。
+type householdRecipient struct {
+	UserID  uuid.UUID
+	Payload model.HouseholdChangePayload
+}
+
+// householdSnapshot 返回家庭当前成员的接收者列表与各自视角的 household payload。
+// 调用时机决定语义：在成员变更之后调用，payload 的 memberCount/role 即为变更后的快照。
+func householdSnapshot(ctx context.Context, db rowQueryer, hid uuid.UUID) ([]householdRecipient, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT m.user_id, h.name, h.owner_user_id, m.role,
+		       (SELECT count(*) FROM household_members x WHERE x.household_id = h.id) AS member_count
+		FROM household_members m
+		JOIN households h ON h.id = m.household_id
+		WHERE h.id = $1
+		ORDER BY m.joined_at, m.user_id`, hid)
+	if err != nil {
+		return nil, fmt.Errorf("查询家庭快照失败: %w", err)
+	}
+	defer rows.Close()
+	out := []householdRecipient{}
+	for rows.Next() {
+		var (
+			uid, owner uuid.UUID
+			p          model.HouseholdChangePayload
+		)
+		if err := rows.Scan(&uid, &p.Name, &owner, &p.Role, &p.MemberCount); err != nil {
+			return nil, fmt.Errorf("解析家庭快照失败: %w", err)
+		}
+		p.ID = hid.String()
+		p.OwnerUserID = owner.String()
+		out = append(out, householdRecipient{UserID: uid, Payload: p})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历家庭快照失败: %w", err)
+	}
+	return out, nil
+}
+
+// householdMemberIDs 返回家庭当前成员 id，用于扇出房间类结构变更。
+func householdMemberIDs(ctx context.Context, db rowQueryer, hid uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT user_id FROM household_members WHERE household_id = $1 ORDER BY joined_at, user_id`, hid)
+	if err != nil {
+		return nil, fmt.Errorf("查询家庭成员失败: %w", err)
+	}
+	defer rows.Close()
+	out := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("解析家庭成员失败: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历家庭成员失败: %w", err)
+	}
+	return out, nil
+}
+
+// insertStructuralChanges 为每个接收者各写一条 change_log。
+//
+// 扇出设计（v0.15.0）：结构变更按「写入时刻的成员集合」逐人写一行，
+// user_id = 接收者、household_id 留空。因此
+//   - 被移除的成员不会再收到离开之后的结构变更（那些行里没有他的 user_id）；
+//   - 新成员加入后不会回放历史结构（历史的行没有他的 user_id），首次基线走 GET /households；
+//   - 已写入的行不会被成员变动影响（不会因退出而突然变成「未清理的缺口」触发 410）。
+func insertStructuralChanges(ctx context.Context, tx *sql.Tx, recipients []uuid.UUID, entity, entityID, op string, payload any) error {
+	if len(recipients) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("序列化结构变更失败: %w", err)
+	}
+	for _, uid := range recipients {
+		seq, err := allocOneChangeSeq(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO change_log (seq, user_id, household_id, entity, entity_id, op, payload, server_ts)
+			VALUES ($1, $2, NULL, $3, $4, $5, $6, now())`,
+			seq, uid, entity, entityID, op, raw); err != nil {
+			return fmt.Errorf("写入结构变更失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// emitHouseholdChange 在事务内按当前成员集合扇出 household 结构变更。
+// deleted=true 时 op 为 delete，payload 里的 Deleted 置真；调用方需在此之前取快照。
+func emitHouseholdChange(ctx context.Context, tx *sql.Tx, snapshot []householdRecipient, op string, deleted bool) error {
+	if len(snapshot) == 0 {
+		return nil
+	}
+	recipients := make([]uuid.UUID, 0, len(snapshot))
+	payloads := make([]model.HouseholdChangePayload, 0, len(snapshot))
+	for _, r := range snapshot {
+		p := r.Payload
+		p.Deleted = deleted
+		recipients = append(recipients, r.UserID)
+		payloads = append(payloads, p)
+	}
+	for i, uid := range recipients {
+		if err := insertStructuralChanges(ctx, tx, []uuid.UUID{uid}, "household", payloads[i].ID, op, payloads[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emitRoomChange 在事务内按当前成员集合扇出 room 结构变更。
+func emitRoomChange(ctx context.Context, tx *sql.Tx, hid uuid.UUID, op string, deleted bool, room model.HouseholdRoom) error {
+	recipients, err := householdMemberIDs(ctx, tx, hid)
+	if err != nil {
+		return err
+	}
+	payload := model.RoomChangePayload{
+		ID: room.ID, HouseholdID: room.HouseholdID, Name: room.Name,
+		SortOrder: room.SortOrder, Deleted: deleted,
+	}
+	return insertStructuralChanges(ctx, tx, recipients, "room", room.ID, op, payload)
 }

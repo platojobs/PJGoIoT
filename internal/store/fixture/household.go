@@ -82,6 +82,41 @@ func (s *Store) requireHouseholdLocked(userID, householdID string, ownerOnly boo
 	return h, nil
 }
 
+// appendStructuralChangeLocked 写入一条面向单个接收者的结构变更。
+// 结构变更按「写入时刻的成员集合」逐人一条，因此不回放历史、也不会在成员变动后触发 410。
+func (s *Store) appendStructuralChangeLocked(recipient, entity, entityID, op string, payload any) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	seq := s.nextSeq
+	s.nextSeq++
+	s.changes = append(s.changes, changeRecord{
+		seq: seq, userID: recipient, entity: entity, entityID: entityID,
+		op: op, payload: raw, serverTS: time.Now().UTC(),
+	})
+}
+
+// appendHouseholdChangeLocked 按家庭当前成员集合扇出 household 结构变更。
+func (s *Store) appendHouseholdChangeLocked(h *householdRecord, op string, deleted bool) {
+	for uid, role := range h.members {
+		s.appendStructuralChangeLocked(uid, "household", h.ID, op, model.HouseholdChangePayload{
+			ID: h.ID, Name: h.Name, OwnerUserID: h.OwnerUserID, Role: role,
+			MemberCount: len(h.members), Deleted: deleted,
+		})
+	}
+}
+
+// appendRoomChangeLocked 按家庭当前成员集合扇出 room 结构变更。
+func (s *Store) appendRoomChangeLocked(h *householdRecord, op string, deleted bool, room model.HouseholdRoom) {
+	for uid := range h.members {
+		s.appendStructuralChangeLocked(uid, "room", room.ID, op, model.RoomChangePayload{
+			ID: room.ID, HouseholdID: room.HouseholdID, Name: room.Name,
+			SortOrder: room.SortOrder, Deleted: deleted,
+		})
+	}
+}
+
 // CreateHousehold 实现 store.Store。
 func (s *Store) CreateHousehold(ctx context.Context, ownerUserID string, name string) (model.Household, error) {
 	s.mu.Lock()
@@ -98,6 +133,7 @@ func (s *Store) CreateHousehold(ctx context.Context, ownerUserID string, name st
 		members: map[string]string{ownerUserID: "owner"},
 	}
 	s.households[hid] = h
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return s.householdViewLocked(h, ownerUserID), nil
 }
 
@@ -141,6 +177,7 @@ func (s *Store) RenameHousehold(ctx context.Context, userID string, householdID 
 		return err
 	}
 	h.Name = name
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return nil
 }
 
@@ -170,6 +207,7 @@ func (s *Store) DeleteHousehold(ctx context.Context, userID string, householdID 
 		}
 	}
 	delete(s.households, householdID)
+	s.appendHouseholdChangeLocked(h, "delete", true)
 	for rid, r := range s.rooms {
 		if r.HouseholdID == householdID {
 			delete(s.rooms, rid)
@@ -226,6 +264,7 @@ func (s *Store) RemoveHouseholdMember(ctx context.Context, userID string, househ
 	}
 	s.moveUserDevicesToPersonalLocked(targetUserID, householdID)
 	delete(h.members, targetUserID)
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return nil
 }
 
@@ -257,6 +296,7 @@ func (s *Store) TransferHouseholdOwnership(ctx context.Context, userID string, h
 	h.members[userID] = "member"
 	h.members[targetUserID] = "owner"
 	h.OwnerUserID = targetUserID
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return nil
 }
 
@@ -277,6 +317,7 @@ func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID s
 		}
 		s.moveUserDevicesToPersonalLocked(userID, householdID)
 		delete(s.households, householdID)
+		s.appendHouseholdChangeLocked(h, "delete", true)
 		for rid, r := range s.rooms {
 			if r.HouseholdID == householdID {
 				delete(s.rooms, rid)
@@ -290,7 +331,14 @@ func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID s
 		return nil
 	}
 	s.moveUserDevicesToPersonalLocked(userID, householdID)
+	// 退出者本人收到 delete（同账号其他设备也能立刻移除该家庭）。
+	role := h.members[userID]
+	s.appendStructuralChangeLocked(userID, "household", h.ID, "delete", model.HouseholdChangePayload{
+		ID: h.ID, Name: h.Name, OwnerUserID: h.OwnerUserID, Role: role,
+		MemberCount: len(h.members), Deleted: true,
+	})
 	delete(h.members, userID)
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return nil
 }
 
@@ -400,6 +448,10 @@ func (s *Store) ReorderHouseholdRooms(ctx context.Context, userID string, househ
 		}
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
+	h := s.households[householdID]
+	for _, r := range out {
+		s.appendRoomChangeLocked(h, "upsert", false, r)
+	}
 	return out, nil
 }
 
@@ -454,6 +506,7 @@ func (s *Store) ClaimHouseholdInvitation(ctx context.Context, userID string, cod
 		h.members[userID] = "member"
 	}
 	delete(s.invitations, codeHash)
+	s.appendHouseholdChangeLocked(h, "upsert", false)
 	return s.householdViewLocked(h, userID), nil
 }
 
@@ -491,6 +544,7 @@ func (s *Store) CreateHouseholdRoom(ctx context.Context, userID string, househol
 		SortOrder: sortOrder, CreatedAt: time.Now().UTC(),
 	}
 	s.rooms[r.ID] = r
+	s.appendRoomChangeLocked(s.households[householdID], "upsert", false, r)
 	return r, nil
 }
 
@@ -512,6 +566,7 @@ func (s *Store) UpdateHouseholdRoom(ctx context.Context, userID string, househol
 		r.SortOrder = *sortOrder
 	}
 	s.rooms[roomID] = r
+	s.appendRoomChangeLocked(s.households[householdID], "upsert", false, r)
 	return r, nil
 }
 
@@ -534,6 +589,7 @@ func (s *Store) DeleteHouseholdRoom(ctx context.Context, userID string, househol
 			}
 		}
 	}
+	s.appendRoomChangeLocked(s.households[householdID], "delete", true, r)
 	return nil
 }
 

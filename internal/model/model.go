@@ -330,6 +330,28 @@ type Change struct {
 	ServerTS time.Time       `json:"serverTs"`
 }
 
+// HouseholdChangePayload 是 change_log 中 entity=household 的 payload（v0.15.0）。
+// Role 是**该接收者本人**在家庭中的角色，客户端可直接据此刷新「我的家庭」列表。
+// Deleted=true 表示该家庭已从当前账号的数据集中移除（解散、被移除、自己退出）。
+type HouseholdChangePayload struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	OwnerUserID string `json:"ownerUserId"`
+	Role        string `json:"role"`
+	MemberCount int    `json:"memberCount"`
+	Deleted     bool   `json:"deleted"`
+}
+
+// RoomChangePayload 是 change_log 中 entity=room 的 payload（v0.15.0）。
+// Deleted=true 表示房间已删除，客户端应移除本地房间并按需清空设备 roomId。
+type RoomChangePayload struct {
+	ID          string `json:"id"`
+	HouseholdID string `json:"householdId"`
+	Name        string `json:"name"`
+	SortOrder   int    `json:"sortOrder"`
+	Deleted     bool   `json:"deleted"`
+}
+
 // ChangesPage 是 GET /sync/changes 的响应体。
 type ChangesPage struct {
 	Changes    []Change `json:"changes"`

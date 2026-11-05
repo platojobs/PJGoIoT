@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"sync"
@@ -558,5 +559,274 @@ func TestHouseholdSharingPostgres(t *testing.T) {
 	}
 	if _, err := st.GetUserDeviceByKey(ctx, memberID, "android", extID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("删除家庭后成员不应再看到设备: err=%v", err)
+	}
+}
+
+// changesSince 拉取某个账号自 cursor 之后的可视变更。
+func changesSince(t *testing.T, st *postgres.Store, userID string, cursor int64) model.ChangesPage {
+	t.Helper()
+	page, err := st.Changes(context.Background(), userID, cursor, 200)
+	if err != nil {
+		t.Fatalf("拉取变更失败 user=%s: %v", userID, err)
+	}
+	return page
+}
+
+// findHouseholdChange 在同 entityId 的多条变更中取最后一条（即最新状态）。
+func findHouseholdChange(t *testing.T, page model.ChangesPage, householdID string) (model.Change, bool) {
+	t.Helper()
+	var last model.Change
+	found := false
+	for _, ch := range page.Changes {
+		if ch.Entity == "household" && ch.EntityID == householdID {
+			last, found = ch, true
+		}
+	}
+	return last, found
+}
+
+func TestHouseholdStructureChangesPostgres(t *testing.T) {
+	dsn := testDSN(t)
+	runMigrations(t, dsn)
+	ctx := context.Background()
+	st, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ownerID := newHouseholdUser(t, st)
+	memberID := newHouseholdUser(t, st)
+	outsiderID := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, ownerID, memberID, outsiderID) })
+
+	home, err := st.CreateHousehold(ctx, ownerID, "结构同步家庭")
+	if err != nil {
+		t.Fatalf("创建家庭失败: %v", err)
+	}
+	// 创建家庭本身就要产生一条 household upsert（否则客户端只能轮询）
+	baseOwner := changesSince(t, st, ownerID, 0)
+	ch, ok := findHouseholdChange(t, baseOwner, home.ID)
+	if !ok || ch.Op != "upsert" {
+		t.Fatalf("创建家庭应写入 household upsert: %+v", baseOwner.Changes)
+	}
+	var created model.HouseholdChangePayload
+	if err := json.Unmarshal(ch.Payload, &created); err != nil {
+		t.Fatalf("解析 household payload 失败: %v", err)
+	}
+	if created.Name != "结构同步家庭" || created.OwnerUserID != ownerID || created.MemberCount != 1 || created.Role != "owner" {
+		t.Fatalf("创建家庭 payload 不正确: %+v", created)
+	}
+	codeHash := hashOf("struct-code-" + uuid.NewString())
+	if _, err := st.CreateHouseholdInvitation(ctx, ownerID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("创建邀请码失败: %v", err)
+	}
+	if _, err := st.ClaimHouseholdInvitation(ctx, memberID, codeHash, time.Now().UTC(), 10*time.Minute); err != nil {
+		t.Fatalf("领取邀请码失败: %v", err)
+	}
+	cursors := map[string]int64{
+		ownerID:  baseOwner.NextCursor,
+		memberID: changesSince(t, st, memberID, 0).NextCursor,
+	}
+
+	// 改名 + 建房间 + 重排
+	if err := st.RenameHousehold(ctx, ownerID, home.ID, "结构同步-改名"); err != nil {
+		t.Fatalf("改名失败: %v", err)
+	}
+	r1, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "客厅", 0)
+	if err != nil {
+		t.Fatalf("建房间失败: %v", err)
+	}
+	r2, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "卧室", 1)
+	if err != nil {
+		t.Fatalf("建房间失败: %v", err)
+	}
+	if _, err := st.ReorderHouseholdRooms(ctx, ownerID, home.ID, []string{r2.ID, r1.ID}); err != nil {
+		t.Fatalf("重排房间失败: %v", err)
+	}
+
+	for _, uid := range []string{ownerID, memberID} {
+		page := changesSince(t, st, uid, cursors[uid])
+		hch, ok := findHouseholdChange(t, page, home.ID)
+		if !ok {
+			t.Fatalf("账号 %s 未见改名事件: %+v", uid, page.Changes)
+		}
+		var p model.HouseholdChangePayload
+		if err := json.Unmarshal(hch.Payload, &p); err != nil {
+			t.Fatalf("解析 payload 失败: %v", err)
+		}
+		if p.Name != "结构同步-改名" || p.MemberCount != 2 {
+			t.Fatalf("账号 %s 改名 payload 不正确: %+v", uid, p)
+		}
+		if wantRole := map[bool]string{true: "owner", false: "member"}[uid == ownerID]; p.Role != wantRole {
+			t.Fatalf("账号 %s 的 role 应为 %s: %+v", uid, wantRole, p)
+		}
+
+		// 重排后每间房都有一条最新 upsert，sortOrder 可直接驱动客户端
+		orders := map[string]int{}
+		for _, c := range page.Changes {
+			if c.Entity != "room" || c.Op != "upsert" {
+				continue
+			}
+			var rp model.RoomChangePayload
+			if err := json.Unmarshal(c.Payload, &rp); err != nil {
+				t.Fatalf("解析 room payload 失败: %v", err)
+			}
+			if rp.HouseholdID != home.ID || rp.Deleted {
+				t.Fatalf("room payload 不正确: %+v", rp)
+			}
+			orders[rp.ID] = rp.SortOrder
+		}
+		if orders[r2.ID] != 0 || orders[r1.ID] != 1 {
+			t.Fatalf("账号 %s 未见重排后的 sortOrder: %+v", uid, orders)
+		}
+	}
+
+	// 无关账号看不到该家庭的任何结构变更
+	for _, c := range changesSince(t, st, outsiderID, 0).Changes {
+		if c.Entity == "household" || c.Entity == "room" {
+			if c.EntityID == home.ID || c.EntityID == r1.ID || c.EntityID == r2.ID {
+				t.Fatalf("无关账号不应看到该家庭结构变更: %+v", c)
+			}
+		}
+	}
+
+	// 转让所有权：两个账号各自看到的 role 边界正确
+	beforeTransferOwner := changesSince(t, st, ownerID, 0).NextCursor
+	beforeTransferMember := changesSince(t, st, memberID, 0).NextCursor
+	if err := st.TransferHouseholdOwnership(ctx, ownerID, home.ID, memberID); err != nil {
+		t.Fatalf("转让失败: %v", err)
+	}
+	for _, tc := range []struct {
+		uid      string
+		cursor   int64
+		wantRole string
+	}{
+		{ownerID, beforeTransferOwner, "member"},
+		{memberID, beforeTransferMember, "owner"},
+	} {
+		page := changesSince(t, st, tc.uid, tc.cursor)
+		hch, ok := findHouseholdChange(t, page, home.ID)
+		if !ok || hch.Op != "upsert" {
+			t.Fatalf("转让后账号 %s 未见 household upsert: %+v", tc.uid, page.Changes)
+		}
+		var p model.HouseholdChangePayload
+		if err := json.Unmarshal(hch.Payload, &p); err != nil {
+			t.Fatalf("解析 payload 失败: %v", err)
+		}
+		if p.Role != tc.wantRole || p.OwnerUserID != memberID {
+			t.Fatalf("转让后账号 %s 视角不正确: %+v", tc.uid, p)
+		}
+	}
+
+	// 新 owner 移除旧 owner：被移除者不再收到后续结构变更
+	removedCursor := changesSince(t, st, ownerID, 0).NextCursor
+	if err := st.RemoveHouseholdMember(ctx, memberID, home.ID, ownerID); err != nil {
+		t.Fatalf("移除成员失败: %v", err)
+	}
+	if err := st.RenameHousehold(ctx, memberID, home.ID, "移除后再改名"); err != nil {
+		t.Fatalf("改名失败: %v", err)
+	}
+	for _, c := range changesSince(t, st, ownerID, removedCursor).Changes {
+		if c.Entity == "household" && c.EntityID == home.ID {
+			t.Fatalf("被移除成员不应再收到结构变更: %+v", c)
+		}
+	}
+	// 但他仍能拉到自己离开之前的家庭结构变更（可见性按「当时属于该家庭」）
+	if _, ok := findHouseholdChange(t, changesSince(t, st, ownerID, 0), home.ID); !ok {
+		t.Fatalf("被移除成员应仍能看到离开前的结构变更")
+	}
+	// 仍在家庭的成员收到改名
+	page := changesSince(t, st, memberID, 0)
+	hch, ok := findHouseholdChange(t, page, home.ID)
+	if !ok {
+		t.Fatalf("在册成员未见改名: %+v", page.Changes)
+	}
+	var p model.HouseholdChangePayload
+	if err := json.Unmarshal(hch.Payload, &p); err != nil {
+		t.Fatalf("解析 payload 失败: %v", err)
+	}
+	if p.Name != "移除后再改名" || p.MemberCount != 1 {
+		t.Fatalf("在册成员视角不正确: %+v", p)
+	}
+
+	// 新成员加入后不回放历史结构：新账号只能看到加入之后的条目
+	lateID := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, lateID) })
+	codeHash = hashOf("struct-late-" + uuid.NewString())
+	if _, err := st.CreateHouseholdInvitation(ctx, memberID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("创建邀请码失败: %v", err)
+	}
+	if _, err := st.ClaimHouseholdInvitation(ctx, lateID, codeHash, time.Now().UTC(), 10*time.Minute); err != nil {
+		t.Fatalf("领取邀请码失败: %v", err)
+	}
+	latePage := changesSince(t, st, lateID, 0)
+	lateHousehold, ok := findHouseholdChange(t, latePage, home.ID)
+	if !ok {
+		t.Fatalf("新成员应收到加入时的 household upsert: %+v", latePage.Changes)
+	}
+	var lateP model.HouseholdChangePayload
+	if err := json.Unmarshal(lateHousehold.Payload, &lateP); err != nil {
+		t.Fatalf("解析 payload 失败: %v", err)
+	}
+	if lateP.Role != "member" || lateP.MemberCount != 2 {
+		t.Fatalf("新成员视角不正确: %+v", lateP)
+	}
+	roomCount := 0
+	for _, c := range latePage.Changes {
+		if c.Entity == "room" {
+			roomCount++
+		}
+	}
+	if roomCount != 0 {
+		t.Fatalf("新成员不应回放历史房间结构变更: %d", roomCount)
+	}
+}
+
+func TestHouseholdStructureChangesCursorExpiredPostgres(t *testing.T) {
+	dsn := testDSN(t)
+	runMigrations(t, dsn)
+	ctx := context.Background()
+	st, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	uid := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, uid) })
+
+	home, err := st.CreateHousehold(ctx, uid, "结构过期家庭")
+	if err != nil {
+		t.Fatalf("创建家庭失败: %v", err)
+	}
+	if err := st.RenameHousehold(ctx, uid, home.ID, "结构过期-改名"); err != nil {
+		t.Fatalf("改名失败: %v", err)
+	}
+	// 游标定格在更早的位置，随后产生更多结构变更以推进最小可见 seq
+	cursor := changesSince(t, st, uid, 0).NextCursor
+	if _, err := st.CreateHouseholdRoom(ctx, uid, home.ID, "过期房间1", 0); err != nil {
+		t.Fatalf("建房间失败: %v", err)
+	}
+	if _, err := st.CreateHouseholdRoom(ctx, uid, home.ID, "过期房间2", 1); err != nil {
+		t.Fatalf("建房间失败: %v", err)
+	}
+
+	page := changesSince(t, st, uid, 0)
+	maxSeq := page.NextCursor
+	// 模拟 90 天保留期清理：只留下最新一条结构变更
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DELETE FROM change_log WHERE user_id = $1 AND entity IN ('household','room') AND seq < $2`,
+		uid, maxSeq); err != nil {
+		t.Fatalf("模拟保留期清理失败: %v", err)
+	}
+
+	// 结构变更同样适用 90 天保留语义：旧游标必须得到 RESYNC_REQUIRED（store.ErrCursorExpired）
+	if _, err := st.Changes(ctx, uid, cursor, 100); !errors.Is(err, store.ErrCursorExpired) {
+		t.Fatalf("结构变更的旧游标应触发 ErrCursorExpired: cursor=%d maxSeq=%d err=%v", cursor, maxSeq, err)
 	}
 }

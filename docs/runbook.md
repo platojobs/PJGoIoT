@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.14.0）
+# PJGoIoT 运行手册（v0.15.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -60,6 +60,11 @@
 | v0.14.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.10.0 |
 | v0.14.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
 | v0.14.0 CI | **已验证** | GitHub Actions [run 42051601765](https://github.com/platojobs/PJGoIoT/actions/runs/42051601765) 四 job 全绿；`Postgres 集成测试` 正则改为 `TestHousehold`，日志确认 `TestHouseholdOwnershipPostgres` 与 `TestHouseholdOwnershipTransferConcurrentPostgres` 实际执行；`OpenAPI 契约校验` 步骤实际执行 |
+| v0.15.0 结构变更同步 | **已验证** | 真实 PG `TestHouseholdStructureChangesPostgres`：创建/改名/建房/重排/转让/移除各阶段写入 `household`/`room` 变更，两账号 `role` 视角正确，无关账号不可见，被移除者不再收到后续结构变更但仍可读离开前历史，新成员不回放历史房间结构 |
+| v0.15.0 结构变更 410 | **已验证** | `TestHouseholdStructureChangesCursorExpiredPostgres`：仅由结构变更造成的缺口同样返回 `ErrCursorExpired`（HTTP 410 `RESYNC_REQUIRED`） |
+| v0.15.0 未知 entity | **已验证** | `TestSyncChangesUnknownEntityIgnoredByOldClient`：含 `household`/`room`/未来 entity 的响应可被老客户端解析并忽略，`nextCursor` 正常推进 |
+| v0.15.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.11.0 |
+| v0.15.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -715,6 +720,34 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
     "SELECT id,name,sort_order FROM household_rooms WHERE household_id='<householdId>'
        ORDER BY sort_order, id;"
   ```
+
+#### 7.13.9 结构变更的增量同步（v0.15.0）
+
+- `GET /sync/changes` 现在除 `user_device` 外还返回 `entity=household` / `entity=room`。
+  `household` payload 含 `id/name/ownerUserId/role(接收者本人)/memberCount/deleted`；
+  `room` payload 含 `id/householdId/name/sortOrder/deleted`。
+- **扇出写入**：每条结构变更按「写入时刻的成员集合」逐人各写一行（`user_id=接收者`、`household_id` 留空）。
+  因此查某条结构变更的接收者：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT seq,user_id,entity,entity_id,op,payload->>'name' AS name,server_ts
+       FROM change_log WHERE entity IN ('household','room') ORDER BY seq DESC LIMIT 20;"
+  ```
+  `household_id` 为空是**预期**的（不代表缺失归属，归属在 payload / `entity_id` 里）。
+- **可见性排查**「成员被移除后还收到家庭变更？」→ 不应发生：移除之后的结构行里没有该用户的 `user_id`。
+  若出现，检查该行 `user_id` 是否等于被移除者以及写入时间是否在移除之前。
+- **新成员看不到历史**是设计取舍：首次基线走 `GET /households`；不要期待 `/sync/changes` 回放旧结构。
+- **未知 entity**：客户端必须忽略并照常推进 `nextCursor`。若客户端因 `future_entity` 卡住游标，
+  属于客户端 bug，不是服务端拒绝；服务端对 `entity` 不做白名单校验。
+- **410**：结构变更同样适用 `change_log` 90 天保留。`cursor` 早于仍保留的最老 `seq`
+  时返回 `410 RESYNC_REQUIRED`，包括缺口**仅由结构变更**造成的情况。
+  核对：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT min(seq), max(seq) FROM change_log;"
+  ```
+- 设备归属变更仍走已有的 `user_device` 变更，不会重复写结构变更；查家庭内设备变更归属看
+  `change_log.household_id`，查结构变更看 `user_id` 扇出。
 
 ## 8. 监控与告警
 

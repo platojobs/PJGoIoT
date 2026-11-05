@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.10.0
+  version: 0.11.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -858,6 +858,31 @@ paths:
 
         每条变更的 `payload` 为 `UserDevice`，包含 `platform`、`externalId` 与可选 `mac`；
         `entityId` 为 `<userId>:<platform>:<externalId>` 派生的稳定字符串。
+
+        **家庭结构变更（自 `0.11.0`）**：`entity` 取值为 `household` 或 `room`，
+        `entityId` 分别是 `<householdId>` / `<roomId>`，`op` 沿用 `upsert` / `delete`；
+        payload 见 `HouseholdChange` 与 `RoomChange`。
+
+        基础写入范围（均在同一个数据库事务内与业务写入一起提交）：
+        创建家庭、改名/删除家庭、创建/改名/删除/重排房间、成员加入/移除/退出、所有权转让。
+        设备归属变更复用已有的 `user_device` 变更，不额外重复写结构变更。
+
+        **可见性（按「当时属于该家庭」）**：结构变更按写入时刻的成员集合**逐人**写入，
+        因此
+        - 成员被移除/退出后，**不会再收到**离开之后产生的结构变更；
+        - 已被写入的历史结构变更不会因为退出而消失或变成「未清理的缺口」（不会误报 410）；
+        - 新成员加入后**不回放**加入之前的历史结构；
+        - 非成员完全看不到任何结构变更。
+
+        **首次基线**：新加入的成员（含新设备登录的老账号）应以 `GET /households` 做全量基线，
+        而不是依赖 `/sync/changes` 回放历史。
+
+        **向后兼容**：客户端必须忽略未知的 `entity`（未知 entity 既可能是未来新增类型，
+        也可能是本版本尚未实现的类型），且**照常推进 `nextCursor`**，不得因为存在未知 entity
+        就阻塞游标或报错。`payload` 只加字段不删字段，客户端应忽略多余字段。
+
+        90 天保留与 410 语义同样适用于结构变更：若 `cursor` 早于仍保留的最老 `seq`，
+        一律返回 `410 RESYNC_REQUIRED`，包括仅由结构变更造成的缺口。
       security:
         - bearerAuth: []
       parameters:
@@ -2358,20 +2383,80 @@ components:
           format: int64
         entity:
           type: string
+          description: |
+            `user_device`：设备变更，payload 为 `UserDevice`；
+            `household`（自 `0.11.0`）：家庭结构变更，payload 为 `HouseholdChange`；
+            `room`（自 `0.11.0`）：房间结构变更，payload 为 `RoomChange`。
+            **客户端必须忽略未知 entity 并照常推进 `nextCursor`。**
           example: user_device
         entityId:
           type: string
           description: |
-            复合键派生的稳定字符串：`<userId>:<platform>:<externalId>`。
+            `user_device`：`<userId>:<platform>:<externalId>` 派生的稳定字符串；
+            `household`：`<householdId>`；`room`：`<roomId>`。
             旧变更（000003 迁移前）已在迁移时回填为同一形式。
         op:
           type: string
           enum: [upsert, delete]
         payload:
-          $ref: "#/components/schemas/UserDevice"
+          description: |
+            按 `entity` 区分：`UserDevice` / `HouseholdChange` / `RoomChange`。
+            字段只加不删，客户端应忽略多余字段。
+          oneOf:
+            - $ref: "#/components/schemas/UserDevice"
+            - $ref: "#/components/schemas/HouseholdChange"
+            - $ref: "#/components/schemas/RoomChange"
         serverTs:
           type: string
           format: date-time
+
+    HouseholdChange:
+      type: object
+      description: |
+        `/sync/changes` 中 `entity=household` 的 payload（自 `0.11.0`）。
+        `role` 是**当前接收者本人**在该家庭中的角色，因此同一条业务变更对不同成员会返回不同的 `role`。
+        `deleted=true` 表示该家庭已从当前账号的数据集中移除（解散、被移除、主动退出），
+        客户端应整段移除该家庭及其房间与设备归属，无需再拉取 `GET /households`。
+      required: [id, name, ownerUserId, role, memberCount, deleted]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        ownerUserId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, member]
+          description: 当前接收者在该家庭中的角色
+        memberCount:
+          type: integer
+          description: 变更后的成员数（用于刷新家庭成员数展示）
+        deleted:
+          type: boolean
+
+    RoomChange:
+      type: object
+      description: |
+        `/sync/changes` 中 `entity=room` 的 payload（自 `0.11.0`）。
+        整段重排会为每间房各发一条 `upsert`，客户端按 `sortOrder` 重排序即可。
+        `deleted=true` 表示房间已删除，客户端应移除本地房间；该房间下设备的 `roomId` 已在设备变更中清空。
+      required: [id, householdId, name, sortOrder, deleted]
+      properties:
+        id:
+          type: string
+          format: uuid
+        householdId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        sortOrder:
+          type: integer
+        deleted:
+          type: boolean
 
     ChangesPage:
       type: object
