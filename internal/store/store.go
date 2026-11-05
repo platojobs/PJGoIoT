@@ -23,6 +23,9 @@ var (
 	ErrCursorExpired = errors.New("同步游标已过期")
 	// ErrTimeout 表示数据库查询超过服务端超时预算，HTTP 层映射为 503 TIMEOUT。
 	ErrTimeout = errors.New("数据库查询超时")
+	// ErrDuplicateDevice 表示同一批 push 中出现重复设备 id 或重复 (platform, externalId)。
+	// HTTP 层已提前校验；存储层再次校验用于直接调用 Store 的场景，映射为 400 BAD_REQUEST。
+	ErrDuplicateDevice = errors.New("同一批设备存在重复 id 或唯一键")
 )
 
 // PushOptions 携带同步写入的幂等参数。

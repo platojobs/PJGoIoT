@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.9.0**（真实存储联调、CI 压测门槛、Grafana/SLO 与 `route` 指标标签）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.10.0**（push 事务边界收紧、数据库故障 503 语义、迁移演练）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例，不新增字段，契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -543,7 +543,7 @@ bash scripts/stack-for-e2e.sh --stop # 等价 make e2e-stop
 ```
 
 脚本行为：启动前用 connect+bind 预检端口，被占用时打印「端口 X 已被占用，自动换端口重试」
-并重试（最多 3 次）；Docker 起独立 Postgres、迁移到 `version=8`、等 readiness、把
+并重试（最多 3 次）；Docker 起独立 Postgres、迁移到最新 version（当前 `version=9`）、等 readiness、把
 `DATABASE_URL/API_PID/BASE_URL` 写入 `.e2e/stack.env`；任一步失败自动清理并以非 0 退出。
 stdout 只有 `BASE_URL=...`，人类日志走 stderr。可用 `E2E_PG_PORT` / `E2E_API_PORT`
 强制首次尝试某端口来验证换端口路径（实测：65021/65022 被占用后自动切到 51660/51671）。
@@ -621,6 +621,96 @@ CI 中的 `perf-smoke` job 会起 postgres service + API（`RATE_LIMIT_PER_MINUT
   SLO-2/3 才能按接口精确查询。
 - dashboard 的 JSON 结构与指标名由 `scripts/validate-dashboard.sh` 校验（JSON 可解析 +
   每个 `pjgoiot_*` 指标必须在 Go 代码中存在），已接入 CI `lint-configs`。
+
+### 事务边界与部分写入语义（v0.10.0）
+
+`POST /sync/push` 是**整批单事务**：设备 upsert、读数写入、`change_log` 追加、幂等记录写入
+都在同一个 `BeginTx` 内完成，失败即 `defer tx.Rollback()`。不存在“前 2 台已提交、第 3 台冲突”的
+部分成功；客户端拿到 200 时，响应里的每一行都已落库（`unchanged` 除外，它表示客户端已是最新）。
+
+| 结论项 | 语义 | 代码位置 |
+| --- | --- | --- |
+| 批内原子性 | 全部设备 + 读数 + `change_log` + 幂等记录同一事务，任一校验/约束/崩溃错误整批回滚 | [`postgres.go`](internal/store/postgres/postgres.go) `Store.Push` |
+| 计数严格一致 | `applied` 只统计真正写入的行；`conflicts` 是服务端获胜的冲突；读数 `appliedReadings + skippedReadings == len(readings)` | [`readings.go`](internal/store/postgres/readings.go) `pushReadingsTx` |
+| 写入行数校验 | 设备 INSERT/UPDATE 与 `change_log` INSERT 都读取 `RowsAffected`，与期望行数不符则整批回滚，绝不“报成功” | `writePendingDevices` |
+| 批内重复键 | 同一批出现重复设备 `id` 或重复 `(platform, externalId)` → **400 BAD_REQUEST**，整批不写 | `Store.Push` 第一遍规范化；HTTP 层同步校验 |
+| 同批重复读数 id | 第一条计 `appliedReadings`，后续条计 `skippedReadings`（内容不同再进 `conflicts`），一个 id 最多计一次 applied | `pushReadingsTx` 的 `credited` 集合 |
+| 幂等记录 | 与业务写入同事务：崩溃/回滚不会留下幂等键，同 `Idempotency-Key` 重试按新请求处理；只有成功提交后重放才返回历史响应 | `Store.Push` |
+| 变更日志 | 与设备写入同事务，不会出现“设备已更新但 `change_log` 缺失”；同用户 push 用事务级咨询锁串行化，`seq` 分配顺序 = 提交顺序，游标不会越过更小 seq | `LockIdempotencyKey("push:"+userID)` |
+| 事务预算 | push 总预算 **10s**（含连接池排队），超时返回 503 `TIMEOUT` 并回滚 | `pushTimeout` |
+
+崩溃窗口测试（真实 PG，注入点返回错误后验证零残留）：
+
+```bash
+TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot?sslmode=disable' \
+  go test ./internal/store/postgres -run TestPushTransactionBoundaries -v
+# 覆盖：devices_written / change_log_written / readings_written /
+#       idempotency_written / before_commit 五个阶段，以及重复 id/键、读数校验失败、并发 push
+```
+
+### 故障恢复行为（v0.10.0）
+
+数据库故障时 API 返回 **503 + 明确错误码**，客户端可重试；不会把可恢复故障伪装成 500。
+
+| 场景 | 状态码 / code | 行为与可重试性 |
+| --- | --- | --- |
+| Postgres 停机 30s（`GET /my/devices`、`POST /sync/push`） | **503 `UNAVAILABLE`** | 连接被拒/重置/关闭；整批未提交，可重试 |
+| `/healthz`（liveness） | **200** | 只证明进程存活，不访问数据库，供容器 liveness 探针使用 |
+| `/api/v1/health`（readiness） | **503 `UNAVAILABLE`** | 含数据库 `Ping`，失败即摘流 |
+| Postgres 重启 | 立即自愈 | `database/sql` 丢弃坏连接，重启后首次请求 200（实测 0–0.5s，无需重启 API） |
+| `statement_timeout=100ms`（慢查询） | **503 `TIMEOUT`** | `SQLSTATE 57014` 显式映射；`pjgoiot_db_errors_total` +1/次 |
+| 连接池耗尽（`DB_MAX_OPEN_CONNS=2`、高并发） | 排队，超预算 **503 `TIMEOUT`** | 鉴权查询 3s 预算、push 10s 预算；不是无限挂起 |
+
+实测证据（本机 Docker `postgres:16-alpine` + 本机 API 进程，停机 36s）：
+
+```text
+== 停机窗口（30 次采样）==
+my/devices {'503': 30}   push {'503': 30}
+healthz {'200': 30}      api/health {'503': 30}
+== 重启后 ==
+恢复：health 200，用时 0s；GET /my/devices => 200（12.7ms），设备数据完好
+
+== 慢查询（ALTER ROLE ... SET statement_timeout='100ms'）==
+baseline 1.34s/1.32s/1.54s（200 OK）
+100ms 下连续 3 次：status=503 code=TIMEOUT time≈0.10–0.17s
+pjgoiot_db_errors_total 0 -> 3
+
+== 连接池 = 2 ==
+GET /my/devices 200 并发 8s：7330 请求，896.7 RPS，p95 540ms，错误率 0（排队后成功）
+POST /sync/push 100 并发 8s：250 请求，113×200 + 137×503(TIMEOUT)，p95 10.2s，错误率 54.8%
+```
+
+连接池排障要点：`DB_MAX_OPEN_CONNS` 至少覆盖预期并发；503 `TIMEOUT` 应指数退避重试；
+切勿通过调大 HTTP `ReadTimeout` 来“掩盖”鉴权查询无限等待（v0.10.0 已给鉴权查询加 3s 预算）。
+
+### 迁移演练（v0.10.0）
+
+`scripts/migrate-drill.sh` 每次创建独立 `postgres:16-alpine` 容器与三个临时库，结束后删除，
+可重复执行；覆盖空库升级、000001 时代数据升级、down 到 1 再 up。真实输出：
+
+```text
+===== 场景 1：空库 0 -> 最新 =====
+  起始：none（空库）
+  迁移后：version=9 dirty=false
+  users tokens user_devices change_log readings = 0 0 0 0 0
+
+===== 场景 2：000001 时代数据 -> 最新 =====
+  迁移到：version=1 dirty=false → version=9 dirty=false
+  回填抽查 user_devices(platform|external_id|device_type)：android|AA:BB:CC:00:00:01|nordic_uart
+  回填抽查 tokens(expires_at = created_at + 180d)：true
+  回填抽查 change_log(payload.platform|payload.externalId|entity_id)：
+    android|AA:BB:CC:00:00:01|11111111-...:android:AA:BB:CC:00:00:01
+
+===== 场景 3：最新 -> down 到 1 -> up 到最新 =====
+  down 前  users tokens user_devices change_log readings = 1 1 1 1 1
+  回滚 8 步 users tokens user_devices change_log readings = 1 1 1 1 -1
+  up 后    users tokens user_devices change_log readings = 1 1 1 1 0
+  up 后重新推导字段：android|AA:BB:CC:00:00:02|environmental_sensor
+```
+
+已知边界：`000006` 的 down 会删除 `readings` 表，跨 version 1 的往返会丢读数（迁移语义，
+不是数据损坏）；`users` / `tokens` / `user_devices` / `change_log` 行数保持不丢。
+本演练发现并修复了 000004 对大写 MAC 的漏回填（新增 `000009_mac_case_backfill`）。
 
 ### curl 示例
 
@@ -930,7 +1020,9 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.9.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
+| `APP_VERSION` | `0.10.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
+| `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
+| `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 | `READING_RETENTION_DAYS` | `90` | **仅 cleanup 容器**：读数保留天数，映射到 `-retention-days` |
@@ -985,6 +1077,10 @@ go run ./cmd/migrate -direction up -steps 1   # 只前进一步
   - 新增 `change_log_server_ts_idx (server_ts)` 与 `idempotency_keys_created_at_idx (created_at)`，
     支撑按保留期的时间范围删除；
   - 只加列/索引，不加默认过期行为之外的语义；down 迁移按逆序删除索引与列，不影响其余数据。
+- `000009_mac_case_backfill`：v0.10.0 迁移演练发现的回填缺陷修复：
+  - 000004 用 `ud.mac = pd.mac` 精确比较，000001 时代写入的大写 MAC 永远拿不到 `device_type`；
+  - 本次按 `lower(ud.mac) = pd.mac` 重新回填仍为 `NULL` 的记录，读路径的 `public_devices` 关联也改为大小写不敏感；
+  - 幂等、只补空值，不改写已有型号；down 为空操作（该列由 000004 down 负责删除）。
 
 seed 数据来源与边界：
 
@@ -1002,7 +1098,7 @@ seed 数据来源与边界：
 - `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然；v0.4.0 新增 `TestReadingsPushIdempotency`（重复 id 计 skipped、同 id 不同内容计 `duplicate_id` 冲突且原值不变）、`TestReadingsPushOptional`（无 readings 时计数为 0、隐式设备写入与注册后可查）、`TestReadingsValidation`（metric/unit/value/recordedAt/批量上限/非法 externalId）、`TestReadingsListPagination`（倒序、游标翻页、metric 与时间过滤、非法参数、跨用户 404）、`TestReadingsSummary`（聚合值、无数据 null、hours 校验、跨用户 404）；v0.5.0 新增 `TestReadingsSeries`（1h/1d 的 UTC 对齐与跨整点/跨日边界、桶内 min/max/avg/last、空区间 `buckets: []`、8 类非法参数含「桶数超 500 提示更粗 bucket」、跨用户与不存在设备 404、unit 取窗口最新）、`TestReadingsMetrics`（排序与计数、多单位取最新、空数组、跨用户 404）；v0.6.0 新增 `TestPairingCodeFlow`（生成/字符集/TTL、新码使旧码失效、claim 换新 token 且原 token 保留、重放 404、跨用户、错误体不泄露账号）、`TestPairingCodeExpired`（过期统一 404）、`TestExportContentAndPagination`（内容与库内一致、升序、limit 分页与 nextCursor 连续性、非法 cursor/limit、Content-Disposition）、`TestDeleteMeIdempotent`（204、之后 401、重复调用 401、不影响其他用户）、`TestMetricsEndpoint`（文本可解析且含请求数/直方图/DB 错误/近似计数）、`TestMetricsBypassesRateLimit`（限流触发后 `/metrics` 仍 200）、`TestRequestIDAndLogs`（透传/生成 UUID、日志字段齐全且不含 token）；v0.7.0 新增 `TestHealthzLiveness`（`/healthz` 200、字段完整、不受限流影响，与 readiness 区分）。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType`、`alias`、`advertisedName`、`group` 仅在客户端上报时参与内容比较（缺失保持原值不产生冲突）。
 - `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）；v0.4.0 新增集成子测试「读数链路」：批量写入与计数、重复 id 幂等、同 id 不同内容冲突、NaN/Inf/未来时间/非法 metric 拒绝、数据库 CHECK 拒绝 NaN、倒序游标分页、非法游标、metric 过滤、跨用户与不存在设备 404、summary 聚合与无数据、90 天清理（历史数据被删且近期数据保留）；v0.5.0 新增集成子测试「读数分桶序列与指标清单」：1h 跨整点与 1d UTC 零点对齐、桶内 min/max/avg/last、分桶计数合计与原始条数一致、空区间 `[]`、非法 bucket / 超 90 天 / 超 500 桶、跨用户与不存在设备 404、指标清单排序与计数、空设备空数组；v0.6.0 新增 `TestPostgresAccountIntegration`：配对码新码失效旧码、claim 签发新 token 且原 token 保留、重放/过期 404、错 5 次作废（库内行删除）、跨用户配对、TTL 清理、导出含 tombstone 与升序分页（条数与库内 `COUNT` 一致、字段一致、非法游标）、`pg_class.reltuples` 近似计数、注销级联（`users/tokens/user_devices/change_log/idempotency_keys/readings/pairing_codes` 全部为 0）与重复注销 401。
-- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=8，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引、000007 的 `pairing_codes` 表、000008 的 `tokens.expires_at` 回填与三个新索引；随后回滚到 version=6 验证 `pairing_codes` 被删除且用户数据完好，再回滚到 version=5 验证 `readings` 表被删除且设备数据完好，最后 up 回到 version=8。
+- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=9，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引、000007 的 `pairing_codes` 表、000008 的 `tokens.expires_at` 回填与三个新索引、000009 的大写 MAC 型号补齐；随后回滚到 version=6 验证 `pairing_codes` 被删除且用户数据完好，再回滚到 version=5 验证 `readings` 表被删除且设备数据完好，最后 up 回到 version=9。
 
 本机实际执行结果（2026-11-05）：
 

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,8 +35,13 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(10)
+	maxOpen := envInt("DB_MAX_OPEN_CONNS", 20)
+	maxIdle := envInt("DB_MAX_IDLE_CONNS", 10)
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -44,6 +51,19 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
 	return &Store{db: db, q: sqlcgen.New(db)}, nil
+}
+
+// envInt 读取正整数环境变量；缺省、非法或非正数时返回 fallback。
+func envInt(key string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 // Backend 实现 store.Store。
@@ -197,6 +217,10 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expir
 
 // UserIDByTokenHash 实现 store.Store。
 func (s *Store) UserIDByTokenHash(ctx context.Context, tokenHash string) (string, error) {
+	// 鉴权查询必须受超时预算约束：连接池耗尽时若无限等待，请求会在
+	// ReadTimeout 之后才读到 body，表现为莫名的 400 而不是可重试的 503。
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
 	userID, err := s.q.GetUserIDByTokenHash(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -292,7 +316,7 @@ SELECT d.id, d.client_id, d.platform, d.external_id, d.mac, d.alias, d.advertise
          WHEN dt.compatibility IS NOT NULL THEN dt.compatibility
        END AS resolved_compatibility
 FROM user_devices d
-LEFT JOIN public_devices pd ON pd.mac = d.mac
+LEFT JOIN public_devices pd ON pd.mac = lower(d.mac)
 LEFT JOIN device_types dt ON dt.type = COALESCE(NULLIF(d.device_type, ''), pd.device_type)
 WHERE d.user_id = $1 AND d.deleted_at IS NULL
 ORDER BY d.updated_at DESC, d.id`
@@ -331,12 +355,31 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 	return s.enrichUserDevice(ctx, s.q, mapUserDevice(row)), nil
 }
 
-// Push 实现 store.Store。所有设备、变更日志与幂等记录在同一事务内写入。
+// pushTimeout 是单次 push 的总预算。连接池耗尽时请求会排队，超过预算即返回
+// 503 TIMEOUT（可重试），而不是无限挂起直到 HTTP 写超时。
+const pushTimeout = 10 * time.Second
+
+// injectFault 是崩溃窗口测试的注入点；生产运行时 faultHook 为 nil，不产生开销。
+// 允许在事务内指定阶段返回错误，由 defer tx.Rollback 验证回滚后的残留状态。
+var faultHook func(stage string) error
+
+func injectFault(stage string) error {
+	if faultHook == nil {
+		return nil
+	}
+	return faultHook(stage)
+}
+
+// Push 实现 store.Store。所有设备、读数、变更日志与幂等记录在同一事务内写入：
+// 任意一条失败都会回滚整批，不存在“部分提交”的成功响应。
 func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, opts store.PushOptions) (model.PushResult, bool, error) {
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return model.PushResult{}, false, fmt.Errorf("非法 user id: %w", err)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
+	defer cancel()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -345,11 +388,16 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	defer tx.Rollback()
 	q := s.q.WithTx(tx)
 
+	// 同一用户的 push 串行化，原因有二：
+	//  1. 避免并发请求在“批量查询已存设备”与“批量插入”之间抢占同一唯一键，
+	//     使插入被 ON CONFLICT DO NOTHING 静默跳过，出现“报成功但没写入”；
+	//  2. 保证 change_log 的 seq 分配顺序与事务提交顺序一致，避免客户端游标
+	//     越过尚未提交的较小 seq，导致该变更对其他客户端永久不可见。
+	if err := q.LockIdempotencyKey(ctx, "push:"+userID); err != nil {
+		return model.PushResult{}, false, fmt.Errorf("锁定用户 push 失败: %w", err)
+	}
+
 	if opts.IdempotencyKey != "" {
-		// 对同一 (user, key) 加事务级咨询锁，避免并发重复写入。
-		if err := q.LockIdempotencyKey(ctx, userID+"|"+opts.IdempotencyKey); err != nil {
-			return model.PushResult{}, false, fmt.Errorf("锁定幂等键失败: %w", err)
-		}
 		rec, err := q.GetIdempotencyKey(ctx, sqlcgen.GetIdempotencyKeyParams{UserID: uid, Key: opts.IdempotencyKey})
 		if err == nil {
 			if rec.RequestHash != opts.RequestHash {
@@ -374,14 +422,34 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	result := model.PushResult{Applied: []model.AppliedChange{}, Conflicts: []model.Conflict{}}
 
 	// 第一遍：规范化设备键，并批量加载公共元数据与已存设备，避免逐设备查询。
+	// 同批重复 id / 重复复合键必须显式拒绝：若放行，多行 INSERT 的
+	// ON CONFLICT ... DO NOTHING 会静默丢掉后出现的行，而结果仍报 applied。
 	devices := make([]model.PushDevice, len(req.Devices))
 	macSet := map[string]struct{}{}
+	seenID := make(map[string]struct{}, len(req.Devices))
+	seenKey := make(map[string]struct{}, len(req.Devices))
 	for i, dev := range req.Devices {
+		id, err := uuid.Parse(dev.ID)
+		if err != nil {
+			return model.PushResult{}, false, fmt.Errorf("非法设备 id %q: %w", dev.ID, err)
+		}
+		dev.ID = id.String()
+		if _, ok := seenID[dev.ID]; ok {
+			return model.PushResult{}, false, fmt.Errorf("%w: devices[%d].id 重复", store.ErrDuplicateDevice, i)
+		}
+		seenID[dev.ID] = struct{}{}
+
 		platform, externalID, mac, err := validate.ResolveDeviceKey(dev.Platform, dev.ExternalID, dev.MAC)
 		if err != nil {
 			return model.PushResult{}, false, fmt.Errorf("设备键非法: %w", err)
 		}
 		dev.Platform, dev.ExternalID, dev.MAC = platform, externalID, mac
+		key := platform + "|" + externalID
+		if _, ok := seenKey[key]; ok {
+			return model.PushResult{}, false, fmt.Errorf("%w: devices[%d] 的 platform + externalId 重复", store.ErrDuplicateDevice, i)
+		}
+		seenKey[key] = struct{}{}
+
 		dev.DeviceType = strings.ToLower(strings.TrimSpace(dev.DeviceType))
 		devices[i] = dev
 		if dev.MAC != "" {
@@ -505,9 +573,15 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	if err := writePendingDevices(ctx, tx, uid, req.ClientID, pending, seqs, enrich, &result); err != nil {
 		return model.PushResult{}, false, err
 	}
+	if err := injectFault("change_log_written"); err != nil {
+		return model.PushResult{}, false, err
+	}
 
 	if len(req.Readings) > 0 {
 		if err := pushReadingsTx(ctx, tx, uid, req.Readings, now, &result, q); err != nil {
+			return model.PushResult{}, false, err
+		}
+		if err := injectFault("readings_written"); err != nil {
 			return model.PushResult{}, false, err
 		}
 	}
@@ -528,8 +602,14 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		}); err != nil {
 			return model.PushResult{}, false, fmt.Errorf("写入幂等键失败: %w", err)
 		}
+		if err := injectFault("idempotency_written"); err != nil {
+			return model.PushResult{}, false, err
+		}
 	}
 
+	if err := injectFault("before_commit"); err != nil {
+		return model.PushResult{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return model.PushResult{}, false, fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -814,7 +894,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 		if err != nil {
 			return fmt.Errorf("服务端设备 id 非法: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE user_devices SET
+		res, err := db.ExecContext(ctx, `UPDATE user_devices SET
 			id = $1, client_id = $2, platform = $3, external_id = $4, mac = $5, alias = $6,
 			"group" = $7, rules = $8, scan_records = $9, updated_at = $10, deleted_at = $11,
 			server_seq = $12, device_type = $13, advertised_name = $14
@@ -822,15 +902,35 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 			devID, clientID, p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.MAC),
 			p.record.Alias, p.record.Group, p.record.Rules, p.record.ScanRecords,
 			p.record.UpdatedAt, p.deletedAt, seqs[i], nullableString(p.dev.DeviceType),
-			p.record.AdvertisedName, uid, oldID); err != nil {
+			p.record.AdvertisedName, uid, oldID)
+		if err != nil {
 			return fmt.Errorf("写入用户设备失败: %w", err)
 		}
+		if n, err := res.RowsAffected(); err != nil {
+			return fmt.Errorf("读取设备更新结果失败: %w", err)
+		} else if n != 1 {
+			return fmt.Errorf("设备换 id 更新行数不一致: 期望 1 实际 %d", n)
+		}
 	}
-	if err := insertDevicesBatch(ctx, db, insertRows); err != nil {
+	inserted, err := insertDevicesBatch(ctx, db, insertRows)
+	if err != nil {
 		return fmt.Errorf("写入用户设备失败: %w", err)
 	}
-	if err := updateDevicesBatch(ctx, db, uid, updateRows); err != nil {
+	if inserted != int64(len(insertRows)) {
+		// ON CONFLICT DO NOTHING 静默跳过会导致“结果报 applied 但库里没有”。
+		// 每用户已串行化，正常不会发生；一旦发生必须整批回滚而不是报成功。
+		return fmt.Errorf("设备写入行数不一致: 期望 %d 实际 %d", len(insertRows), inserted)
+	}
+	updated, err := updateDevicesBatch(ctx, db, uid, updateRows)
+	if err != nil {
 		return fmt.Errorf("更新用户设备失败: %w", err)
+	}
+	if updated != int64(len(updateRows)) {
+		return fmt.Errorf("设备更新行数不一致: 期望 %d 实际 %d", len(updateRows), updated)
+	}
+
+	if err := injectFault("devices_written"); err != nil {
+		return err
 	}
 
 	// 变更日志同样使用一条多行 INSERT。
@@ -843,8 +943,12 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 		}
 		logRows = append(logRows, []any{seqs[i], uid, "user_device", p.entityID, p.op, payload, time.Now().UTC()})
 	}
-	if err := insertChangeLogBatch(ctx, db, logRows); err != nil {
+	logged, err := insertChangeLogBatch(ctx, db, logRows)
+	if err != nil {
 		return fmt.Errorf("写入变更日志失败: %w", err)
+	}
+	if logged != int64(len(logRows)) {
+		return fmt.Errorf("变更日志写入行数不一致: 期望 %d 实际 %d", len(logRows), logged)
 	}
 	return nil
 }
@@ -873,32 +977,53 @@ var updateDeviceCasts = []string{"uuid", "text", "text", "text", "text", "text",
 
 var changeLogCasts = []string{"bigint", "uuid", "text", "text", "text", "jsonb", "timestamptz"}
 
-func insertDevicesBatch(ctx context.Context, db *sql.Tx, rows [][]any) error {
+func insertDevicesBatch(ctx context.Context, db *sql.Tx, rows [][]any) (int64, error) {
 	if len(rows) == 0 {
-		return nil
+		return 0, nil
 	}
 	values, args := buildBatchValues(1, rows, insertDeviceCasts)
-	_, err := db.ExecContext(ctx, fmt.Sprintf(listUserDevicesInsertSQL, values), args...)
-	return err
+	res, err := db.ExecContext(ctx, fmt.Sprintf(listUserDevicesInsertSQL, values), args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取设备写入结果失败: %w", err)
+	}
+	return n, nil
 }
 
-func updateDevicesBatch(ctx context.Context, db *sql.Tx, uid uuid.UUID, rows [][]any) error {
+func updateDevicesBatch(ctx context.Context, db *sql.Tx, uid uuid.UUID, rows [][]any) (int64, error) {
 	if len(rows) == 0 {
-		return nil
+		return 0, nil
 	}
 	values, args := buildBatchValues(2, rows, updateDeviceCasts)
 	args = append([]any{uid}, args...)
-	_, err := db.ExecContext(ctx, fmt.Sprintf(listUserDevicesUpdateSQL, values), args...)
-	return err
+	res, err := db.ExecContext(ctx, fmt.Sprintf(listUserDevicesUpdateSQL, values), args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取设备更新结果失败: %w", err)
+	}
+	return n, nil
 }
 
-func insertChangeLogBatch(ctx context.Context, db *sql.Tx, rows [][]any) error {
+func insertChangeLogBatch(ctx context.Context, db *sql.Tx, rows [][]any) (int64, error) {
 	if len(rows) == 0 {
-		return nil
+		return 0, nil
 	}
 	values, args := buildBatchValues(1, rows, changeLogCasts)
-	_, err := db.ExecContext(ctx, fmt.Sprintf(changeLogInsertSQL, values), args...)
-	return err
+	res, err := db.ExecContext(ctx, fmt.Sprintf(changeLogInsertSQL, values), args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取变更日志写入结果失败: %w", err)
+	}
+	return n, nil
 }
 
 // buildBatchValues 返回占位符文本与按行展开的参数；start 为参数起始编号，casts 逐列类型。

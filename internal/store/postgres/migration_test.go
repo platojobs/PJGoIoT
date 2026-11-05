@@ -97,6 +97,14 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 		userID, deviceID, legacyMAC, time.Now().UTC()); err != nil {
 		t.Fatalf("写入旧设备失败: %v", err)
 	}
+	// 000001 时代客户端可能写入大写 MAC；000004 的精确比较会漏掉它，000009 才补齐型号。
+	upperDeviceID := uuid.New()
+	if _, err := db.Exec(`
+		INSERT INTO user_devices (user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, server_seq)
+		VALUES ($1, $2, 'legacy-client-2', 'AA:BB:CC:00:00:02', '大写 MAC 设备', '', '{}'::jsonb, '[]'::jsonb, $3, 8)`,
+		userID, upperDeviceID, time.Now().UTC()); err != nil {
+		t.Fatalf("写入大写 MAC 旧设备失败: %v", err)
+	}
 	if _, err := db.Exec(`
 		INSERT INTO change_log (seq, user_id, entity, entity_id, op, payload, server_ts)
 		VALUES (nextval(pg_get_serial_sequence('change_log','seq')), $1, 'user_device', $2, 'upsert',
@@ -140,6 +148,16 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	}
 	if !deviceType.Valid || deviceType.String != "nordic_uart" {
 		t.Fatalf("device_type 回填异常: valid=%v value=%q", deviceType.Valid, deviceType.String)
+	}
+
+	// 000009：大写 MAC 的历史记录也要按 lower(mac) 补齐型号。
+	var upperType sql.NullString
+	if err := db.QueryRow(`SELECT device_type FROM user_devices WHERE id = $1`, upperDeviceID).
+		Scan(&upperType); err != nil {
+		t.Fatalf("读取大写 MAC 设备型号失败: %v", err)
+	}
+	if !upperType.Valid || upperType.String != "environmental_sensor" {
+		t.Fatalf("000009 未补齐大写 MAC 型号: valid=%v value=%q", upperType.Valid, upperType.String)
 	}
 
 	// 000004：为可核实的固件/配件补齐厂商，未核实的保持空字符串。
@@ -210,7 +228,7 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM user_devices WHERE user_id = $1`, userID).Scan(&deviceCount); err != nil {
 		t.Fatalf("回滚后查询设备失败: %v", err)
 	}
-	if deviceCount != 1 {
+	if deviceCount != 2 {
 		t.Fatalf("回滚 000006 破坏了设备数据: count=%d", deviceCount)
 	}
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {

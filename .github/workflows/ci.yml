@@ -97,7 +97,7 @@ jobs:
             RATE_LIMIT_BURST=0 \
             PAIRING_CLAIM_RATE_PER_MINUTE=0 \
             PAIRING_CLAIM_BURST=0 \
-            APP_VERSION=0.9.0 \
+            APP_VERSION=0.10.0 \
             ADDR=127.0.0.1:18080 \
             /tmp/pjgoiot-api >/tmp/api.log 2>&1 &
           echo $! >/tmp/api.pid
@@ -193,7 +193,8 @@ jobs:
         run: |
           set -euo pipefail
           scripts=(deploy/scripts/backup.sh deploy/scripts/restore.sh
-            scripts/stack-for-e2e.sh scripts/seed-for-e2e.sh scripts/validate-dashboard.sh)
+            scripts/stack-for-e2e.sh scripts/seed-for-e2e.sh scripts/validate-dashboard.sh
+            scripts/migrate-drill.sh)
           for f in "${scripts[@]}"; do
             bash -n "$f"
             echo "bash -n ok: $f"

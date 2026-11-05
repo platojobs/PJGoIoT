@@ -45,7 +45,7 @@ func Load() (Config, error) {
 		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
 		ShutdownTimeout:     10 * time.Second,
 		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:             getEnv("APP_VERSION", "0.9.0"),
+		Version:             getEnv("APP_VERSION", "0.10.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")

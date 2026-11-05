@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/platojobs/PJGoIoT/internal/auth"
 	"github.com/platojobs/PJGoIoT/internal/config"
@@ -29,6 +31,22 @@ type stubStore struct {
 	*fixture.Store
 	changesErr error
 	seriesErr  error
+	pushErr    error
+	tokenErr   error
+}
+
+func (s *stubStore) UserIDByTokenHash(ctx context.Context, hash string) (string, error) {
+	if s.tokenErr != nil {
+		return "", s.tokenErr
+	}
+	return s.Store.UserIDByTokenHash(ctx, hash)
+}
+
+func (s *stubStore) Push(ctx context.Context, userID string, req model.PushRequest, opts store.PushOptions) (model.PushResult, bool, error) {
+	if s.pushErr != nil {
+		return model.PushResult{}, false, s.pushErr
+	}
+	return s.Store.Push(ctx, userID, req, opts)
 }
 
 func (s *stubStore) Changes(ctx context.Context, userID string, cursor int64, limit int) (model.ChangesPage, error) {
@@ -124,6 +142,69 @@ func TestQueryTimeoutReturns503(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if body := decode[errResponse](t, rec); body.Error.Code != httpapi.CodeTimeout {
+		t.Fatalf("code=%s", body.Error.Code)
+	}
+}
+
+// TestDuplicateDeviceReturns400 验证同批重复设备在 HTTP 层映射为 400 而不是 500。
+func TestDuplicateDeviceReturns400(t *testing.T) {
+	st := &stubStore{Store: newFixtureStore(t), pushErr: store.ErrDuplicateDevice}
+	h := newStubHandler(t, st)
+	user := newUser(t, h)
+	body := `{"devices":[{"id":"` + uuid.NewString() + `","mac":"AA:BB:CC:00:12:01",` +
+		`"rules":{},"scanRecords":[],"updatedAt":"` + time.Now().UTC().Format(time.RFC3339) + `"}]}`
+	rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decode[errResponse](t, rec); got.Error.Code != httpapi.CodeBadRequest {
+		t.Fatalf("code=%s", got.Error.Code)
+	}
+}
+
+// TestStatementTimeoutReturns503 验证数据库 statement_timeout（SQLSTATE 57014）映射为 503 TIMEOUT。
+func TestStatementTimeoutReturns503(t *testing.T) {
+	st := &stubStore{Store: newFixtureStore(t), seriesErr: &pgconn.PgError{
+		Code: "57014", Message: "canceling statement due to statement timeout",
+	}}
+	h := newStubHandler(t, st)
+	user := newUser(t, h)
+	path := "/api/v1/my/devices/ios/" + uuid.NewString() + "/readings/series?metric=heart_rate&bucket=1h&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"
+	rec := do(t, h, http.MethodGet, path, "", user.Token, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := decode[errResponse](t, rec); body.Error.Code != httpapi.CodeTimeout {
+		t.Fatalf("code=%s", body.Error.Code)
+	}
+}
+
+// TestDBUnavailableReturns503 验证连接被拒映射为 503 UNAVAILABLE（可重试），而不是 500。
+func TestDBUnavailableReturns503(t *testing.T) {
+	st := &stubStore{Store: newFixtureStore(t), seriesErr: errors.New(
+		"dial tcp 127.0.0.1:5432: connect: connection refused")}
+	h := newStubHandler(t, st)
+	user := newUser(t, h)
+	path := "/api/v1/my/devices/ios/" + uuid.NewString() + "/readings/series?metric=heart_rate&bucket=1h&from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"
+	rec := do(t, h, http.MethodGet, path, "", user.Token, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := decode[errResponse](t, rec); body.Error.Code != httpapi.CodeUnavailable {
+		t.Fatalf("code=%s", body.Error.Code)
+	}
+}
+
+// TestAuthDBUnavailableReturns503 验证鉴权阶段的数据库不可达也返回 503 而不是 500。
+func TestAuthDBUnavailableReturns503(t *testing.T) {
+	st := &stubStore{Store: newFixtureStore(t), tokenErr: errors.New(
+		"failed to connect to `user=pjgoiot`: connect: connection refused")}
+	h := newStubHandler(t, st)
+	rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", "any-token", nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := decode[errResponse](t, rec); body.Error.Code != httpapi.CodeUnavailable {
 		t.Fatalf("code=%s", body.Error.Code)
 	}
 }

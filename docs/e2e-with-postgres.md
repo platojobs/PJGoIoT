@@ -1,4 +1,4 @@
-# 真实存储客户端联调（Postgres e2e stack，v0.9.0）
+# 真实存储客户端联调（Postgres e2e stack，v0.10.0）
 
 Android / iOS 仓库的契约 e2e 默认跑 `STORE=fixture`，覆盖不到真实 SQL、迁移、
 事务和 `statement_timeout` 行为。本页说明如何一条命令起「真实 Postgres + API」栈，
@@ -36,8 +36,8 @@ BASE_URL="$(bash scripts/stack-for-e2e.sh 2>/dev/null | tail -1 | cut -d= -f2-)"
 1. 用 `python3` 申请空闲端口启动独立 Postgres 容器（`pjgoiot-e2e-pg-*`）；
    若容器启动时端口被并发抢走，会打印「端口 X 已被占用，自动换端口重试」并重试（最多 3 次）。
 2. 等 `pg_isready`，执行 `cmd/migrate -direction up`（对 initdb 临时实例导致的连接重置做有限重试），
-   再执行 `-version` 确认 `version=8 dirty=false`。
-3. 编译并 `nohup` 启动 API：`STORE=postgres`、关闭限流、`APP_VERSION=0.9.0`；
+   再执行 `-version` 确认 `version=9 dirty=false`（以脚本实际输出的最新 version 为准）。
+3. 编译并 `nohup` 启动 API：`STORE=postgres`、关闭限流、`APP_VERSION=0.10.0`；
    API 端口同样自动换端口重试。
 4. 把 `DATABASE_URL`、`API_PID`、`BASE_URL` 等写入 `.e2e/stack.env`（已在 `.gitignore`）。
 5. 任一步失败会自动清理半启动的容器/进程并以非 0 退出。
@@ -109,7 +109,7 @@ E2E_SEED_ANCHOR=2026-11-01T00:00:00Z bash scripts/seed-for-e2e.sh
 8) 注销后访问: HTTP 401 {"error":{"code":"UNAUTHORIZED","message":"token 无效、已过期或已吊销"}}
 ```
 
-同一栈的 `GET /metrics` 已能按 route 区分（v0.9.0 新增 `route` 标签）：
+同一栈的 `GET /metrics` 已能按 route 区分（v0.10.0 新增 `route` 标签）：
 
 ```text
 pjgoiot_http_requests_total{method="GET",route="/api/v1/my/devices",status="200"} 3

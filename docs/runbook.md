@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.7.1）
+# PJGoIoT 运行手册（v0.10.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机部署形态（Caddy → API → PostgreSQL）。
 > 本手册区分「已验证」与「未验证」，未实际执行的步骤不得当作已验证结论。
@@ -33,9 +33,12 @@
 | v0.9.0 curl 全链路（匿名→push→changes→series→metrics→export→注销） | **已验证** | 见 §9.8；注销 `DELETE /me` 204，旧 token 再访问 401 |
 | v0.9.0 smoke 门槛与真实数字 | **已验证** | devices p95 28 ms、series p95 15 ms、push p95 417 ms，错误率 0%，`SMOKE PASS`（阈值 400/400/4 000 ms） |
 | v0.9.0 dashboard / SLO | **本地已验证** | `scripts/validate-dashboard.sh` 通过（9 面板，指标名均在 Go 代码中）；SLO PromQL 未接入真实 Prometheus 长期抓取 |
+| v0.10.0 push 整批单事务与计数守恒 | **已验证** | 真实 PG `TestPushTransactionBoundaries`：重复 id/键 400、读数校验失败整批回滚、5 个崩溃注入点零残留、`applied+skipped==len(readings)`、并发 push 游标无缺口 |
+| v0.10.0 故障注入（停机/重启/慢查询/连接池） | **已验证** | 见 §9.9：PG 停 36s 全部 503 `UNAVAILABLE`；重启 0s 自愈；100ms `statement_timeout` → 503 `TIMEOUT`；池=2 高并发排队后 503 `TIMEOUT` |
+| v0.10.0 迁移演练脚本 | **已验证** | `bash scripts/migrate-drill.sh` 三场景可重复执行：空库→9、000001 数据→9 回填、down 8 步→1 再 up→9；见 §9.9 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
-| 数小时长稳压 / 故障注入 / 多实例 | **未验证** | 仅做 30s/场景短时压测与 10s smoke，未做故障注入与多实例限流 |
+| 数小时长稳压 / 多实例 | **未验证** | 仅做 30s/场景短时压测与 10s smoke 及 v0.10.0 故障注入；未做数小时长稳与多实例限流 |
 | Android/iOS 真机局域网访问 e2e 栈 | **未验证** | 栈绑定 127.0.0.1，仅验证模拟器可用路径；两个客户端仓库本轮未实际执行 |
 
 ## 1. 部署前检查清单
@@ -422,6 +425,71 @@ job 因此变红（工作流里没有 `|| true`，不要为了方便改成吞错
 5. **改阈值必须附实测证据**：在 PR 中贴出连续 3 次本机与 CI 的数字，并同步更新
    README「压测门槛与阈值」的取值依据；没有证据不得放宽。
 
+### 7.11 事务边界与数据库故障（v0.10.0）
+
+`POST /sync/push` 是**整批单事务**（设备 + 读数 + `change_log` + 幂等记录）。下列错误都意味着
+**整批没有提交**，不存在“前几台已写入”的半成功状态；可直接用同一 `Idempotency-Key` 重试。
+
+#### 7.11.1 push 返回 400 `BAD_REQUEST`（批内重复）
+
+现象：`{"error":{"code":"BAD_REQUEST","message":"同一批设备存在重复 id 或唯一键"}}`。
+
+- 同一批里出现重复设备 `id`，或重复 `(platform, externalId)`；服务端在事务内第一遍规范化时拒绝，
+  整批不写、不产生 `change_log`；
+- 客户端应在发送前按 `(platform, externalId)` 去重，而不是靠服务端静默去重；
+- 若确认客户端没有重复，检查是否把“重试”与“新批次”拼进了同一个请求体。
+
+```bash
+# 验证整批未写入（把 <uid> 换成日志里的 user_id）
+docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+  -c "SELECT count(*) FROM change_log WHERE user_id='<uid>';"
+```
+
+#### 7.11.2 503 `UNAVAILABLE`（数据库不可达）
+
+现象：`{"error":{"code":"UNAVAILABLE","message":"数据库暂时不可用，请稍后重试"}}`，且
+`pjgoiot_db_errors_total{...}` 增长。
+
+- 映射覆盖：连接被拒绝/重置、`unexpected EOF`、`driver: bad connection`、SQLSTATE `08xxx` /
+  `57P01` / `57P02` / `57P03` / `53300`；
+- 这不是 500：进程和 HTTP 栈正常，只是下游不可达，**可重试**；客户端应指数退避（1s→2s→4s，上限 30s）；
+- 排查顺序：
+  ```bash
+  docker compose ps postgres
+  docker compose logs --tail=50 postgres
+  docker compose exec -T postgres pg_isready -U pjgoiot
+  # API 日志里应能看到 "数据库暂时不可用" + request_id
+  docker compose logs --tail=100 api | grep -E "UNAVAILABLE|数据库暂时不可用|request_id"
+  ```
+- 重启 API 不是必需的：`database/sql` 会丢弃坏连接，Postgres 恢复后首个请求即成功
+  （v0.10.0 实测停机 36s 后恢复用时 0s，无需重启 API）。
+
+#### 7.11.3 503 `TIMEOUT`（语句超时或连接池排队）
+
+- 与 §7.7 同一错误码，但 v0.10.0 起覆盖两种来源：
+  1. 查询/事务预算耗尽：普通查询 3s、鉴权查询 3s、push 总预算 10s；
+  2. 连接池排队超过预算：`DB_MAX_OPEN_CONNS` 太小时，请求在 `database/sql` 里排队直到超时。
+- 判定方法：
+  ```bash
+  # 看是否有长期占用的连接（池小 + 慢查询时常见）
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+    -c "SELECT state, count(*) FROM pg_stat_activity WHERE datname='pjgoiot' GROUP BY state;"
+  # 连接池配置（默认 20/10）
+  docker compose exec -T api printenv | grep DB_MAX
+  ```
+- 处理：先按 §7.7 找慢 SQL；确认数据库本身不慢后，再把 `DB_MAX_OPEN_CONNS` 调到
+  覆盖预期并发。**不要**通过调大 HTTP `ReadTimeout` 掩盖排队（v0.10.0 已给鉴权查询加 3s 预算，
+  避免请求挂到 15s 后被判成 400）。
+
+#### 7.11.4 `/healthz` 与 `/api/v1/health` 的差异
+
+| 端点 | 是否访问数据库 | 数据库故障时 | 用途 |
+| --- | --- | --- | --- |
+| `GET /healthz` | 否 | **200** | 容器 liveness：证明进程存活，不要因 DB 故障重启容器 |
+| `GET /api/v1/health` | 是（`Ping`） | **503 `UNAVAILABLE`** | readiness：失败即从负载均衡摘流 |
+
+排障时不要用 `/healthz` 200 来判断“服务可用”；判断数据库链路必须看 `/api/v1/health`。
+
 ## 8. 监控与告警
 
 - 抓取目标：`api:8080/metrics`（内网），样例见 `deploy/prometheus/scrape.yml`；
@@ -611,6 +679,114 @@ smoke（真实 Postgres 栈，10s/场景，2s 预热）：
 
 `bash scripts/validate-dashboard.sh` → 9 个面板结构有效，`pjgoiot_*` 指标均存在于 Go 代码，
 `probe_success` 由 blackbox_exporter 提供（唯一豁免）。
+
+### 9.9 v0.10.0 事务边界、故障注入与迁移演练（真实输出）
+
+#### 9.9.1 事务边界与崩溃窗口（真实 PG）
+
+```text
+TEST_DATABASE_URL='postgres://pjgoiot:***@127.0.0.1:55901/pjgoiot_fault?sslmode=disable' \
+  go test ./internal/store/postgres -run TestPushTransactionBoundaries -v -count=1
+
+--- PASS: TestPushTransactionBoundaries (0.23s)
+    --- PASS: 同批重复设备 id 明确拒绝且无残留
+    --- PASS: 同批重复唯一键明确拒绝且无残留
+    --- PASS: 读数校验失败时设备与变更日志一并回滚
+    --- PASS: 崩溃注入 devices_written
+    --- PASS: 崩溃注入 change_log_written
+    --- PASS: 崩溃注入 readings_written
+    --- PASS: 崩溃注入 idempotency_written
+    --- PASS: 崩溃注入 before_commit
+    --- PASS: 计数与实际写入严格对应
+    --- PASS: 并发 push 不丢变更且游标单调
+```
+
+崩溃注入点覆盖 `devices_written → change_log_written → readings_written →
+idempotency_written → before_commit`：每个阶段返回错误后断言 `user_devices` /
+`readings` / `change_log` / `idempotency_keys` **零新增**，随后用同一 `Idempotency-Key`
+重试可正常提交。
+
+#### 9.9.2 Postgres 停机 36s 与重启自愈
+
+```bash
+# API 指向独立 PG 容器（非 compose），30 次采样
+docker stop pjgoiot-fault-pg          # 停机窗口 36s
+# 每 2s 请求一次：GET /my/devices、POST /sync/push、/healthz、/api/v1/health
+docker start pjgoiot-fault-pg
+```
+
+```text
+== 停机窗口（30 次采样）==
+GET  /my/devices     {'503': 30}
+POST /sync/push      {'503': 30}
+GET  /healthz        {'200': 30}
+GET  /api/v1/health  {'503': 30}   # body: {"error":{"code":"UNAVAILABLE",...}}
+
+== 重启后 ==
+/api/v1/health 200，恢复用时 0s
+GET /my/devices 200（12.7ms），设备数据完好，无需重启 API
+```
+
+结论：数据库故障不会伪装成 500，也不会让 liveness 探针误杀容器；readiness 会真实摘流。
+
+#### 9.9.3 慢查询 → 503 `TIMEOUT`
+
+```bash
+docker exec pjgoiot-fault-pg psql -U pjgoiot -d pjgoiot_fault \
+  -c "ALTER ROLE pjgoiot SET statement_timeout='100ms';"
+# 请求一个约 2M 行的 series 查询
+curl -s -o /tmp/out -w '%{http_code} %{time_total}\n' \
+  -H "Authorization: Bearer $TOKEN" "$BASE/readings/series?metric=temperature_celsius&bucket=1d"
+```
+
+```text
+baseline（statement_timeout=0）：200，1.34s / 1.32s / 1.54s
+100ms 超时：503 TIMEOUT，0.10–0.17s（连续 3 次）
+pjgoiot_db_errors_total 0 -> 3
+恢复：ALTER ROLE pjgoiot RESET statement_timeout; 再请求 200
+```
+
+#### 9.9.4 连接池耗尽（`DB_MAX_OPEN_CONNS=2`）
+
+```bash
+DB_MAX_OPEN_CONNS=2 DB_MAX_IDLE_CONNS=1 ./api   # 独立进程，端口 55902
+# loadgen：GET /my/devices 并发 200，8s；POST /sync/push 并发 100，8s
+```
+
+| 场景 | 并发 | 请求数 | RPS | p95 | 状态分布 | 错误率 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `GET /my/devices` | 200 | 7 330 | 896.7 | 540 ms | 全部 200（排队后成功） | 0% |
+| `POST /sync/push` | 100 | 250 | — | 10.2 s | 113×200 + 137×503(TIMEOUT) | 54.8% |
+
+60 并发突刺时抓到 503 响应体 `{"error":{"code":"TIMEOUT",...}}`，确认是**排队超预算后快速失败**，
+不是无限挂起。首轮曾出现 15 个 400 / 部分请求 20s：根因是鉴权查询没有超时，等待超过 HTTP
+`ReadTimeout=15s` 后 body 读取失败被 Gin 判 400；给鉴权查询加 3s 预算后消失。
+
+#### 9.9.5 迁移演练（`scripts/migrate-drill.sh`，可重复执行）
+
+```text
+===== 场景 1：空库 0 -> 最新 =====
+  起始：none（空库）
+  迁移后：version=9 dirty=false
+  users tokens user_devices change_log readings = 0 0 0 0 0
+
+===== 场景 2：000001 时代数据 -> 最新 =====
+  迁移到：version=1 dirty=false → version=9 dirty=false
+  回填抽查 user_devices(platform|external_id|device_type)：android|AA:BB:CC:00:00:01|nordic_uart
+  回填抽查 tokens(expires_at = created_at + 180d)：true
+  回填抽查 change_log(payload.platform|payload.externalId|entity_id)：
+    android|AA:BB:CC:00:00:01|11111111-...:android:AA:BB:CC:00:00:01
+
+===== 场景 3：最新 -> down 到 1 -> up 到最新 =====
+  down 前  users tokens user_devices change_log readings = 1 1 1 1 1
+  回滚 8 步 users tokens user_devices change_log readings = 1 1 1 1 -1
+  up 后    users tokens user_devices change_log readings = 1 1 1 1 0
+  up 后重新推导字段：android|AA:BB:CC:00:00:02|environmental_sensor
+```
+
+已知边界：`000006` 的 down 会删除 `readings` 表，跨 version 1 的往返会丢读数（迁移语义）；
+`users` / `tokens` / `user_devices` / `change_log` 行数不丢。该演练发现并修复了 `000004`
+对大写 MAC 的漏回填（新增 `000009_mac_case_backfill`）。
 
 ## 10. 本地栈自检步骤（可复现）
 

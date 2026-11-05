@@ -173,8 +173,10 @@ func (s *Server) requireAuth() gin.HandlerFunc {
 				fail(c, http.StatusUnauthorized, CodeUnauthorized, "token 无效、已过期或已吊销")
 				return
 			}
-			s.log.Error("解析 token 失败", "error", err, "request_id", c.GetString(ctxKeyRequestID))
-			fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
+			// 数据库不可达/超时不能被压成 500：鉴权查询失败时同样应返回
+			// 503 UNAVAILABLE/TIMEOUT，客户端才知道可以重试。
+			c.Error(err)
+			c.Abort()
 			return
 		}
 

@@ -58,7 +58,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.9.0"
+                version: "0.10.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -848,6 +848,14 @@ paths:
         `Idempotency-Key` 在同一用户下唯一。相同 key + 相同请求体重复提交直接返回历史响应，
         响应头带 `Idempotent-Replayed: true`；相同 key + 不同请求体返回 409。
 
+        事务边界（自 `0.10.0`）：
+        - 整批 `devices`、`readings`、`change_log` 与幂等记录在**同一个数据库事务**内提交；
+          任一条失败（校验、约束、注入的崩溃）都会整批回滚，不会出现“部分成功”的 200；
+        - 同一批 `devices` 内出现重复 `id` 或重复 `(platform, externalId)` 返回 **400 BAD_REQUEST**，
+          整批不写入；客户端应先去重再重试；
+        - 同一用户并发 push 在服务端串行化，保证 `change_log.seq` 的分配顺序与提交顺序一致，
+          客户端游标不会越过尚未提交的较小 seq。
+
         可缺省字段语义（自 `0.3.3`，字段 JSON 类型不变）：
         - 字段缺失（absent）：未上报，服务端保持原值，不参与内容比较；
         - `"group": ""`：显式清除分组，服务端把 `group` 置为空串；
@@ -947,6 +955,26 @@ paths:
                 $ref: "#/components/schemas/Error"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "503":
+          description: |
+            数据库超时或不可用。整批事务已回滚，**没有任何部分写入**，客户端可安全重试。
+            - `TIMEOUT`：查询超过服务端预算（含 `statement_timeout` 与 push 10s 总预算），建议指数退避；
+            - `UNAVAILABLE`：数据库连接被拒/重置/关闭（停机或重启窗口），稍后重试。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                timeout:
+                  value:
+                    error:
+                      code: TIMEOUT
+                      message: "数据库查询超时，请稍后重试"
+                unavailable:
+                  value:
+                    error:
+                      code: UNAVAILABLE
+                      message: "数据库暂不可用，请稍后重试"
 
   /metrics:
     servers:

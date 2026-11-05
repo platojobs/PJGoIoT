@@ -62,10 +62,15 @@ func pushReadingsTx(ctx context.Context, tx *sql.Tx, uid uuid.UUID, readings []m
 	if err != nil {
 		return err
 	}
+	// 同批出现重复 id 时，INSERT ... RETURNING 只返回一行（或同一 id 命中一次），
+	// 但 inserted 是按 id 的集合，直接按条目计数会把重复条目重复计为 applied。
+	// 用 credited 保证一个 id 最多计一次 applied，其余严格归入 skipped。
+	credited := make(map[string]bool, len(inserted))
 	for i := range canonical {
 		c := &canonical[i]
 		readingID, _ := uuid.Parse(c.ID)
-		if inserted[c.ID] {
+		if inserted[c.ID] && !credited[c.ID] {
+			credited[c.ID] = true
 			result.AppliedReadings++
 			continue
 		}

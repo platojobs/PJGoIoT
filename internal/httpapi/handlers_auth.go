@@ -25,8 +25,7 @@ func (s *Server) handleAnonymous(c *gin.Context) {
 	expiresAt := time.Now().UTC().Add(s.cfg.TokenTTL())
 	userID, err := s.store.CreateUserWithToken(c.Request.Context(), hash, expiresAt)
 	if err != nil {
-		s.log.Error("创建匿名用户失败", "error", err, "request_id", c.GetString(ctxKeyRequestID))
-		fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
+		s.storeFailure(c, "创建匿名用户失败", err)
 		return
 	}
 	c.JSON(http.StatusCreated, anonymousResponse{UserID: userID, Token: token, ExpiresAt: expiresAt})
