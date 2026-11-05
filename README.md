@@ -710,9 +710,9 @@ seed 数据来源与边界：
 | fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| `docker build` | 通过（GitHub Actions `构建镜像` job，v0.5.1 提交 ca0d5fd，run 41947830444） |
-| GitHub Actions | 通过（v0.5.1：gofmt、vet、build、单元测试、迁移到 version=6、Postgres 集成测试、distroless 镜像构建；run 41947830444） |
-| OpenAPI 静态校验 | 通过：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（10 条非阻断 warning）；四个读数路径、push 的 `readings` 与 `appliedReadings`/`skippedReadings`、所有 `$ref` 均可解析 |
+| `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
+| GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
+| OpenAPI 静态校验 | 通过：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（10 条非阻断 warning，均为既有示例/描述风格提示）；配对码、导出、注销、`/metrics` 路径与全部 `$ref` 均可解析 |
 
 集成测试运行方式：
 
