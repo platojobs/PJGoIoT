@@ -52,10 +52,12 @@ type householdRecord struct {
 
 // householdInvitationRecord 是内存版邀请码；householdID 为空表示失败尝试计数行。
 type householdInvitationRecord struct {
+	id          string
 	householdID string
 	invitedBy   string
 	attempts    int
 	expiresAt   time.Time
+	createdAt   time.Time
 }
 
 type userData struct {

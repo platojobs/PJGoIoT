@@ -2,7 +2,7 @@
 # 产物包含 api 与 migrate 两个二进制，便于 docker-compose 中先迁移后启动。
 FROM golang:1.22-alpine AS build
 
-ARG APP_VERSION=0.12.0
+ARG APP_VERSION=0.13.0
 # 国内网络访问 proxy.golang.org 常超时；可通过 build arg / 环境变量 GOPROXY 切换到镜像源，
 # 例如：GOPROXY=https://goproxy.cn,direct docker compose build
 ARG GOPROXY=https://proxy.golang.org,direct
@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./c
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-ARG APP_VERSION=0.12.0
+ARG APP_VERSION=0.13.0
 
 COPY --from=build /out/api /api
 COPY --from=build /out/migrate /migrate

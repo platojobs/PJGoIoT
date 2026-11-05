@@ -50,6 +50,165 @@ func newHouseholdUser(t *testing.T, st *postgres.Store) string {
 	return uid
 }
 
+func TestHouseholdManagementPostgres(t *testing.T) {
+	dsn := testDSN(t)
+	runMigrations(t, dsn)
+	ctx := context.Background()
+	st, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ownerID := newHouseholdUser(t, st)
+	memberID := newHouseholdUser(t, st)
+	otherID := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, ownerID, memberID, otherID) })
+
+	ownerPersonal := mustPersonalHousehold(t, st, ownerID)
+	memberPersonal := mustPersonalHousehold(t, st, memberID)
+
+	home, err := st.CreateHousehold(ctx, ownerID, "管理家庭")
+	if err != nil {
+		t.Fatalf("创建家庭失败: %v", err)
+	}
+	join := func(userID string) {
+		t.Helper()
+		codeHash := hashOf("mgmt-code-" + uuid.NewString())
+		if _, err := st.CreateHouseholdInvitation(ctx, ownerID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+			t.Fatalf("创建邀请码失败: %v", err)
+		}
+		if _, err := st.ClaimHouseholdInvitation(ctx, userID, codeHash, time.Now().UTC(), 10*time.Minute); err != nil {
+			t.Fatalf("领取邀请码失败: %v", err)
+		}
+	}
+
+	// 邀请码管理：列表只暴露前缀，撤销后不可领取
+	codeHash := hashOf("mgmt-code-listed-" + uuid.NewString())
+	if _, err := st.CreateHouseholdInvitation(ctx, ownerID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("创建邀请码失败: %v", err)
+	}
+	list, err := st.ListHouseholdInvitations(ctx, ownerID, home.ID)
+	if err != nil || len(list) != 1 || list[0].Status != "active" || len(list[0].CodeHashPrefix) != 8 {
+		t.Fatalf("邀请码列表不符合预期: %+v err=%v", list, err)
+	}
+	if err := st.RevokeHouseholdInvitation(ctx, ownerID, home.ID, list[0].ID); err != nil {
+		t.Fatalf("撤销邀请码失败: %v", err)
+	}
+	if _, err := st.ClaimHouseholdInvitation(ctx, memberID, codeHash, time.Now().UTC(), 10*time.Minute); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("撤销后的邀请码应失效: err=%v", err)
+	}
+
+	join(memberID)
+	if _, err := st.ListHouseholdInvitations(ctx, memberID, home.ID); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("非 owner 查邀请码应 Forbidden: err=%v", err)
+	}
+
+	// roomCount 与整段重排
+	r1, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "客厅", 1)
+	if err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	r2, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "卧室", 2)
+	if err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	r3, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "书房", 3)
+	if err != nil {
+		t.Fatalf("创建房间失败: %v", err)
+	}
+	homes, err := st.ListHouseholds(ctx, ownerID)
+	if err != nil {
+		t.Fatalf("查询家庭失败: %v", err)
+	}
+	if len(homes) != 2 || homes[1].RoomCount != 3 {
+		t.Fatalf("roomCount 应为 3: %+v", homes)
+	}
+	rooms, err := st.ReorderHouseholdRooms(ctx, ownerID, home.ID, []string{r3.ID, r1.ID, r2.ID})
+	if err != nil || len(rooms) != 3 || rooms[0].ID != r3.ID || rooms[2].SortOrder != 2 {
+		t.Fatalf("整段重排不符合预期: %+v err=%v", rooms, err)
+	}
+	if _, err := st.ReorderHouseholdRooms(ctx, ownerID, home.ID, []string{r1.ID}); !errors.Is(err, store.ErrRoomOrderMismatch) {
+		t.Fatalf("缺项重排应冲突: err=%v", err)
+	}
+
+	// 成员设备随成员移除回到个人家庭
+	memberDevice := uuid.NewString()
+	memberExt := "AA:BB:CC:00:22:33"
+	alias := "成员设备"
+	now := time.Now().UTC()
+	_, _, err = st.Push(ctx, memberID, model.PushRequest{
+		ClientID: "mgmt-integration",
+		Devices: []model.PushDevice{{
+			ID: memberDevice, Platform: "android", ExternalID: memberExt, Alias: &alias,
+			UpdatedAt: now, Rules: []byte(`{}`), ScanRecords: []byte(`[]`),
+		}},
+	}, store.PushOptions{IdempotencyKey: "mgmt-push-member", RequestHash: "hash-mgmt-member"})
+	if err != nil {
+		t.Fatalf("push 成员设备失败: %v", err)
+	}
+	if _, err := st.UpdateUserDeviceMeta(ctx, memberID, "android", memberExt, nil, nil, &home.ID); err != nil {
+		t.Fatalf("成员设备移入家庭失败: %v", err)
+	}
+	if err := st.RemoveHouseholdMember(ctx, ownerID, home.ID, memberID); err != nil {
+		t.Fatalf("移除成员失败: %v", err)
+	}
+	if _, err := st.GetHousehold(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("被移除成员应 NotFound: err=%v", err)
+	}
+	got, err := st.GetUserDeviceByKey(ctx, memberID, "android", memberExt)
+	if err != nil || got.HouseholdID == nil || *got.HouseholdID != memberPersonal {
+		t.Fatalf("被移除成员设备应回个人家庭: %+v err=%v", got, err)
+	}
+	if err := st.RemoveHouseholdMember(ctx, ownerID, home.ID, ownerID); !errors.Is(err, store.ErrHouseholdOwnerCannotRemoveSelf) {
+		t.Fatalf("owner 移除自己应被拒绝: err=%v", err)
+	}
+
+	// 成员退出
+	join(memberID)
+	if err := st.LeaveHousehold(ctx, memberID, home.ID); err != nil {
+		t.Fatalf("成员退出失败: %v", err)
+	}
+	if _, err := st.GetHousehold(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("退出后应 NotFound: err=%v", err)
+	}
+
+	// owner 有其他成员时拒绝退出；成员退出后 owner 单独退出删除家庭
+	join(otherID)
+	if err := st.LeaveHousehold(ctx, ownerID, home.ID); !errors.Is(err, store.ErrHouseholdOwnerMustTransfer) {
+		t.Fatalf("owner 有其他成员应拒退: err=%v", err)
+	}
+	if err := st.LeaveHousehold(ctx, otherID, home.ID); err != nil {
+		t.Fatalf("成员退出失败: %v", err)
+	}
+	if err := st.LeaveHousehold(ctx, ownerID, home.ID); err != nil {
+		t.Fatalf("owner 单独退出失败: %v", err)
+	}
+	if _, err := st.GetHousehold(ctx, ownerID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("owner 退出后家庭应删除: err=%v", err)
+	}
+
+	// 个人家庭不可退出
+	if err := st.LeaveHousehold(ctx, ownerID, ownerPersonal); !errors.Is(err, store.ErrPersonalHouseholdImmutable) {
+		t.Fatalf("个人家庭退出应被拒绝: err=%v", err)
+	}
+}
+
+func mustPersonalHousehold(t *testing.T, st *postgres.Store, userID string) string {
+	t.Helper()
+	homes, err := st.ListHouseholds(context.Background(), userID)
+	if err != nil || len(homes) == 0 {
+		t.Fatalf("查询个人家庭失败: %+v err=%v", homes, err)
+	}
+	for _, h := range homes {
+		if h.Personal {
+			return h.ID
+		}
+	}
+	t.Fatalf("未找到个人家庭: %+v", homes)
+	return ""
+}
+
 func TestHouseholdSharingPostgres(t *testing.T) {
 	dsn := testDSN(t)
 	runMigrations(t, dsn)

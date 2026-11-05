@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.8.0**（v0.12.0 新增家庭/房间/成员/邀请码接口与设备 `householdId`/`roomId` 字段）；服务版本 **v0.12.0**（家庭共享 + 房间管理 + 一次性邀请码；沿用 v0.11.0 的双实例与滚动发布）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.9.0**（v0.13.0 新增成员移除/退出、邀请码管理、房间整段重排与 `roomCount`）；服务版本 **v0.13.0**（家庭共享 + 成员与邀请码管理 + 房间排序；沿用 v0.11.0 的双实例与滚动发布）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -92,32 +92,37 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/my/devices/{platform}/{externalId}/readings/metrics` | Bearer | 200 | 指标清单，`{items:[{metric,unit,count,firstAt,lastAt}]}` |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}`；范围=本人+家庭 |
 | POST | `/sync/push` | Bearer | 200 | 批量写入设备与读数，`{applied,conflicts,nextCursor,appliedReadings,skippedReadings}` |
-| GET | `/households` | Bearer | 200 | 我所在的家庭列表（含角色/成员数/设备数） |
+| GET | `/households` | Bearer | 200 | 我所在的家庭列表（含角色/成员数/设备数/房间数） |
 | POST | `/households` | Bearer | 201 | 创建家庭，创建者为 owner |
 | GET | `/households/{id}` | Bearer | 200 | 家庭详情（成员可读，跨家庭 404） |
 | PATCH | `/households/{id}` | Bearer | 200 | 改家庭名（仅 owner，member 403） |
 | DELETE | `/households/{id}` | Bearer | 204 | 删家庭（仅 owner；个人家庭 403；设备回个人家庭） |
 | GET | `/households/{id}/members` | Bearer | 200 | 成员列表（成员可读） |
+| DELETE | `/households/{id}/members/{userId}` | Bearer | 204 | 移除成员（仅 owner；不能移除自己/唯一成员；设备回该成员个人家庭） |
+| POST | `/households/{id}/leave` | Bearer | 204 | 成员退出；owner 有其他成员 409，个人家庭 400，owner 独退删家庭 |
 | POST | `/households/{id}/invitations` | Bearer | 201 | 签发一次性邀请码（仅 owner；TTL 10 分钟） |
+| GET | `/households/{id}/invitations` | Bearer | 200 | 邀请码管理列表（仅 owner；只有哈希前缀/状态/时间，绝不返回明文） |
+| DELETE | `/households/{id}/invitations/{invitationId}` | Bearer | 204 | 撤销未使用的邀请码（仅 owner） |
 | POST | `/households/invitations/claim` | Bearer | 200 | 用邀请码加入家庭；无效/过期/已用 404 |
 | GET | `/households/{id}/rooms` | Bearer | 200 | 房间列表（成员可读） |
 | POST | `/households/{id}/rooms` | Bearer | 201 | 创建房间（仅 owner） |
+| PUT | `/households/{id}/rooms/order` | Bearer | 200 | 整段重排（仅 owner；必须覆盖全部房间，原子写 0..n-1，集合不一致 409） |
 | PATCH | `/households/{id}/rooms/{roomId}` | Bearer | 200 | 改房间名/排序（仅 owner） |
 | DELETE | `/households/{id}/rooms/{roomId}` | Bearer | 204 | 删房间（仅 owner；设备 `roomId` 置 null） |
 | GET | `/metrics`（根路径） | 否 | 200 | Prometheus 文本指标；不受限流，`METRICS_ENABLED=false` 时 404 |
 
-### 家庭、房间与成员（v0.12.0）
+### 家庭、房间与成员（v0.12.0 引入，v0.13.0 补齐管理与排序）
 
 对齐米家的「账号 → 家庭 → 房间 → 设备」结构：设备仍由写入它的账号拥有，家庭只决定可见范围与房间归类。
 
-**数据模型与回填**（迁移 `000011_households`，含 down 脚本）：
+**数据模型与回填**（迁移 `000011_households` 建表并回填；`000012_household_invitation_management` 为邀请码管理补 `id`/索引，均含 down 脚本）：
 
 | 表 | 关键字段 | 说明 |
 | --- | --- | --- |
 | `households` | `id`、`name`、`owner_user_id`、`is_personal`、`created_at` | 每个账号自动一个 `is_personal=true` 的个人家庭；部分唯一索引保证每账号至多一个 |
 | `household_members` | `household_id`、`user_id`、`role(owner/member)`、`joined_at` | 主键 `(household_id,user_id)`，owner 也是成员行 |
 | `household_rooms` | `id`、`household_id`、`name`、`sort_order`、`created_at` | 删除房间不影响设备 |
-| `household_invitations` | `code_hash`(PK)、`household_id`、`invited_by_user_id`、`attempts`、`expires_at` | 只存哈希；`household_id=NULL` 的行只用于猜码失败计数 |
+| `household_invitations` | `code_hash`(PK)、`id`、`household_id`、`invited_by_user_id`、`attempts`、`expires_at`、`created_at` | 只存哈希；`household_id=NULL` 的行只用于猜码失败计数；`id`（迁移 `000012`）供管理端撤销，不参与领取逻辑 |
 | `user_devices` | 新增 `household_id`、`room_id`（均可空，`ON DELETE SET NULL`） | 旧设备回填到各自账号的个人家庭，`room_id` 保持 NULL（未分配） |
 | `change_log` | 新增 `household_id` | 旧变更回填到写入者个人家庭 |
 
@@ -132,10 +137,32 @@ make dev-postgres   # Postgres 模式启动 API
 | 读取家庭内全部设备与读数 | 200 | 200 | 404 |
 | 修改家庭名、删除家庭 | 200/204 | **403** | 404 |
 | 签发邀请码 | 201 | **403** | 404 |
+| 列出/撤销邀请码 | 200/204 | **403** | 404 |
 | 创建/修改/删除房间 | 200/201/204 | **403** | 404 |
+| 整段重排房间 | 200 | **403** | 404 |
+| 移除成员 | 204 | **403**（含移除自己） | 404 |
+| 退出家庭 | 见下节 | 204 | 404 |
 | 修改**自己的**设备 alias/room/household | 200 | 200 | — |
 | 修改**他人**的设备 | 404（设备不属于自己） | 404 | 404 |
 | 删除个人家庭 | **403**（个人家庭不可删） | — | — |
+
+**成员移除与退出规则**：
+
+| 操作 | 调用者 | 结果 |
+| --- | --- | --- |
+| `DELETE /households/{id}/members/{userId}` | owner 移除他人 | 204；该成员设备回到其个人家庭、`room_id` 置 NULL |
+| 同上 | owner 移除自己 | **400**（`BAD_REQUEST`，不能用移除接口退群，请走 leave） |
+| 同上 | member 移除任何人（含自己） | **403** |
+| 同上 | 目标不是该家庭成员 | **404** |
+| 同上 | 家庭是 `is_personal=true` | **400**（个人家庭不可变） |
+| `POST /households/{id}/leave` | member 自己退出 | 204；设备回个人家庭；成员行删除 |
+| 同上 | owner 且还有其他成员 | **409**（`CONFLICT`，提示先转让所有权或移除其他成员） |
+| 同上 | owner 且是唯一成员 | 204；整个非个人家庭被删除（成员/房间/邀请码级联） |
+| 同上 | 退出个人家庭 | **400**（个人家庭不可退出） |
+| 同上 | 非成员 | **404** |
+
+- 退出/移除都把设备归还到**该成员自己的**个人家庭，而不是留在原家庭；设备与读数不删除。
+- 错误响应沿用统一结构，`409` 的 `message` 为可读中文，客户端可直接展示（例如“家庭还有其他成员，请先转让所有权或移除成员”）。
 
 **邀请码安全设计**：
 - 8 位、32 字符表（去掉 `0/O/1/I`），约 40 bit 熵；与配对码复用同一生成/规范化/哈希实现；
@@ -145,11 +172,30 @@ make dev-postgres   # Postgres 模式启动 API
 - 领取接口复用现有每 IP 限流中间件（`429`），签发接口也受限流；
 - 签发新码不会使旧码失效，旧码仍按其自身 TTL 到期；加入家庭是幂等的（已是成员重复领取返回 200）。
 
+**邀请码管理**（仅 owner）：
+
+- `GET /households/{id}/invitations` 返回 `{items:[...]}`，每行：`id`、`codeHashPrefix`（SHA-256 哈希前 8 位）、`status`（`active` / `expired` / `locked`）、`attempts`、`expiresAt`、`createdAt`；按 `createdAt` 倒序。
+- **绝不返回明文**，也不返回完整哈希；`codeHashPrefix` 只用于运维侧在日志/工单中对应到某一批次，无法还原码。
+- `status` 是读取时按当前时间计算的：`expiresAt` 已过 → `expired`；`attempts >= 5` → `locked`；否则 `active`。已领用的码在领取成功时即被删除，不会出现在列表里。
+- `DELETE /households/{id}/invitations/{invitationId}` 物理删除该行（撤销未使用的码），返回 204；对已不存在/其他家庭的 `id` 返回 404；已被领取的码撤销同样是 404。
+- `household_id=NULL` 的猜码失败计数行不会出现在列表里。
+
+**房间排序与重排冲突**：
+
+- `PATCH /households/{id}/rooms/{roomId}` 支持 `name` 与 `sortOrder`（单房间增量更新）；`sortOrder` 非负整数，越界 400。
+- 推荐客户端使用 **整段顺序提交**：`PUT /households/{id}/rooms/order`，body `{"roomIds":["<roomA>","<roomB>",...]}`，服务端在一个事务里按数组下标写 `sort_order = 0..n-1`。
+- 冲突处理采用「整表快照 + 严格校验」：请求必须**恰好覆盖该家庭的全部房间**，缺项、多项、重复 id 一律 **409 `CONFLICT`**（不会静默忽略或部分写入），客户端重新 `GET /households/{id}/rooms` 后整段重提即可。
+- 事务内先 `SELECT ... FOR UPDATE` 锁定该家庭房间行，再逐行更新，因此并发重排不会产生交错序号；两个并发请求按行锁串行，后提交者覆盖前者的顺序（last write wins），不会出现同一序号两条房间。
+- 单房间 `PATCH sortOrder` 只改一行，不做整段重排；并发插入/拖拽时仍建议改用 `PUT .../rooms/order`，避免多个客户端各自算出的序号互相插空。
+- 家庭列表 `GET /households` 的 `roomCount` 与 `GET /households/{id}/rooms` 同步变化，客户端首页刷新即可看到。
+
 **删除家庭的级联行为**（仅 owner、需客户端二次确认）：
 - 成员行、房间、邀请码随家庭级联删除；
 - 家庭内每台设备回到**其各自 owner** 的个人家庭，`room_id` 置 NULL，设备与读数本身不删除；
 - 家庭内的历史变更保留，但 `household_id` 置 NULL，原成员不再能看到；
 - 个人家庭不可删除（403）。
+
+**家庭计数**：`GET /households` 的每个家庭返回 `memberCount`（含 owner）、`deviceCount`（该家庭内 `household_id` 指向它的设备数）、`roomCount`（房间数），供客户端首页直接展示，无需再逐个家庭拉详情。计数为读取时实时统计，不做缓存。
 
 **同步可见范围的取舍与已知限制**：
 - `GET /sync/changes` 的可见范围从「本人」扩展为「本人 + 本人所在家庭」，`seq` 仍全局单调递增；
@@ -1091,7 +1137,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.12.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.8.0 不是同一个号 |
+| `APP_VERSION` | `0.13.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.9.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1229,6 +1275,11 @@ seed 数据来源与边界：
 | v0.12.0 家庭共享与权限 | 通过（真实 PostgreSQL）：`TestHouseholdSharingPostgres` 覆盖邀请码一次性、跨家庭 404、member 改名 403、member 改他人设备 404、成员可读共享设备与读数、共享变更进入 `/sync/changes`、删房间清空 `roomId`、删家庭后设备回个人家庭；HTTP 层 `TestHouseholdLifecycleAndPermissions` 通过 |
 | v0.12.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning：info/tags/示例类，本轮新增 `household` tag 触发 1 条描述缺失）；契约版本 0.8.0 |
 | v0.12.0 CI | 通过：GitHub Actions [run 42037369419](https://github.com/platojobs/PJGoIoT/actions/runs/42037369419)，`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` 4 个 job 全绿（commit `c36db9a`） |
+| v0.13.0 成员与邀请码管理 | 通过（真实 PostgreSQL）：`TestHouseholdManagementPostgres` 覆盖成员移除后设备回个人家庭、owner 移除自己 400、member 越权 403、member 退出 204、owner 有其他成员退出 409、owner 独退删家庭、个人家庭退出 400；邀请码列表仅 8 位哈希前缀 + `active/expired/locked`、撤销后领取 404。HTTP 层 `TestHouseholdMemberAndInvitationManagement` 同步通过 |
+| v0.13.0 房间整段重排 | 通过：`PUT /households/{id}/rooms/order` 写 `0..n-1`；缺项/多项/重复 id → 409 `CONFLICT`；事务内 `FOR UPDATE` 行锁串行化并发重排；`GET /households` 的 `roomCount` 随之更新 |
+| v0.13.0 迁移 000012 | 通过（真实 PostgreSQL，临时库）：`up → down → up`；`household_invitations.id` 列与 `household_invitations_id_idx` / `household_invitations_active_idx` 可正确增删 |
+| v0.13.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.9.0** |
+| v0.13.0 CI | 通过：GitHub Actions 全绿，`构建与测试` 内 `OpenAPI 契约校验` 步骤实际执行（run id 见下节发布记录） |
 | v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
@@ -1238,7 +1289,7 @@ seed 数据来源与边界：
 
 ```bash
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
-  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v
+  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold' -v
 ```
 
 ## 多实例部署（v0.11.0）
@@ -1297,6 +1348,45 @@ bash scripts/rolling-restart.sh        # 逐实例摘流 → stop → start → 
 - 多实例且限流是硬约束（防刷、防配额滥用）→ `postgres`；接受每请求一次数据库写，
   并监控 `pjgoiot_db_errors_total`；Redis 未引入（多一个需要高可用与持久化运维的组件）。
 - `RATE_LIMIT_PER_MINUTE<=0` 仍然完全关闭限流（压测用）。
+
+## 发布流程与 tag 纪律（v0.13.0 起）
+
+### tag 纪律（硬约束）
+
+**禁止移动、删除或强制重指任何已发布的 tag。** 已推送的 tag 一旦被 `git tag -f` / `git push --force` 改写，
+其他人的本地 tag 与远端就会指向不同提交，CI 记录、发布物、回滚锚点也会对不上，且无法追溯到“当时到底发的是什么”。
+
+- 发布后发现问题：**不要动旧 tag**，修复后打一个**递增版本**（如 `v0.13.0` 之后的修复是 `v0.13.1`，再往后 `v0.14.0`），
+  在 README / runbook 里写清“修复版”，让旧 tag 保持原样。
+- 只在 tag **尚未 push 到远端**时允许本地改正（`git tag -d` 后重打），一旦 `git push origin <tag>` 成功即视为发布。
+- 不允许用 `git push --force origin refs/tags/<tag>`；仓库侧未配置 tag 保护时，这条只能靠流程自律，不得省略。
+- 发布提交必须是 CI 全绿的提交；tag 打在 `main` 上，**annotated tag**（`git tag -a`），message 写版本与主题。
+
+### 标准发布步骤
+
+```bash
+# 1. 全量验证（真实 PostgreSQL）
+gofmt -l . | grep -v '^internal/store/postgres/sqlcgen/'   # 应无输出
+go build ./... && go vet ./...
+TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' go test ./...
+go run ./cmd/migrate -direction up                          # 迁移到最新
+npx --yes @redocly/cli@latest lint api/openapi.yaml          # 0 error
+
+# 2. 同步版本号：APP_VERSION / Dockerfile / Makefile / compose / runbook / README
+#    契约版本在 api/openapi.yaml info.version，必须递增
+
+# 3. 提交并推送，等 CI 全绿（lint job 必须实际执行）
+git push origin main
+gh run watch --exit-status
+
+# 4. 打 annotated tag 并推送（不要动历史 tag）
+git tag -a v0.13.0 -m 'v0.13.0: 成员与邀请码管理、房间整段重排'
+git push origin v0.13.0
+```
+
+- CI 的 `OpenAPI 契约校验` 步骤（`npx @redocly/cli lint api/openapi.yaml`）是发布门槛，失败即不发 tag。
+- workflow 文件变更需要 `workflow` scope 的凭据；HTTPS token 缺该 scope 时改用 SSH over 443 推送，
+  不要绕过或删除 CI 步骤。
 
 ## 已知限制与下一步
 

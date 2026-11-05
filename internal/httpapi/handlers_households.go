@@ -48,6 +48,10 @@ type roomPatchRequest struct {
 	SortOrder *int    `json:"sortOrder"`
 }
 
+type roomOrderRequest struct {
+	RoomIDs []string `json:"roomIds"`
+}
+
 type deviceMetaPatchRequest struct {
 	Alias       *string `json:"alias"`
 	RoomID      *string `json:"roomId"`
@@ -164,6 +168,24 @@ func (s *Server) handleListHouseholdMembers(c *gin.Context) {
 	c.JSON(http.StatusOK, listResponse{Items: items})
 }
 
+// handleRemoveHouseholdMember 仅 owner 可移除成员；owner 自己与唯一成员不可移除。
+func (s *Server) handleRemoveHouseholdMember(c *gin.Context) {
+	if err := s.store.RemoveHouseholdMember(c.Request.Context(), userID(c), c.Param("id"), c.Param("userId")); err != nil {
+		s.storeFailure(c, "移除家庭成员失败", err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// handleLeaveHousehold 成员自己退出；personal 家庭不可退出，owner 有其他成员时返回 409。
+func (s *Server) handleLeaveHousehold(c *gin.Context) {
+	if err := s.store.LeaveHousehold(c.Request.Context(), userID(c), c.Param("id")); err != nil {
+		s.storeFailure(c, "退出家庭失败", err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // handleCreateHouseholdInvitation 仅 owner 可签发一次性邀请码，只返回明文一次。
 func (s *Server) handleCreateHouseholdInvitation(c *gin.Context) {
 	code, err := auth.NewPairingCode()
@@ -200,6 +222,25 @@ func (s *Server) handleClaimHouseholdInvitation(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, h)
+}
+
+// handleListHouseholdInvitations 仅 owner 可查看；只返回哈希前缀与状态，绝不返回明文。
+func (s *Server) handleListHouseholdInvitations(c *gin.Context) {
+	items, err := s.store.ListHouseholdInvitations(c.Request.Context(), userID(c), c.Param("id"))
+	if err != nil {
+		s.storeFailure(c, "查询家庭邀请码失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, listResponse{Items: items})
+}
+
+// handleRevokeHouseholdInvitation 仅 owner 可撤销未使用的邀请码。
+func (s *Server) handleRevokeHouseholdInvitation(c *gin.Context) {
+	if err := s.store.RevokeHouseholdInvitation(c.Request.Context(), userID(c), c.Param("id"), c.Param("invitationId")); err != nil {
+		s.storeFailure(c, "撤销家庭邀请码失败", err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // handleListHouseholdRooms 家庭成员均可读。
@@ -279,6 +320,25 @@ func (s *Server) handleDeleteHouseholdRoom(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// handleReorderHouseholdRooms 仅 owner 可整段重排；请求必须覆盖全部房间，按数组顺序重写 0..n-1。
+func (s *Server) handleReorderHouseholdRooms(c *gin.Context) {
+	var req roomOrderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, CodeInvalidJSON, "请求体不是合法 JSON")
+		return
+	}
+	if req.RoomIDs == nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "roomIds 不能为空")
+		return
+	}
+	items, err := s.store.ReorderHouseholdRooms(c.Request.Context(), userID(c), c.Param("id"), req.RoomIDs)
+	if err != nil {
+		s.storeFailure(c, "重排房间失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, listResponse{Items: items})
 }
 
 // handlePatchMyDevice 更新设备 alias/roomId/householdId（仅设备 owner）。

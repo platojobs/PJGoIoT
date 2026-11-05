@@ -139,7 +139,8 @@ func (s *Store) GetHousehold(ctx context.Context, userID string, householdID str
 const householdSelectSQL = `
 SELECT h.id, h.name, h.owner_user_id, m.role, h.is_personal, h.created_at,
        (SELECT count(*) FROM household_members x WHERE x.household_id = h.id) AS member_count,
-       (SELECT count(*) FROM user_devices d WHERE d.household_id = h.id AND d.deleted_at IS NULL) AS device_count
+       (SELECT count(*) FROM user_devices d WHERE d.household_id = h.id AND d.deleted_at IS NULL) AS device_count,
+       (SELECT count(*) FROM household_rooms r WHERE r.household_id = h.id) AS room_count
 FROM households h
 JOIN household_members m ON m.household_id = h.id`
 
@@ -152,7 +153,7 @@ func scanHousehold(row householdScanner) (model.Household, error) {
 		h         model.Household
 		id, owner uuid.UUID
 	)
-	if err := row.Scan(&id, &h.Name, &owner, &h.Role, &h.Personal, &h.CreatedAt, &h.MemberCount, &h.DeviceCount); err != nil {
+	if err := row.Scan(&id, &h.Name, &owner, &h.Role, &h.Personal, &h.CreatedAt, &h.MemberCount, &h.DeviceCount, &h.RoomCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Household{}, err
 		}
@@ -288,6 +289,151 @@ func (s *Store) ListHouseholdMembers(ctx context.Context, userID string, househo
 	return out, nil
 }
 
+// RemoveHouseholdMember 实现 store.Store。
+// 被移除成员的设备回到其个人家庭并清空房间，避免设备继续暴露给原家庭。
+func (s *Store) RemoveHouseholdMember(ctx context.Context, userID string, householdID string, targetUserID string) error {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	tid, err := uuid.Parse(targetUserID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
+		return err
+	}
+	var targetRole string
+	err = tx.QueryRowContext(ctx, `
+		SELECT role FROM household_members WHERE household_id = $1 AND user_id = $2 FOR UPDATE`,
+		hid, tid).Scan(&targetRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询成员失败: %w", err)
+	}
+	if targetRole == "owner" || tid == uid {
+		return store.ErrHouseholdOwnerCannotRemoveSelf
+	}
+	if err := moveMemberDevicesToPersonal(ctx, tx, tid, hid); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, tid); err != nil {
+		return fmt.Errorf("移除成员失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+	return nil
+}
+
+// LeaveHousehold 实现 store.Store。
+func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID string) error {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		personal   bool
+		role       string
+		otherCount int
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT is_personal FROM households WHERE id = $1 FOR UPDATE`, hid).Scan(&personal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询家庭失败: %w", err)
+	}
+	err = tx.QueryRowContext(ctx, `
+		SELECT role FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, uid).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询家庭角色失败: %w", err)
+	}
+	if personal {
+		return store.ErrPersonalHouseholdImmutable
+	}
+
+	if role == "owner" {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT count(*) FROM household_members WHERE household_id = $1 AND user_id <> $2`, hid, uid).
+			Scan(&otherCount); err != nil {
+			return fmt.Errorf("查询其他成员失败: %w", err)
+		}
+		if otherCount > 0 {
+			return store.ErrHouseholdOwnerMustTransfer
+		}
+		// owner 独自退出：家庭整体删除，设备回到个人家庭。
+		if err := moveMemberDevicesToPersonal(ctx, tx, uid, hid); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM households WHERE id = $1`, hid); err != nil {
+			return fmt.Errorf("删除家庭失败: %w", err)
+		}
+	} else {
+		if err := moveMemberDevicesToPersonal(ctx, tx, uid, hid); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, uid); err != nil {
+			return fmt.Errorf("退出家庭失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+	return nil
+}
+
+// moveMemberDevicesToPersonal 把某成员在该家庭的设备迁回其个人家庭并清空房间。
+func moveMemberDevicesToPersonal(ctx context.Context, tx *sql.Tx, memberID, householdID uuid.UUID) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE user_devices d
+		SET household_id = h.id, room_id = NULL
+		FROM households h
+		WHERE d.user_id = $1 AND d.household_id = $2
+		  AND h.owner_user_id = $1 AND h.is_personal = true`, memberID, householdID); err != nil {
+		return fmt.Errorf("回迁成员设备失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE user_devices SET household_id = NULL, room_id = NULL
+		WHERE user_id = $1 AND household_id = $2`, memberID, householdID); err != nil {
+		return fmt.Errorf("清理成员设备归属失败: %w", err)
+	}
+	return nil
+}
+
 // CreateHouseholdInvitation 实现 store.Store。
 func (s *Store) CreateHouseholdInvitation(ctx context.Context, userID string, householdID string, codeHash string, expiresAt time.Time) (model.HouseholdInvitation, error) {
 	uid, err := uuid.Parse(userID)
@@ -322,6 +468,107 @@ func (s *Store) CreateHouseholdInvitation(ctx context.Context, userID string, ho
 		return model.HouseholdInvitation{}, fmt.Errorf("提交事务失败: %w", err)
 	}
 	return model.HouseholdInvitation{HouseholdID: hid.String(), ExpiresAt: expiresAt.UTC()}, nil
+}
+
+// ListHouseholdInvitations 实现 store.Store：只返回哈希前缀、过期时间与状态。
+func (s *Store) ListHouseholdInvitations(ctx context.Context, userID string, householdID string) ([]model.HouseholdInvitationInfo, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return nil, store.ErrNotFound
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, code_hash, attempts, expires_at, created_at
+		FROM household_invitations
+		WHERE household_id = $1
+		ORDER BY created_at DESC, id`, hid)
+	if err != nil {
+		return nil, fmt.Errorf("查询邀请码失败: %w", err)
+	}
+	defer rows.Close()
+	now := time.Now().UTC()
+	out := []model.HouseholdInvitationInfo{}
+	for rows.Next() {
+		var (
+			id                   uuid.UUID
+			hash                 string
+			attempts             int
+			expiresAt, createdAt time.Time
+		)
+		if err := rows.Scan(&id, &hash, &attempts, &expiresAt, &createdAt); err != nil {
+			return nil, fmt.Errorf("解析邀请码失败: %w", err)
+		}
+		out = append(out, model.HouseholdInvitationInfo{
+			ID:             id.String(),
+			CodeHashPrefix: hashPrefix(hash),
+			Status:         invitationStatus(attempts, expiresAt, now),
+			Attempts:       attempts,
+			ExpiresAt:      expiresAt.UTC(),
+			CreatedAt:      createdAt.UTC(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历邀请码失败: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeHouseholdInvitation 实现 store.Store：删除未使用的邀请码；已用码在领取时已删除。
+func (s *Store) RevokeHouseholdInvitation(ctx context.Context, userID string, householdID string, invitationID string) error {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	iid, err := uuid.Parse(invitationID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+	if err := requireHouseholdOwner(ctx, s.db, uid, hid); err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM household_invitations WHERE id = $1 AND household_id = $2`, iid, hid)
+	if err != nil {
+		return fmt.Errorf("撤销邀请码失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// hashPrefix 返回哈希前 8 位，仅用于管理列表展示，不能还原明文。
+func hashPrefix(hash string) string {
+	const n = 8
+	if len(hash) <= n {
+		return hash
+	}
+	return hash[:n]
+}
+
+// invitationStatus 计算邀请码状态：attempts 达上限为 locked，否则过期/有效。
+func invitationStatus(attempts int, expiresAt, now time.Time) string {
+	if attempts >= maxHouseholdInvitationAttempts {
+		return "locked"
+	}
+	if !expiresAt.After(now) {
+		return "expired"
+	}
+	return "active"
 }
 
 // maxHouseholdInvitationAttempts 是同一邀请码允许的最大失败次数。
@@ -552,6 +799,92 @@ func (s *Store) UpdateHouseholdRoom(ctx context.Context, userID string, househol
 	r.HouseholdID = hid.String()
 	r.CreatedAt = r.CreatedAt.UTC()
 	return r, nil
+}
+
+// ReorderHouseholdRooms 实现 store.Store：整段顺序提交，事务内按数组顺序重写 0..n-1。
+// 行锁串行化并发重排，最后一个提交者获胜，不会出现交错的中间排序。
+func (s *Store) ReorderHouseholdRooms(ctx context.Context, userID string, householdID string, roomIDs []string) ([]model.HouseholdRoom, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return nil, store.ErrNotFound
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM household_rooms WHERE household_id = $1 FOR UPDATE`, hid)
+	if err != nil {
+		return nil, fmt.Errorf("锁定房间失败: %w", err)
+	}
+	current := map[uuid.UUID]bool{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("解析房间 id 失败: %w", err)
+		}
+		current[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历房间失败: %w", err)
+	}
+	if len(roomIDs) != len(current) {
+		return nil, store.ErrRoomOrderMismatch
+	}
+	ordered := make([]uuid.UUID, 0, len(roomIDs))
+	seen := map[uuid.UUID]bool{}
+	for _, raw := range roomIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil || !current[id] || seen[id] {
+			return nil, store.ErrRoomOrderMismatch
+		}
+		seen[id] = true
+		ordered = append(ordered, id)
+	}
+	for i, id := range ordered {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE household_rooms SET sort_order = $1 WHERE id = $2 AND household_id = $3`, i, id, hid); err != nil {
+			return nil, fmt.Errorf("更新房间排序失败: %w", err)
+		}
+	}
+	roomRows, err := tx.QueryContext(ctx, `
+		SELECT id, household_id, name, sort_order, created_at
+		FROM household_rooms WHERE household_id = $1
+		ORDER BY sort_order ASC, created_at ASC, id`, hid)
+	if err != nil {
+		return nil, fmt.Errorf("查询房间失败: %w", err)
+	}
+	out := []model.HouseholdRoom{}
+	for roomRows.Next() {
+		r, err := scanRoom(roomRows)
+		if err != nil {
+			roomRows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	roomRows.Close()
+	if err := roomRows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历房间失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交事务失败: %w", err)
+	}
+	return out, nil
 }
 
 // DeleteHouseholdRoom 实现 store.Store。room_id 由外键 ON DELETE SET NULL 自动清空。

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.8.0
+  version: 0.9.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -1241,6 +1241,59 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /households/{id}/members/{userId}:
+    delete:
+      tags: [household]
+      operationId: removeHouseholdMember
+      summary: 移除家庭成员
+      description: |
+        仅 owner 可调用。owner 不能移除自己，也不能移除家庭唯一成员（400）。
+        被移除成员的设备回到其个人家庭并清空 `roomId`，不会继续暴露给原家庭。
+        目标不是家庭成员时返回 404；跨家庭访问同样 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+        - $ref: "#/components/parameters/HouseholdUserId"
+      responses:
+        "204":
+          description: 移除成功
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /households/{id}/leave:
+    post:
+      tags: [household]
+      operationId: leaveHousehold
+      summary: 成员退出家庭
+      description: |
+        成员自己退出，无需请求体。设备回到退出者个人家庭并清空 `roomId`。
+
+        - 个人家庭（`personal=true`）不可退出，返回 **400**；
+        - owner 在还有其他成员时不能退出，返回 **409 CONFLICT**，需先移除成员或转让家庭；
+        - owner 是唯一成员时退出会**删除该家庭**（含房间与邀请码），设备回到个人家庭；
+        - 非成员与不存在的家庭统一返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "204":
+          description: 退出成功
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /households/{id}/invitations:
     post:
@@ -1273,6 +1326,61 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/RateLimited"
+    get:
+      tags: [household]
+      operationId: listHouseholdInvitations
+      summary: 查看未使用的家庭邀请码
+      description: |
+        仅 owner 可调用（member 返回 **403**）。只返回 `codeHashPrefix`（SHA-256 哈希前 8 位）、
+        `expiresAt`、`createdAt` 与 `status`，**绝不返回明文**。
+        `status`：`active`（有效）、`expired`（已过期）、`locked`（失败次数达上限）。
+        领取成功或撤销后该记录立即删除，因此列表只包含未使用的码。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HouseholdInvitationInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /households/{id}/invitations/{invitationId}:
+    delete:
+      tags: [household]
+      operationId: revokeHouseholdInvitation
+      summary: 撤销邀请码
+      description: |
+        仅 owner 可调用。删除指定未使用邀请码（已过期的码也允许清理）；已领取的码在领取时已删除。
+        `invitationId` 是管理记录 UUID，不是明文邀请码；不存在或不属于该家庭返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+        - $ref: "#/components/parameters/InvitationId"
+      responses:
+        "204":
+          description: 撤销成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /households/{id}/rooms:
     get:
@@ -1335,12 +1443,66 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /households/{id}/rooms/order:
+    put:
+      tags: [household]
+      operationId: reorderHouseholdRooms
+      summary: 整段重排房间
+      description: |
+        仅 owner 可调用。请求体 `roomIds` 必须**恰好覆盖**该家庭当前全部房间，
+        每个 id 出现一次；服务端在单个事务内按数组顺序把 `sortOrder` 重写为 `0..n-1`，
+        并返回重排后的完整列表。
+
+        冲突处理：并发重排时房间行锁串行化，最后一个提交者获胜，不会产生部分排序。
+        若期间有房间被创建/删除导致集合不一致，返回 **409 CONFLICT**，客户端应重新拉取
+        房间列表后整段重提；不要用逐条 PATCH `sortOrder` 的方式插序，否则可能产生重复/交错顺序。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdRoomOrder"
+            example:
+              roomIds:
+                - "6f2a9e4c-7b8d-4c5e-9f01-2a3b4c5d6e7f"
+                - "8a9b0c1d-2e3f-4a5b-9c6d-7e8f9a0b1c2d"
+                - "9b0c1d2e-3f4a-4b5c-8d6e-7f8a9b0c1d2e"
+      responses:
+        "200":
+          description: 重排成功，返回按新顺序排列的房间
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HouseholdRoom"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
   /households/{id}/rooms/{roomId}:
     patch:
       tags: [household]
       operationId: updateHouseholdRoom
       summary: 更新房间名称或排序
       description: 仅 owner 可调用；`name`/`sortOrder` 至少提供一个，缺失字段保持不变。
+        单条修改排序仅适合简单场景；需要整体重排或插序时请使用 `PUT /households/{id}/rooms/order`，
+        服务端会整段原子重写并避免并发插序冲突。
       security:
         - bearerAuth: []
       parameters:
@@ -1490,6 +1652,24 @@ components:
         type: string
         format: uuid
         example: 0d1f3b2a-4c5d-4e6f-8a9b-0c1d2e3f4a5b
+    HouseholdUserId:
+      name: userId
+      in: path
+      required: true
+      description: 要移除的家庭成员 userId
+      schema:
+        type: string
+        format: uuid
+        example: 3c4d5e6f-7a8b-4c9d-ae0f-1a2b3c4d5e6f
+    InvitationId:
+      name: invitationId
+      in: path
+      required: true
+      description: 邀请码记录 UUID（非明文邀请码）
+      schema:
+        type: string
+        format: uuid
+        example: 8a9b0c1d-2e3f-4a5b-9c6d-7e8f9a0b1c2d
     RoomId:
       name: roomId
       in: path
@@ -1602,6 +1782,16 @@ components:
             error:
               code: FORBIDDEN
               message: "没有操作权限"
+    Conflict:
+      description: 当前状态与请求冲突（如 owner 还有其他成员时退出、房间排序与当前集合不一致）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: CONFLICT
+              message: "家庭还有其他成员，请先移除成员或转让家庭后再退出"
 
   schemas:
     Error:
@@ -2400,7 +2590,7 @@ components:
 
     Household:
       type: object
-      required: [id, name, ownerUserId, role, personal, memberCount, deviceCount, createdAt]
+      required: [id, name, ownerUserId, role, personal, memberCount, deviceCount, roomCount, createdAt]
       properties:
         id:
           type: string
@@ -2425,6 +2615,9 @@ components:
         deviceCount:
           type: integer
           description: 当前归属该家庭且未删除的设备数
+        roomCount:
+          type: integer
+          description: 家庭内房间数（自 0.9.0）
         createdAt:
           type: string
           format: date-time
@@ -2552,3 +2745,42 @@ components:
         householdId:
           type: string
           description: 家庭 UUID 或空串
+
+    HouseholdInvitationInfo:
+      type: object
+      description: 邀请码管理视图，绝不包含明文
+      required: [id, codeHashPrefix, status, attempts, expiresAt, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 管理记录 id，用于撤销；不是邀请码
+        codeHashPrefix:
+          type: string
+          description: SHA-256 哈希前 8 位，仅用于区分不同邀请码
+          example: "9f3a1c0b"
+        status:
+          type: string
+          enum: [active, expired, locked]
+          description: active 有效、expired 过期、locked 失败次数达上限
+        attempts:
+          type: integer
+          description: 已累计的失败次数（成功领取会删除记录）
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    HouseholdRoomOrder:
+      type: object
+      required: [roomIds]
+      properties:
+        roomIds:
+          type: array
+          description: 必须恰好覆盖家庭全部房间，每个 id 出现一次；按数组顺序重写 sortOrder
+          minItems: 0
+          items:
+            type: string
+            format: uuid

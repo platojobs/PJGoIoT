@@ -1,4 +1,4 @@
-# 真实存储客户端联调（Postgres e2e stack，v0.12.0）
+# 真实存储客户端联调（Postgres e2e stack，v0.13.0）
 
 Android / iOS 仓库的契约 e2e 默认跑 `STORE=fixture`，覆盖不到真实 SQL、迁移、
 事务和 `statement_timeout` 行为。本页说明如何一条命令起「真实 Postgres + API」栈，
@@ -36,8 +36,8 @@ BASE_URL="$(bash scripts/stack-for-e2e.sh 2>/dev/null | tail -1 | cut -d= -f2-)"
 1. 用 `python3` 申请空闲端口启动独立 Postgres 容器（`pjgoiot-e2e-pg-*`）；
    若容器启动时端口被并发抢走，会打印「端口 X 已被占用，自动换端口重试」并重试（最多 3 次）。
 2. 等 `pg_isready`，执行 `cmd/migrate -direction up`（对 initdb 临时实例导致的连接重置做有限重试），
-   再执行 `-version` 确认 `version=9 dirty=false`（以脚本实际输出的最新 version 为准）。
-3. 编译并 `nohup` 启动 API：`STORE=postgres`、关闭限流、`APP_VERSION=0.12.0`；
+   再执行 `-version` 确认 `version=12 dirty=false`（以脚本实际输出的最新 version 为准）。
+3. 编译并 `nohup` 启动 API：`STORE=postgres`、关闭限流、`APP_VERSION=0.13.0`；
    API 端口同样自动换端口重试。
 4. 把 `DATABASE_URL`、`API_PID`、`BASE_URL` 等写入 `.e2e/stack.env`（已在 `.gitignore`）。
 5. 任一步失败会自动清理半启动的容器/进程并以非 0 退出。

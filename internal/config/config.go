@@ -54,7 +54,7 @@ func Load() (Config, error) {
 		ShutdownDrain:       time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
 		InstanceID:          getEnv("INSTANCE_ID", ""),
 		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:             getEnv("APP_VERSION", "0.12.0"),
+		Version:             getEnv("APP_VERSION", "0.13.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")

@@ -51,11 +51,17 @@ func (s *Store) householdViewLocked(h *householdRecord, viewer string) model.Hou
 	v.Role = h.members[viewer]
 	v.MemberCount = len(h.members)
 	v.DeviceCount = 0
+	v.RoomCount = 0
 	for _, data := range s.users {
 		for _, d := range data.byID {
 			if d.DeletedAt == nil && d.HouseholdID != nil && *d.HouseholdID == h.ID {
 				v.DeviceCount++
 			}
+		}
+	}
+	for _, r := range s.rooms {
+		if r.HouseholdID == h.ID {
+			v.RoomCount++
 		}
 	}
 	return v
@@ -203,6 +209,169 @@ func (s *Store) ListHouseholdMembers(ctx context.Context, userID string, househo
 	return out, nil
 }
 
+// RemoveHouseholdMember 实现 store.Store。
+func (s *Store) RemoveHouseholdMember(ctx context.Context, userID string, householdID string, targetUserID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, err := s.requireHouseholdLocked(userID, householdID, true)
+	if err != nil {
+		return err
+	}
+	role, ok := h.members[targetUserID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	if targetUserID == userID || role == "owner" {
+		return store.ErrHouseholdOwnerCannotRemoveSelf
+	}
+	s.moveUserDevicesToPersonalLocked(targetUserID, householdID)
+	delete(h.members, targetUserID)
+	return nil
+}
+
+// LeaveHousehold 实现 store.Store。
+func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, err := s.requireHouseholdLocked(userID, householdID, false)
+	if err != nil {
+		return err
+	}
+	if h.Personal {
+		return store.ErrPersonalHouseholdImmutable
+	}
+	if h.members[userID] == "owner" {
+		if len(h.members) > 1 {
+			return store.ErrHouseholdOwnerMustTransfer
+		}
+		s.moveUserDevicesToPersonalLocked(userID, householdID)
+		delete(s.households, householdID)
+		for rid, r := range s.rooms {
+			if r.HouseholdID == householdID {
+				delete(s.rooms, rid)
+			}
+		}
+		for hash, inv := range s.invitations {
+			if inv.householdID == householdID {
+				delete(s.invitations, hash)
+			}
+		}
+		return nil
+	}
+	s.moveUserDevicesToPersonalLocked(userID, householdID)
+	delete(h.members, userID)
+	return nil
+}
+
+func (s *Store) moveUserDevicesToPersonalLocked(userID, householdID string) {
+	data, ok := s.users[userID]
+	if !ok {
+		return
+	}
+	pid := s.personalHouseholdIDLocked(userID)
+	for _, d := range data.byID {
+		if d.HouseholdID != nil && *d.HouseholdID == householdID {
+			if pid != "" {
+				v := pid
+				d.HouseholdID = &v
+			} else {
+				d.HouseholdID = nil
+			}
+			d.RoomID = nil
+		}
+	}
+}
+
+// ListHouseholdInvitations 实现 store.Store。
+func (s *Store) ListHouseholdInvitations(ctx context.Context, userID string, householdID string) ([]model.HouseholdInvitationInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, err := s.requireHouseholdLocked(userID, householdID, true); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	out := []model.HouseholdInvitationInfo{}
+	for hash, inv := range s.invitations {
+		if inv.householdID != householdID {
+			continue
+		}
+		out = append(out, model.HouseholdInvitationInfo{
+			ID:             inv.id,
+			CodeHashPrefix: hashPrefix(hash),
+			Status:         invitationStatus(inv.attempts, inv.expiresAt, now),
+			Attempts:       inv.attempts,
+			ExpiresAt:      inv.expiresAt.UTC(),
+			CreatedAt:      inv.createdAt.UTC(),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// RevokeHouseholdInvitation 实现 store.Store。
+func (s *Store) RevokeHouseholdInvitation(ctx context.Context, userID string, householdID string, invitationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.requireHouseholdLocked(userID, householdID, true); err != nil {
+		return err
+	}
+	for hash, inv := range s.invitations {
+		if inv.id == invitationID && inv.householdID == householdID {
+			delete(s.invitations, hash)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+// ReorderHouseholdRooms 实现 store.Store。
+func (s *Store) ReorderHouseholdRooms(ctx context.Context, userID string, householdID string, roomIDs []string) ([]model.HouseholdRoom, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.requireHouseholdLocked(userID, householdID, true); err != nil {
+		return nil, err
+	}
+	current := map[string]bool{}
+	for _, r := range s.rooms {
+		if r.HouseholdID == householdID {
+			current[r.ID] = true
+		}
+	}
+	if len(roomIDs) != len(current) {
+		return nil, store.ErrRoomOrderMismatch
+	}
+	seen := map[string]bool{}
+	for _, rid := range roomIDs {
+		if !current[rid] || seen[rid] {
+			return nil, store.ErrRoomOrderMismatch
+		}
+		seen[rid] = true
+	}
+	for i, rid := range roomIDs {
+		r := s.rooms[rid]
+		r.SortOrder = i
+		s.rooms[rid] = r
+	}
+	out := []model.HouseholdRoom{}
+	for _, r := range s.rooms {
+		if r.HouseholdID == householdID {
+			out = append(out, r)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].SortOrder != out[j].SortOrder {
+			return out[i].SortOrder < out[j].SortOrder
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 // CreateHouseholdInvitation 实现 store.Store。
 func (s *Store) CreateHouseholdInvitation(ctx context.Context, userID string, householdID string, codeHash string, expiresAt time.Time) (model.HouseholdInvitation, error) {
 	s.mu.Lock()
@@ -217,7 +386,8 @@ func (s *Store) CreateHouseholdInvitation(ctx context.Context, userID string, ho
 		}
 	}
 	s.invitations[codeHash] = &householdInvitationRecord{
-		householdID: householdID, invitedBy: userID, expiresAt: expiresAt.UTC(),
+		id: uuid.NewString(), householdID: householdID, invitedBy: userID,
+		expiresAt: expiresAt.UTC(), createdAt: now,
 	}
 	return model.HouseholdInvitation{HouseholdID: householdID, ExpiresAt: expiresAt.UTC()}, nil
 }
@@ -233,7 +403,7 @@ func (s *Store) ClaimHouseholdInvitation(ctx context.Context, userID string, cod
 	}
 	inv, ok := s.invitations[codeHash]
 	if !ok {
-		s.invitations[codeHash] = &householdInvitationRecord{attempts: 1, expiresAt: now.Add(ttl).UTC()}
+		s.invitations[codeHash] = &householdInvitationRecord{id: uuid.NewString(), attempts: 1, expiresAt: now.Add(ttl).UTC(), createdAt: now}
 		return model.Household{}, store.ErrNotFound
 	}
 	if inv.householdID == "" || inv.attempts >= maxHouseholdInvitationAttempts || !inv.expiresAt.After(now) {
@@ -334,6 +504,25 @@ func (s *Store) DeleteHouseholdRoom(ctx context.Context, userID string, househol
 		}
 	}
 	return nil
+}
+
+// hashPrefix 返回哈希前 8 位，仅用于管理列表展示。
+func hashPrefix(hash string) string {
+	if len(hash) <= 8 {
+		return hash
+	}
+	return hash[:8]
+}
+
+// invitationStatus 计算邀请码状态：attempts 达上限为 locked，否则过期/有效。
+func invitationStatus(attempts int, expiresAt, now time.Time) string {
+	if attempts >= maxHouseholdInvitationAttempts {
+		return "locked"
+	}
+	if !expiresAt.After(now) {
+		return "expired"
+	}
+	return "active"
 }
 
 // UpdateUserDeviceMeta 实现 store.Store。

@@ -18,6 +18,14 @@ type householdResp struct {
 	Personal    bool   `json:"personal"`
 	MemberCount int    `json:"memberCount"`
 	DeviceCount int    `json:"deviceCount"`
+	RoomCount   int    `json:"roomCount"`
+}
+
+type invitationInfoResp struct {
+	ID             string    `json:"id"`
+	CodeHashPrefix string    `json:"codeHashPrefix"`
+	Status         string    `json:"status"`
+	ExpiresAt      time.Time `json:"expiresAt"`
 }
 
 type roomResp struct {
@@ -200,5 +208,139 @@ func TestHouseholdLifecycleAndPermissions(t *testing.T) {
 	// 个人家庭不可删除
 	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+personalID, "", owner.Token, nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("个人家庭删除应 403: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHouseholdMemberAndInvitationManagement(t *testing.T) {
+	h := newHandler(t, 0)
+	owner := newUser(t, h)
+	member := newUser(t, h)
+	other := newUser(t, h)
+
+	rec := do(t, h, http.MethodPost, "/api/v1/households", `{"name":"管理测试"}`, owner.Token, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("创建家庭 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	home := decode[householdResp](t, rec)
+
+	createInvite := func() invitationResp {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/invitations", "", owner.Token, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("签发邀请码 status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return decode[invitationResp](t, rec)
+	}
+	claim := func(code, token string, want int) {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, "/api/v1/households/invitations/claim", `{"code":"`+code+`"}`, token, nil)
+		if rec.Code != want {
+			t.Fatalf("领取邀请码 status=%d want=%d body=%s", rec.Code, want, rec.Body.String())
+		}
+	}
+
+	// 邀请码管理：列表只给哈希前缀，撤销后不可领取
+	inv1 := createInvite()
+	listed := decode[itemsResponse[invitationInfoResp]](t, do(t, h, http.MethodGet, "/api/v1/households/"+home.ID+"/invitations", "", owner.Token, nil))
+	if len(listed.Items) != 1 || listed.Items[0].Status != "active" || len(listed.Items[0].CodeHashPrefix) != 8 {
+		t.Fatalf("邀请码列表不符合预期: %+v", listed.Items)
+	}
+	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+home.ID+"/invitations/"+listed.Items[0].ID, "", owner.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("撤销邀请码 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	claim(inv1.Code, member.Token, http.StatusNotFound)
+
+	// member 不能查看邀请码管理列表
+	inv2 := createInvite()
+	claim(inv2.Code, member.Token, http.StatusOK)
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID+"/invitations", "", member.Token, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("member 查邀请码应 403: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 成员设备随成员移除回到个人家庭
+	memberPersonal := decode[itemsResponse[householdResp]](t, do(t, h, http.MethodGet, "/api/v1/households", "", member.Token, nil)).Items[0].ID
+	memberDevice := "66666666-6666-4666-8666-666666666666"
+	pushTestDevice(t, h, member.Token, memberDevice, "ios", "77777777-7777-4777-8777-777777777777", "成员设备")
+	rec = do(t, h, http.MethodPatch, "/api/v1/my/devices/ios/77777777-7777-4777-8777-777777777777", `{"householdId":"`+home.ID+`"}`, member.Token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("成员设备移入家庭 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+home.ID+"/members/"+member.UserID, "", owner.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("owner 移除成员 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", member.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("被移除成员读取家庭应 404: status=%d", rec.Code)
+	}
+	memberDevices := decode[itemsResponse[model.UserDevice]](t, do(t, h, http.MethodGet, "/api/v1/my/devices", "", member.Token, nil))
+	if len(memberDevices.Items) != 1 || memberDevices.Items[0].HouseholdID == nil || *memberDevices.Items[0].HouseholdID != memberPersonal {
+		t.Fatalf("被移除成员的设备应回到个人家庭: %+v", memberDevices.Items)
+	}
+	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+home.ID+"/members/"+owner.UserID, "", owner.Token, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("owner 移除自己应 400: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 成员自己退出
+	inv3 := createInvite()
+	claim(inv3.Code, member.Token, http.StatusOK)
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", member.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("成员退出 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", member.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("退出后读取家庭应 404: status=%d", rec.Code)
+	}
+
+	// 房间整段重排 + 房间数
+	r1 := decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"客厅","sortOrder":1}`, owner.Token, nil))
+	r2 := decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"卧室","sortOrder":2}`, owner.Token, nil))
+	r3 := decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"书房","sortOrder":3}`, owner.Token, nil))
+	homes := decode[itemsResponse[householdResp]](t, do(t, h, http.MethodGet, "/api/v1/households", "", owner.Token, nil))
+	foundHome := false
+	for _, item := range homes.Items {
+		if item.ID == home.ID {
+			foundHome = true
+			if item.RoomCount != 3 {
+				t.Fatalf("roomCount 应为 3: %+v", item)
+			}
+		}
+	}
+	if !foundHome {
+		t.Fatalf("家庭列表缺少测试家庭: %+v", homes.Items)
+	}
+	body := fmt.Sprintf(`{"roomIds":[%q,%q,%q]}`, r3.ID, r1.ID, r2.ID)
+	rec = do(t, h, http.MethodPut, "/api/v1/households/"+home.ID+"/rooms/order", body, owner.Token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("整段重排 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	ordered := decode[itemsResponse[roomResp]](t, rec)
+	if len(ordered.Items) != 3 || ordered.Items[0].ID != r3.ID || ordered.Items[1].ID != r1.ID ||
+		ordered.Items[2].ID != r2.ID || ordered.Items[0].SortOrder != 0 || ordered.Items[2].SortOrder != 2 {
+		t.Fatalf("重排结果不符合预期: %+v", ordered.Items)
+	}
+	// 缺项必须冲突，不产生部分排序
+	if rec := do(t, h, http.MethodPut, "/api/v1/households/"+home.ID+"/rooms/order",
+		fmt.Sprintf(`{"roomIds":[%q]}`, r1.ID), owner.Token, nil); rec.Code != http.StatusConflict {
+		t.Fatalf("缺项重排应 409: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// owner 有其他成员时不能退出
+	inv4 := createInvite()
+	claim(inv4.Code, other.Token, http.StatusOK)
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", owner.Token, nil); rec.Code != http.StatusConflict {
+		t.Fatalf("owner 有其他成员退出应 409: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", other.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("other 退出 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", owner.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("owner 单独退出 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", owner.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("owner 退出后家庭应删除: status=%d", rec.Code)
+	}
+
+	// 个人家庭不可退出
+	personal := decode[itemsResponse[householdResp]](t, do(t, h, http.MethodGet, "/api/v1/households", "", owner.Token, nil)).Items[0].ID
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+personal+"/leave", "", owner.Token, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("个人家庭退出应 400: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

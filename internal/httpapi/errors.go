@@ -123,6 +123,14 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "token 无效、已过期或已吊销")
 		case errors.Is(last, store.ErrForbidden):
 			writeError(c.Writer, http.StatusForbidden, CodeForbidden, "没有操作权限")
+		case errors.Is(last, store.ErrHouseholdOwnerMustTransfer):
+			writeError(c.Writer, http.StatusConflict, CodeConflict, "家庭还有其他成员，请先移除成员或转让家庭后再退出")
+		case errors.Is(last, store.ErrHouseholdOwnerCannotRemoveSelf):
+			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "owner 不能移除自己")
+		case errors.Is(last, store.ErrPersonalHouseholdImmutable):
+			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "个人家庭不支持退出或该操作")
+		case errors.Is(last, store.ErrRoomOrderMismatch):
+			writeError(c.Writer, http.StatusConflict, CodeConflict, "房间排序列表与当前房间不一致，请刷新后整段重新提交")
 		case errors.Is(last, store.ErrNotFound):
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		case errors.Is(last, store.ErrIdempotencyConflict):

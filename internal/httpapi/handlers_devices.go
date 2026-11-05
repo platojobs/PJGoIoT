@@ -240,6 +240,10 @@ func (s *Server) respondMyDeviceByKey(c *gin.Context, rawPlatform string, rawExt
 func (s *Server) storeFailure(c *gin.Context, operation string, err error) {
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrUnauthorized) ||
 		errors.Is(err, store.ErrForbidden) ||
+		errors.Is(err, store.ErrHouseholdOwnerMustTransfer) ||
+		errors.Is(err, store.ErrHouseholdOwnerCannotRemoveSelf) ||
+		errors.Is(err, store.ErrPersonalHouseholdImmutable) ||
+		errors.Is(err, store.ErrRoomOrderMismatch) ||
 		errors.Is(err, store.ErrTimeout) || errors.Is(err, store.ErrCursorExpired) ||
 		errors.Is(err, store.ErrDuplicateDevice) || isStatementTimeout(err) || isDBUnavailable(err) {
 		// 交给统一错误出口映射；数据库不可达/语句超时必须返回 503 可重试语义，

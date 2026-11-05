@@ -105,6 +105,7 @@ type Household struct {
 	Personal    bool      `json:"personal"`
 	MemberCount int       `json:"memberCount"`
 	DeviceCount int       `json:"deviceCount"`
+	RoomCount   int       `json:"roomCount"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
@@ -129,6 +130,17 @@ type HouseholdRoom struct {
 type HouseholdInvitation struct {
 	HouseholdID string    `json:"householdId"`
 	ExpiresAt   time.Time `json:"expiresAt"`
+}
+
+// HouseholdInvitationInfo 是邀请码管理视图：只暴露哈希前缀，绝不返回明文。
+// Status 取值 active / expired / locked。
+type HouseholdInvitationInfo struct {
+	ID             string    `json:"id"`
+	CodeHashPrefix string    `json:"codeHashPrefix"`
+	Status         string    `json:"status"`
+	Attempts       int       `json:"attempts"`
+	ExpiresAt      time.Time `json:"expiresAt"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 // PushDevice 是客户端在一次 push 中提交的单台设备。

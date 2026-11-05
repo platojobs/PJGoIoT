@@ -28,6 +28,15 @@ var (
 	ErrDuplicateDevice = errors.New("同一批设备存在重复 id 或唯一键")
 	// ErrForbidden 表示已认证用户对同家庭内的资源没有操作权限（跨家庭仍返回 ErrNotFound）。
 	ErrForbidden = errors.New("没有操作权限")
+	// ErrHouseholdOwnerMustTransfer 表示 owner 在还有其他成员时不能退出/不能移除自己。
+	// HTTP 层映射为 409，并给出可读提示。
+	ErrHouseholdOwnerMustTransfer = errors.New("家庭还有其他成员，请先移除成员或转让家庭")
+	// ErrHouseholdOwnerCannotRemoveSelf 表示 owner 不能把自己移出家庭。
+	ErrHouseholdOwnerCannotRemoveSelf = errors.New("owner 不能移除自己")
+	// ErrPersonalHouseholdImmutable 表示个人家庭不支持退出等操作。
+	ErrPersonalHouseholdImmutable = errors.New("个人家庭不支持该操作")
+	// ErrRoomOrderMismatch 表示整段房间排序与当前房间集合不一致（缺项/多项/重复）。
+	ErrRoomOrderMismatch = errors.New("房间排序列表必须包含家庭内全部房间且不能重复")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -109,8 +118,17 @@ type Store interface {
 	DeleteHousehold(ctx context.Context, userID string, householdID string) error
 	// ListHouseholdMembers 返回成员列表，仅家庭成员可见。
 	ListHouseholdMembers(ctx context.Context, userID string, householdID string) ([]model.HouseholdMember, error)
+	// RemoveHouseholdMember 仅 owner 可移除成员；不能移除 owner 自己；被移除成员的设备回到其个人家庭。
+	RemoveHouseholdMember(ctx context.Context, userID string, householdID string, targetUserID string) error
+	// LeaveHousehold 让成员自己退出；personal 家庭不可退出；owner 还有其他成员时返回 ErrHouseholdOwnerMustTransfer；
+	// owner 单独退出时家庭随之删除。
+	LeaveHousehold(ctx context.Context, userID string, householdID string) error
 	// CreateHouseholdInvitation 由 owner 签发一次性邀请码（只存哈希）。
 	CreateHouseholdInvitation(ctx context.Context, userID string, householdID string, codeHash string, expiresAt time.Time) (model.HouseholdInvitation, error)
+	// ListHouseholdInvitations 由 owner 查看未使用的邀请码；只返回哈希前缀与状态。
+	ListHouseholdInvitations(ctx context.Context, userID string, householdID string) ([]model.HouseholdInvitationInfo, error)
+	// RevokeHouseholdInvitation 由 owner 撤销未使用的邀请码。
+	RevokeHouseholdInvitation(ctx context.Context, userID string, householdID string, invitationID string) error
 	// ClaimHouseholdInvitation 用邀请码加入家庭；失败按码计数，满 5 次作废。
 	ClaimHouseholdInvitation(ctx context.Context, userID string, codeHash string, now time.Time, ttl time.Duration) (model.Household, error)
 	// ListHouseholdRooms 返回房间列表，仅家庭成员可见。
@@ -119,6 +137,8 @@ type Store interface {
 	CreateHouseholdRoom(ctx context.Context, userID string, householdID string, name string, sortOrder int) (model.HouseholdRoom, error)
 	// UpdateHouseholdRoom 仅 owner 可改房间；name/sortOrder 为 nil 表示不变。
 	UpdateHouseholdRoom(ctx context.Context, userID string, householdID string, roomID string, name *string, sortOrder *int) (model.HouseholdRoom, error)
+	// ReorderHouseholdRooms 仅 owner 可整段重排；roomIDs 必须恰好覆盖家庭全部房间，按数组顺序写入 0..n-1。
+	ReorderHouseholdRooms(ctx context.Context, userID string, householdID string, roomIDs []string) ([]model.HouseholdRoom, error)
 	// DeleteHouseholdRoom 仅 owner 可删房间；房间内设备的 room_id 置 NULL。
 	DeleteHouseholdRoom(ctx context.Context, userID string, householdID string, roomID string) error
 	// UpdateUserDeviceMeta 仅设备 owner 可改 alias/roomId/householdId。
