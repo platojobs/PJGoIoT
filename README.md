@@ -585,12 +585,12 @@ push 结果: applied=1 skippedReadings=24 conflicts=0
 `cmd/loadgen -smoke` 是 CI 的短跑模式：每场景 10s（2s 预热）、低并发，跑完按阈值断言，
 **任一场景错误率 > 0 或 p95 超阈值即非 0 退出**，CI job 直接变红（没有 `|| true`）。
 
-| 场景 | 并发 | 阈值（CI 断言） | 本轮 smoke 实测 p95 | 取值依据 |
-| --- | --- | --- | --- | --- |
-| `GET /my/devices` | 20 | **< 400 ms** | **28 ms**（20 421 请求，2 040.7 RPS） | v0.8.0 100 并发 p95 215 ms 的约 1.9x，覆盖共享 runner 抖动 |
-| `GET /readings/series`（1d/90 天） | 10 | **< 400 ms** | **15 ms**（14 207 请求，1 420.2 RPS） | v0.8.0 50 并发 p95 127 ms 的约 3.1x，兼顾 CI 机器更慢 |
-| `POST /sync/push`（100 设备+200 读数/批） | 5 | **< 4 000 ms** | **417 ms**（165 请求，16.2 RPS） | v0.8.0 50 并发 p95 2 005 ms 的约 2x，保留写吞吐上限余量 |
-| 错误率（全部场景） | — | **0%** | 0.00% | 不是性能抖动，任何 5xx/超时都视为回归 |
+| 场景 | 并发 | 阈值（CI 断言） | 本机 smoke p95 | CI smoke p95（run 41974670052） | 取值依据 |
+| --- | --- | --- | --- | --- | --- |
+| `GET /my/devices` | 20 | **< 400 ms** | **28 ms**（20 421 请求，2 040.7 RPS） | **16 ms**（19 908 请求，1 986.4 RPS） | v0.8.0 100 并发 p95 215 ms 的约 1.9x，覆盖共享 runner 抖动 |
+| `GET /readings/series`（1d/90 天） | 10 | **< 400 ms** | **15 ms**（14 207 请求，1 420.2 RPS） | **11 ms**（14 066 请求，1 405.8 RPS） | v0.8.0 50 并发 p95 127 ms 的约 3.1x，兼顾 CI 机器更慢 |
+| `POST /sync/push`（100 设备+200 读数/批） | 5 | **< 4 000 ms** | **417 ms**（165 请求，16.2 RPS） | **313 ms**（184 请求，18.1 RPS） | v0.8.0 50 并发 p95 2 005 ms 的约 2x，保留写吞吐上限余量 |
+| 错误率（全部场景） | — | **0%** | 0.00% | 0.00% | 不是性能抖动，任何 5xx/超时都视为回归 |
 
 本地复跑（真实 Postgres 栈）：
 
@@ -1046,6 +1046,7 @@ seed 数据来源与边界：
 | v0.9.0 smoke 门槛 | 通过（真实 Postgres 栈，本机）：devices 20 并发 p95 28ms（阈值 400ms）、series 10 并发 p95 15ms（400ms）、push 5 并发 p95 417ms（4000ms），错误率 0%，`SMOKE PASS` |
 | v0.9.0 dashboard 校验 | 通过：`bash scripts/validate-dashboard.sh` → JSON 结构有效（9 面板），`probe_success` 豁免，其余 `pjgoiot_*` 指标均在 Go 代码中存在 |
 | v0.9.0 单元/集成测试 | 通过：`gofmt`/`go build`/`go vet`/`go test ./...` 全绿；真实 PostgreSQL 集成测试（`TEST_DATABASE_URL`）全绿；`TestMetricsEndpoint` 已断言 `route` 标签 |
+| v0.9.0 GitHub Actions | **通过**（run 41974670052，commit c0f93ba）：`构建与测试`、`压测门槛（smoke）`（devices p95 16ms / series 11ms / push 313ms，错误率 0%，`SMOKE PASS`）、`构建镜像`、`配置与脚本校验`（含 dashboard 校验与新脚本 shellcheck）均 success |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
