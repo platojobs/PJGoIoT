@@ -594,8 +594,8 @@ seed 数据来源与边界：
 | fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| `docker build` | 通过（GitHub Actions `构建镜像` job，v0.4.0 提交 a5aebf0，run 41940956229） |
-| GitHub Actions | 通过（v0.4.0：gofmt、vet、build、单元测试、迁移到 version=6、Postgres 集成测试、distroless 镜像构建；run 41940956229） |
+| `docker build` | 通过（GitHub Actions `构建镜像` job，v0.5.0 提交 791b501，run 41946830487） |
+| GitHub Actions | 通过（v0.5.0：gofmt、vet、build、单元测试、迁移到 version=6、Postgres 集成测试、distroless 镜像构建；run 41946830487） |
 
 集成测试运行方式：
 
