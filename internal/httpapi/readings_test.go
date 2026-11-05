@@ -233,7 +233,7 @@ func TestReadingsValidation(t *testing.T) {
 func TestReadingsListPagination(t *testing.T) {
 	h := newHandler(t, 0)
 	user := newUser(t, h)
-	base := time.Now().UTC().Add(-2 * time.Hour)
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
 
 	readings := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
@@ -311,7 +311,7 @@ func TestReadingsSummary(t *testing.T) {
 	h := newHandler(t, 0)
 	user := newUser(t, h)
 	now := time.Now().UTC()
-	base := now.Add(-30 * time.Minute)
+	base := now.Add(-30 * time.Minute).Truncate(time.Microsecond)
 
 	readings := []string{
 		readingJSON("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "10", "celsius", base.Add(-30*time.Minute)),
