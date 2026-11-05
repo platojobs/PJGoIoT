@@ -6,7 +6,7 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.4.0**（新增设备测量读数 readings 链路：批量写入、分页查询、聚合与 90 天保留）
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.5.0**（读数链路新增 UTC 对齐分桶序列与指标清单）
 
 ## 快速开始
 
@@ -69,6 +69,8 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/my/devices/{platform}/{externalId}` | Bearer | 200 | 按设备唯一键查单台设备，iOS 无需 MAC |
 | GET | `/my/devices/{platform}/{externalId}/readings` | Bearer | 200 | 读数列表，`recordedAt` 倒序游标分页，`{items,nextCursor,hasMore}` |
 | GET | `/my/devices/{platform}/{externalId}/readings/summary` | Bearer | 200 | 单指标聚合，`{metric,unit,count,min,max,avg,last,windowStart,windowEnd}` |
+| GET | `/my/devices/{platform}/{externalId}/readings/series` | Bearer | 200 | UTC 对齐分桶序列，`{metric,unit,bucket,from,to,buckets[]}` |
+| GET | `/my/devices/{platform}/{externalId}/readings/metrics` | Bearer | 200 | 指标清单，`{items:[{metric,unit,count,firstAt,lastAt}]}` |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}` |
 | POST | `/sync/push` | Bearer | 200 | 批量写入设备与读数，`{applied,conflicts,nextCursor,appliedReadings,skippedReadings}` |
 
@@ -172,7 +174,7 @@ down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
 
 **隐式设备**：读数引用的设备不要求在 `user_devices` 中存在。未注册设备按「隐式设备」接受写入
 （便于先采数据、后补设备信息）；但在设备注册（或被 `/sync/push` 写入）之前，
-`GET .../readings` 与 `.../summary` 仍按设备不存在返回 404。
+`GET .../readings`、`.../summary`、`.../series`、`.../metrics` 均按设备不存在返回 404。
 
 #### 查询：`GET /my/devices/{platform}/{externalId}/readings`
 
@@ -188,6 +190,52 @@ down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
 - 窗口为 `[now-hours, now]`，返回 `windowStart` / `windowEnd`；
 - 无数据时 `count:0`，`min`/`max`/`avg`/`last` 均为 `null`，`unit` 为空串；
 - 有数据时 `unit` 取窗口内最新一条的单位，`last` 为 `recordedAt` 最新的值。
+
+#### 分桶序列与指标清单（v0.5.0）
+
+**分桶序列**：`GET /my/devices/{platform}/{externalId}/readings/series?metric=&from=&to=&bucket=1m|1h|1d`
+
+| 参数 | 必填 | 规则 |
+| --- | --- | --- |
+| `metric` | 是 | 小写 snake_case，1–32 字符 |
+| `from` / `to` | 是 | RFC3339，闭区间，要求 `to > from`，跨度 ≤ 90 天 |
+| `bucket` | 是 | `1m`、`1h`、`1d` 三选一 |
+
+返回：
+
+```json
+{"metric":"temperature_celsius","unit":"celsius","bucket":"1h",
+ "from":"2026-11-04T00:00:00Z","to":"2026-11-05T00:00:00Z",
+ "buckets":[{"start":"2026-11-04T01:00:00Z","end":"2026-11-04T02:00:00Z",
+             "count":12,"min":20.9,"max":21.8,"avg":21.35,"last":21.8}]}
+```
+
+- 桶边界按 **UTC** 对齐：`1m` 对齐整分钟、`1h` 对齐整点、`1d` 对齐 UTC 零点（`00:00:00Z`），
+  与客户端本地时区、夏令时（DST）无关；`start` 为起点（含），`end = start + bucket`（不含）；
+- 只返回 `count > 0` 的桶，按 `start` 升序；范围内无数据时 `buckets: []` 且 HTTP 200；
+- `last` 为桶内 `recordedAt` 最大的值（同一时刻按 `id` 倒序取首条）；
+- `unit` 取时间范围内最新一条读数的单位；
+- 桶数量上限 **500**：参数会产生的桶数超出时返回 400，提示改用更粗的 `bucket` 或缩短范围；
+- 非法参数（缺 `metric`/`from`/`to`/`bucket`、`to <= from`、跨度 > 90 天、非法 bucket）返回 400；
+  越权、设备已删除或不存在统一 404。
+
+**指标清单**：`GET /my/devices/{platform}/{externalId}/readings/metrics`
+
+```json
+{"items":[{"metric":"relative_humidity","unit":"%","count":42,
+           "firstAt":"2026-11-01T00:00:00Z","lastAt":"2026-11-04T23:59:00Z"}]}
+```
+
+- 按 `lastAt` **倒序**（同一 `lastAt` 按 `metric` 升序）；
+- `count` 为该指标读数总数，`firstAt` / `lastAt` 为最早 / 最晚的 `recordedAt`；
+- `unit` 为该指标**最近一条**读数的单位；同一指标存在多个单位时以此为准（历史读数可能使用旧单位）；
+- 设备已注册但未上报过读数时 `items: []` 且 HTTP 200；404 规则同上。
+
+实现：分桶序列由 Postgres `date_bin` + `GROUP BY` 的**单条 SQL** 完成（`min`/`max`/`avg`/`count`
+由聚合函数计算，`last` 与单位用 `ARRAY_AGG(... ORDER BY recorded_at DESC, id DESC)[1]` 取回），
+不在应用层遍历读数。过滤条件与现有索引
+`readings_user_device_metric_time_idx (user_id, platform, external_id, metric, recorded_at DESC)`
+的前缀完全匹配，无需新增覆盖索引；90 天窗口上限保证了单次扫描量。
 
 #### 保留策略（90 天）
 
@@ -305,7 +353,15 @@ curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings?metric=temperature_
 curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings/summary?metric=temperature_celsius&hours=24" \
   -H "Authorization: Bearer $TOKEN"
 
-# 7e. 清理 90 天前读数（也可用 -dry-run 先看时间边界）
+# 7e. 按 UTC 整点分桶（bucket=1m|1h|1d；跨度 ≤ 90 天、桶数 ≤ 500）
+curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings/series?metric=temperature_celsius&from=2026-11-04T00:00:00Z&to=2026-11-05T00:00:00Z&bucket=1h" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 7f. 指标清单（按 lastAt 倒序；unit 取最近一条读数的单位）
+curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings/metrics" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 7g. 清理 90 天前读数（也可用 -dry-run 先看时间边界）
 # DATABASE_URL='postgres://...' go run ./cmd/cleanup -retention-days 90
 
 # 8. 删除设备（只写 tombstone，不物理删除）
@@ -460,7 +516,7 @@ PJGoIoT/
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.4.0` | 健康接口与日志中展示的版本 |
+| `APP_VERSION` | `0.5.0` | 健康接口与日志中展示的版本 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -513,9 +569,9 @@ seed 数据来源与边界：
 
 测试覆盖：
 
-- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然；v0.4.0 新增 `TestReadingsPushIdempotency`（重复 id 计 skipped、同 id 不同内容计 `duplicate_id` 冲突且原值不变）、`TestReadingsPushOptional`（无 readings 时计数为 0、隐式设备写入与注册后可查）、`TestReadingsValidation`（metric/unit/value/recordedAt/批量上限/非法 externalId）、`TestReadingsListPagination`（倒序、游标翻页、metric 与时间过滤、非法参数、跨用户 404）、`TestReadingsSummary`（聚合值、无数据 null、hours 校验、跨用户 404）。
+- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然；v0.4.0 新增 `TestReadingsPushIdempotency`（重复 id 计 skipped、同 id 不同内容计 `duplicate_id` 冲突且原值不变）、`TestReadingsPushOptional`（无 readings 时计数为 0、隐式设备写入与注册后可查）、`TestReadingsValidation`（metric/unit/value/recordedAt/批量上限/非法 externalId）、`TestReadingsListPagination`（倒序、游标翻页、metric 与时间过滤、非法参数、跨用户 404）、`TestReadingsSummary`（聚合值、无数据 null、hours 校验、跨用户 404）；v0.5.0 新增 `TestReadingsSeries`（1h/1d 的 UTC 对齐与跨整点/跨日边界、桶内 min/max/avg/last、空区间 `buckets: []`、8 类非法参数含「桶数超 500 提示更粗 bucket」、跨用户与不存在设备 404、unit 取窗口最新）、`TestReadingsMetrics`（排序与计数、多单位取最新、空数组、跨用户 404）。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType`、`alias`、`advertisedName`、`group` 仅在客户端上报时参与内容比较（缺失保持原值不产生冲突）。
-- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）；v0.4.0 新增集成子测试「读数链路」：批量写入与计数、重复 id 幂等、同 id 不同内容冲突、NaN/Inf/未来时间/非法 metric 拒绝、数据库 CHECK 拒绝 NaN、倒序游标分页、非法游标、metric 过滤、跨用户与不存在设备 404、summary 聚合与无数据、90 天清理（历史数据被删且近期数据保留）。
+- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）；v0.4.0 新增集成子测试「读数链路」：批量写入与计数、重复 id 幂等、同 id 不同内容冲突、NaN/Inf/未来时间/非法 metric 拒绝、数据库 CHECK 拒绝 NaN、倒序游标分页、非法游标、metric 过滤、跨用户与不存在设备 404、summary 聚合与无数据、90 天清理（历史数据被删且近期数据保留）；v0.5.0 新增集成子测试「读数分桶序列与指标清单」：1h 跨整点与 1d UTC 零点对齐、桶内 min/max/avg/last、分桶计数合计与原始条数一致、空区间 `[]`、非法 bucket / 超 90 天 / 超 500 桶、跨用户与不存在设备 404、指标清单排序与计数、空设备空数组。
 - `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=6，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引；随后回滚到 version=5 验证 `readings` 表被删除且设备数据完好，再 up 回到 version=6。
 
 本机实际执行结果（2026-11-05）：
@@ -524,11 +580,12 @@ seed 数据来源与边界：
 | --- | --- |
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
-| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok；`-v` 统计 23 个顶层测试、121 个含子测试用例，0 失败） |
-| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=6；含旧数据、字段回填、读数链路与 down 回滚） |
+| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok；`-v` 统计 25 个顶层测试、132 个含子测试用例，0 失败） |
+| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=6；含旧数据、字段回填、读数链路、分桶序列与指标清单、down 回滚） |
 | v0.3.2 字段测试 | 通过：`TestDeviceMetadataEnrichment`（列表/单查 200 字段、catalog 固件配件完整性、未注册型号与无 MAC 降级 null）、`TestDeviceTypeComparison`、集成测试「公共元数据补全与缺失降级」 |
 | v0.3.3 语义测试 | 通过：`TestPresenceSemantics`（`"group": ""` 清除、缺失保持、清空后拉回为空、广播名与别名互不覆盖）、`TestPresenceOnlyComparison`、集成测试「可缺省字段语义与广播名隔离」、迁移测试 `advertised_name` 默认空串 |
 | v0.4.0 读数测试 | 通过：`TestReadingsPushIdempotency`、`TestReadingsPushOptional`、`TestReadingsValidation`、`TestReadingsListPagination`、`TestReadingsSummary`、集成子测试「读数链路」（含数据库 CHECK 拒绝 NaN、90 天清理）、迁移测试 up→down→up |
+| v0.5.0 分桶与指标清单测试 | 通过：`TestReadingsSeries`（UTC 对齐、跨整点/跨日、桶内聚合、空区间、非法参数、404）、`TestReadingsMetrics`（排序/计数/单位取最新/空数组/404）、集成子测试「读数分桶序列与指标清单」（真实 Postgres） |
 | 真实库迁移 | 通过：`cmd/migrate up` → version=6 dirty=false；`readings` 表、索引与 CHECK 约束按预期创建；历史 000003~000005 回填保持正确（`advertised_name` 默认空串、AA 电池厂商为空） |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
 | v0.4.0 读数 HTTP 验证 | 通过（真实 PostgreSQL + `cmd/api`）：push `appliedReadings=2`；重复 id 不同值返回 `skippedReadings=1` 与 `entity=reading/reason=duplicate_id` 冲突且原值不变；列表倒序；summary `count/min/max/avg/last` 正确；无数据时数值为 `null`；未来时间 400 `BAD_REQUEST`；NaN 400；未知设备与跨用户 404 |
@@ -554,7 +611,7 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
 - 读数保留 90 天由 `cmd/cleanup` 负责，服务内不做后台定时清理；生产环境需自行配置 cron / CronJob。
 - 读数查询要求设备已存在于 `user_devices`；隐式设备写入的读数在注册前不可查。
-- 读数目前只支持单指标聚合（min/max/avg/last），跨指标或按天分桶聚合按需再扩展。
+- 读数支持单指标聚合（`min/max/avg/last`）、UTC 对齐的 `1m/1h/1d` 分桶序列，以及设备维度指标清单；跨指标合并统计按需再扩展。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
 - fixture 模式的用户与设备数据在重启后丢失，仅用于本地联调与测试。
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。

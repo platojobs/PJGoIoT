@@ -236,6 +236,157 @@ func (s *Store) CleanupReadings(ctx context.Context, before time.Time) (int64, e
 	return deleted, nil
 }
 
+// ReadingsSeries 实现 store.Store。
+// 内存实现按 UTC 对齐网格聚合，语义与 Postgres 的 date_bin 一致。
+func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time, bucket string) (model.ReadingsSeries, error) {
+	normMetric, err := validate.NormalizeMetric(metric)
+	if err != nil {
+		return model.ReadingsSeries{}, err
+	}
+	size, err := validate.NormalizeBucket(bucket)
+	if err != nil {
+		return model.ReadingsSeries{}, err
+	}
+	if _, err := validate.ValidateSeriesRange(from, to, size); err != nil {
+		return model.ReadingsSeries{}, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, ok := s.users[userID]
+	if !ok {
+		return model.ReadingsSeries{}, store.ErrNotFound
+	}
+	d, ok := data.byKey[deviceKey(platform, externalID)]
+	if !ok || d.DeletedAt != nil {
+		return model.ReadingsSeries{}, store.ErrNotFound
+	}
+
+	series := model.ReadingsSeries{
+		Metric: normMetric, Bucket: bucket, From: from.UTC(), To: to.UTC(),
+		Buckets: make([]model.ReadingsBucket, 0),
+	}
+
+	type accumulator struct {
+		start  time.Time
+		count  int64
+		sum    float64
+		min    float64
+		max    float64
+		last   float64
+		lastAt time.Time
+		lastID string
+	}
+	buckets := map[time.Time]*accumulator{}
+	var latestAt time.Time
+	var latestID, latestUnit string
+
+	for id, rec := range data.readings {
+		if rec.platform != platform || rec.externalID != externalID || rec.metric != normMetric {
+			continue
+		}
+		if rec.recordedAt.Before(from) || rec.recordedAt.After(to) {
+			continue
+		}
+
+		// 序列整体单位取窗口内最新读数。
+		if latestAt.IsZero() || rec.recordedAt.After(latestAt) || (rec.recordedAt.Equal(latestAt) && id > latestID) {
+			latestAt, latestID, latestUnit = rec.recordedAt, id, rec.unit
+		}
+
+		start := validate.BucketStart(rec.recordedAt, size)
+		acc, ok := buckets[start]
+		if !ok {
+			acc = &accumulator{start: start, count: 0, min: rec.value, max: rec.value, last: rec.value, lastAt: rec.recordedAt, lastID: id}
+			buckets[start] = acc
+		}
+		acc.count++
+		acc.sum += rec.value
+		if rec.value < acc.min {
+			acc.min = rec.value
+		}
+		if rec.value > acc.max {
+			acc.max = rec.value
+		}
+		if rec.recordedAt.After(acc.lastAt) || (rec.recordedAt.Equal(acc.lastAt) && id > acc.lastID) {
+			acc.last, acc.lastAt, acc.lastID = rec.value, rec.recordedAt, id
+		}
+	}
+
+	for _, acc := range buckets {
+		avg := acc.sum / float64(acc.count)
+		last := acc.last
+		series.Buckets = append(series.Buckets, model.ReadingsBucket{
+			Start: acc.start, End: acc.start.Add(size), Count: acc.count,
+			Min: floatFixturePtr(acc.min), Max: floatFixturePtr(acc.max),
+			Avg: &avg, Last: &last,
+		})
+	}
+	sort.Slice(series.Buckets, func(i, j int) bool {
+		return series.Buckets[i].Start.Before(series.Buckets[j].Start)
+	})
+	series.Unit = latestUnit
+	return series, nil
+}
+
+// ReadingsMetrics 实现 store.Store。
+func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, ok := s.users[userID]
+	if !ok {
+		return model.ReadingMetrics{}, store.ErrNotFound
+	}
+	d, ok := data.byKey[deviceKey(platform, externalID)]
+	if !ok || d.DeletedAt != nil {
+		return model.ReadingMetrics{}, store.ErrNotFound
+	}
+
+	result := model.ReadingMetrics{Items: make([]model.ReadingMetric, 0)}
+	type summary struct {
+		count   int64
+		firstAt time.Time
+		lastAt  time.Time
+		lastID  string
+		unit    string
+	}
+	byMetric := map[string]*summary{}
+	for id, rec := range data.readings {
+		if rec.platform != platform || rec.externalID != externalID {
+			continue
+		}
+		item, ok := byMetric[rec.metric]
+		if !ok {
+			item = &summary{count: 0, firstAt: rec.recordedAt, lastAt: rec.recordedAt, lastID: id, unit: rec.unit}
+			byMetric[rec.metric] = item
+		}
+		item.count++
+		if rec.recordedAt.Before(item.firstAt) {
+			item.firstAt = rec.recordedAt
+		}
+		if rec.recordedAt.After(item.lastAt) || (rec.recordedAt.Equal(item.lastAt) && id > item.lastID) {
+			item.lastAt, item.lastID, item.unit = rec.recordedAt, id, rec.unit
+		}
+	}
+	for metric, item := range byMetric {
+		result.Items = append(result.Items, model.ReadingMetric{
+			Metric: metric, Unit: item.unit, Count: item.count,
+			FirstAt: item.firstAt.UTC(), LastAt: item.lastAt.UTC(),
+		})
+	}
+	sort.Slice(result.Items, func(i, j int) bool {
+		if !result.Items[i].LastAt.Equal(result.Items[j].LastAt) {
+			return result.Items[i].LastAt.After(result.Items[j].LastAt)
+		}
+		return result.Items[i].Metric < result.Items[j].Metric
+	})
+	return result, nil
+}
+
+func floatFixturePtr(v float64) *float64 { return &v }
+
 // beforeCursor 判断 (at, id) 是否严格早于游标位置，用于倒序分页。
 func beforeCursor(at time.Time, id string, cursorAt time.Time, cursorID uuid.UUID) bool {
 	if !at.Equal(cursorAt) {

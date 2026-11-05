@@ -310,6 +310,128 @@ func (s *Store) CleanupReadings(ctx context.Context, before time.Time) (int64, e
 	return n, nil
 }
 
+// bucketIntervals 把对外枚举映射为 PostgreSQL interval 字面量。
+var bucketIntervals = map[string]string{
+	"1m": "1 minute",
+	"1h": "1 hour",
+	"1d": "1 day",
+}
+
+// ReadingsSeries 实现 store.Store。
+//
+// 使用单条 SQL + date_bin 做 UTC 对齐分桶，last 取桶内 recorded_at 最大的值。
+// 现有索引 (user_id, platform, external_id, metric, recorded_at DESC) 的列顺序与过滤条件完全匹配，
+// 无需新增覆盖索引。
+func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time, bucket string) (model.ReadingsSeries, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.ReadingsSeries{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	normMetric, err := validate.NormalizeMetric(metric)
+	if err != nil {
+		return model.ReadingsSeries{}, err
+	}
+	size, err := validate.NormalizeBucket(bucket)
+	if err != nil {
+		return model.ReadingsSeries{}, err
+	}
+	if _, err := validate.ValidateSeriesRange(from, to, size); err != nil {
+		return model.ReadingsSeries{}, err
+	}
+	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+		return model.ReadingsSeries{}, err
+	}
+
+	series := model.ReadingsSeries{
+		Metric: normMetric, Bucket: bucket, From: from.UTC(), To: to.UTC(),
+		Buckets: make([]model.ReadingsBucket, 0),
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			date_bin($7::interval, recorded_at, $8::timestamptz) AS bucket_start,
+			COUNT(*) AS count,
+			MIN(value) AS min_value,
+			MAX(value) AS max_value,
+			AVG(value) AS avg_value,
+			(ARRAY_AGG(value ORDER BY recorded_at DESC, id DESC))[1] AS last_value,
+			(ARRAY_AGG(unit ORDER BY recorded_at DESC, id DESC))[1] AS last_unit
+		FROM readings
+		WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND metric = $4
+		  AND recorded_at >= $5 AND recorded_at <= $6
+		GROUP BY bucket_start
+		ORDER BY bucket_start ASC`,
+		uid, platform, externalID, normMetric, from.UTC(), to.UTC(),
+		bucketIntervals[bucket], "2000-01-01T00:00:00Z")
+	if err != nil {
+		return model.ReadingsSeries{}, fmt.Errorf("聚合读数序列失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item model.ReadingsBucket
+		var minV, maxV, avgV, lastV sql.NullFloat64
+		var lastUnit string
+		if err := rows.Scan(&item.Start, &item.Count, &minV, &maxV, &avgV, &lastV, &lastUnit); err != nil {
+			return model.ReadingsSeries{}, fmt.Errorf("解析读数序列失败: %w", err)
+		}
+		item.Start = item.Start.UTC()
+		item.End = item.Start.Add(size)
+		item.Min = floatPtr(minV.Float64)
+		item.Max = floatPtr(maxV.Float64)
+		item.Avg = floatPtr(avgV.Float64)
+		item.Last = floatPtr(lastV.Float64)
+		series.Buckets = append(series.Buckets, item)
+		series.Unit = lastUnit
+	}
+	if err := rows.Err(); err != nil {
+		return model.ReadingsSeries{}, fmt.Errorf("遍历读数序列失败: %w", err)
+	}
+	return series, nil
+}
+
+// ReadingsMetrics 实现 store.Store。
+//
+// unit 取该指标最近一条读数的单位；排序按 lastAt 倒序，同一时间按 metric 升序保证稳定。
+func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.ReadingMetrics{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+		return model.ReadingMetrics{}, err
+	}
+
+	result := model.ReadingMetrics{Items: make([]model.ReadingMetric, 0)}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT metric,
+			(ARRAY_AGG(unit ORDER BY recorded_at DESC, id DESC))[1] AS last_unit,
+			COUNT(*) AS count,
+			MIN(recorded_at) AS first_at,
+			MAX(recorded_at) AS last_at
+		FROM readings
+		WHERE user_id = $1 AND platform = $2 AND external_id = $3
+		GROUP BY metric
+		ORDER BY last_at DESC, metric ASC`, uid, platform, externalID)
+	if err != nil {
+		return model.ReadingMetrics{}, fmt.Errorf("查询指标清单失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item model.ReadingMetric
+		if err := rows.Scan(&item.Metric, &item.Unit, &item.Count, &item.FirstAt, &item.LastAt); err != nil {
+			return model.ReadingMetrics{}, fmt.Errorf("解析指标清单失败: %w", err)
+		}
+		item.FirstAt = item.FirstAt.UTC()
+		item.LastAt = item.LastAt.UTC()
+		result.Items = append(result.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.ReadingMetrics{}, fmt.Errorf("遍历指标清单失败: %w", err)
+	}
+	return result, nil
+}
+
 // ensureUserDevice 校验设备属于当前用户且未删除；否则返回 ErrNotFound（含越权）。
 func (s *Store) ensureUserDevice(ctx context.Context, uid uuid.UUID, platform, externalID string) error {
 	var exists bool

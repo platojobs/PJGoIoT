@@ -21,6 +21,7 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/model"
 	"github.com/platojobs/PJGoIoT/internal/store"
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
+	"github.com/platojobs/PJGoIoT/internal/validate"
 )
 
 // TestPostgresStoreIntegration 需要真实 PostgreSQL，通过 TEST_DATABASE_URL 启用。
@@ -598,6 +599,158 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		kept, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Limit: 10})
 		if err != nil || len(kept.Items) != 5 {
 			t.Fatalf("清理误删近期数据: len=%d err=%v", len(kept.Items), err)
+		}
+	})
+	t.Run("读数分桶序列与指标清单", func(t *testing.T) {
+		const external = "AA:BB:CC:00:00:0B"
+		ctx := context.Background()
+
+		// 固定 UTC 时间，跨整点与跨日边界各有读数，便于断言 UTC 对齐。
+		day := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+		mk := func(metric string, value float64, unit string, at time.Time) model.PushReading {
+			return model.PushReading{
+				ID: uuid.NewString(), Platform: "android", ExternalID: external,
+				Metric: metric, Value: value, Unit: unit, RecordedAt: at,
+			}
+		}
+		readings := []model.PushReading{
+			mk("temperature_celsius", 10, "celsius", day.Add(59*time.Minute)),
+			mk("temperature_celsius", 20, "celsius", day.Add(1*time.Hour)),
+			mk("temperature_celsius", 30, "fahrenheit", day.Add(90*time.Minute)),
+			mk("temperature_celsius", 40, "celsius", day.Add(1*time.Hour+59*time.Minute)),
+			mk("temperature_celsius", 50, "celsius", day.Add(2*time.Hour)),
+			mk("temperature_celsius", 60, "celsius", day.Add(24*time.Hour)),
+			mk("relative_humidity", 55, "%", day.Add(27*time.Hour)),
+		}
+		if _, _, err := st.Push(ctx, userB, model.PushRequest{
+			ClientID: "series-it",
+			Devices: []model.PushDevice{{
+				ID: uuid.NewString(), MAC: external, Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now,
+			}},
+			Readings: readings,
+		}, store.PushOptions{}); err != nil {
+			t.Fatalf("序列测试数据写入失败: %v", err)
+		}
+
+		// 1h：按整点对齐，只返回有数据的桶；桶内 min/max/avg/last 全部来自单条 SQL。
+		oneHour, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day, day.Add(3*time.Hour), "1h")
+		if err != nil {
+			t.Fatalf("1h 序列失败: %v", err)
+		}
+		if oneHour.Bucket != "1h" || oneHour.Metric != "temperature_celsius" || oneHour.Unit != "celsius" {
+			t.Fatalf("1h 元信息异常: %+v", oneHour)
+		}
+		if len(oneHour.Buckets) != 3 {
+			t.Fatalf("1h 桶数=%d，期望 3", len(oneHour.Buckets))
+		}
+		starts := []time.Time{day, day.Add(time.Hour), day.Add(2 * time.Hour)}
+		for i, b := range oneHour.Buckets {
+			if !b.Start.Equal(starts[i]) || !b.End.Equal(starts[i].Add(time.Hour)) {
+				t.Fatalf("1h 第 %d 桶边界异常: start=%s end=%s", i, b.Start, b.End)
+			}
+		}
+		b1 := oneHour.Buckets[1]
+		if b1.Count != 3 || *b1.Min != 20 || *b1.Max != 40 || *b1.Avg != 30 || *b1.Last != 40 {
+			t.Fatalf("1h 桶内聚合异常: %+v", b1)
+		}
+		if oneHour.Buckets[0].Count != 1 || *oneHour.Buckets[0].Last != 10 ||
+			oneHour.Buckets[2].Count != 1 || *oneHour.Buckets[2].Last != 50 {
+			t.Fatalf("1h 边界桶异常: %+v", oneHour.Buckets)
+		}
+
+		// 1d：对齐 UTC 零点；10-31T00:00Z 的读数归入 10-31 桶，计数与原始条数一致。
+		oneDay, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day, day.Add(48*time.Hour), "1d")
+		if err != nil {
+			t.Fatalf("1d 序列失败: %v", err)
+		}
+		if len(oneDay.Buckets) != 2 {
+			t.Fatalf("1d 桶数=%d，期望 2", len(oneDay.Buckets))
+		}
+		d0, d1 := oneDay.Buckets[0], oneDay.Buckets[1]
+		if !d0.Start.Equal(day) || !d0.End.Equal(day.Add(24*time.Hour)) ||
+			!d1.Start.Equal(day.Add(24*time.Hour)) || !d1.End.Equal(day.Add(48*time.Hour)) {
+			t.Fatalf("1d 桶边界异常: %+v", oneDay.Buckets)
+		}
+		if d0.Count != 5 || *d0.Min != 10 || *d0.Max != 50 || *d0.Avg != 30 || *d0.Last != 50 {
+			t.Fatalf("10-30 桶异常: %+v", d0)
+		}
+		if d1.Count != 1 || *d1.Min != 60 || *d1.Max != 60 || *d1.Avg != 60 || *d1.Last != 60 {
+			t.Fatalf("10-31 桶异常: %+v", d1)
+		}
+		if sum := d0.Count + d1.Count; sum != int64(len(readings)-1) {
+			t.Fatalf("分桶计数合计=%d，原始温度读数=%d", sum, len(readings)-1)
+		}
+
+		// 空区间返回空 buckets，而不是 404 或 null。
+		emptySeries, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day.Add(-48*time.Hour), day.Add(-24*time.Hour), "1h")
+		if err != nil {
+			t.Fatalf("空区间失败: %v", err)
+		}
+		if len(emptySeries.Buckets) != 0 {
+			t.Fatalf("空区间 buckets=%+v", emptySeries.Buckets)
+		}
+
+		// 非法参数在存储层同样被拒绝，供 HTTP 层映射为 400。
+		if _, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day, day.Add(time.Hour), "5m"); !errors.Is(err, validate.ErrInvalidBucket) {
+			t.Fatalf("非法 bucket err=%v", err)
+		}
+		if _, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day.Add(-100*24*time.Hour), day, "1h"); !errors.Is(err, validate.ErrInvalidSeriesRange) {
+			t.Fatalf("超 90 天 err=%v", err)
+		}
+		if _, err := st.ReadingsSeries(ctx, userB, "android", external, "temperature_celsius",
+			day, day.Add(10*time.Hour), "1m"); !errors.Is(err, validate.ErrTooManyBuckets) {
+			t.Fatalf("超 500 桶 err=%v", err)
+		}
+
+		// 跨用户与不存在设备统一 404。
+		if _, err := st.ReadingsSeries(ctx, userA, "android", external, "temperature_celsius",
+			day, day.Add(3*time.Hour), "1h"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("跨用户序列 err=%v", err)
+		}
+		if _, err := st.ReadingsSeries(ctx, userB, "android", "AA:BB:CC:00:00:0C", "temperature_celsius",
+			day, day.Add(3*time.Hour), "1h"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("不存在设备序列 err=%v", err)
+		}
+		if _, err := st.ReadingsMetrics(ctx, userA, "android", external); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("跨用户指标清单 err=%v", err)
+		}
+
+		// 指标清单：按 lastAt 倒序；unit 取最近一条；count/firstAt/lastAt 正确。
+		metrics, err := st.ReadingsMetrics(ctx, userB, "android", external)
+		if err != nil {
+			t.Fatalf("指标清单失败: %v", err)
+		}
+		if len(metrics.Items) != 2 {
+			t.Fatalf("指标数量=%d，期望 2", len(metrics.Items))
+		}
+		humidity, temp := metrics.Items[0], metrics.Items[1]
+		if humidity.Metric != "relative_humidity" || humidity.Unit != "%" || humidity.Count != 1 ||
+			!humidity.FirstAt.Equal(day.Add(27*time.Hour)) || !humidity.LastAt.Equal(day.Add(27*time.Hour)) {
+			t.Fatalf("湿度指标异常: %+v", humidity)
+		}
+		if temp.Metric != "temperature_celsius" || temp.Unit != "celsius" || temp.Count != 6 ||
+			!temp.FirstAt.Equal(day.Add(59*time.Minute)) || !temp.LastAt.Equal(day.Add(24*time.Hour)) {
+			t.Fatalf("温度指标异常: %+v", temp)
+		}
+
+		// 无读数的已注册设备：指标清单返回空数组。
+		const emptyDevice = "AA:BB:CC:00:00:0D"
+		if _, _, err := st.Push(ctx, userB, model.PushRequest{Devices: []model.PushDevice{{
+			ID: uuid.NewString(), MAC: emptyDevice, Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now,
+		}}}, store.PushOptions{}); err != nil {
+			t.Fatalf("空设备写入失败: %v", err)
+		}
+		emptyMetrics, err := st.ReadingsMetrics(ctx, userB, "android", emptyDevice)
+		if err != nil {
+			t.Fatalf("空调指标清单失败: %v", err)
+		}
+		if len(emptyMetrics.Items) != 0 {
+			t.Fatalf("空调指标清单=%+v", emptyMetrics.Items)
 		}
 	})
 }

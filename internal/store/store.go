@@ -74,6 +74,10 @@ type Store interface {
 	ListReadings(ctx context.Context, userID string, platform string, externalID string, q model.ReadingsQuery) (model.ReadingsPage, error)
 	// ReadingsSummary 聚合某设备在 [from, to] 内的读数；无数据时 count 为 0、数值为 nil。
 	ReadingsSummary(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time) (model.ReadingsSummary, error)
+	// ReadingsSeries 返回某指标在 [from, to] 内的 UTC 对齐分桶序列，按 start 升序，只含有数据的桶。
+	ReadingsSeries(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time, bucket string) (model.ReadingsSeries, error)
+	// ReadingsMetrics 返回设备的指标清单，按 lastAt 倒序；无数据时 items 为空数组。
+	ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error)
 	// CleanupReadings 删除 recorded_at 早于 before 的读数，返回删除条数。
 	CleanupReadings(ctx context.Context, before time.Time) (int64, error)
 }

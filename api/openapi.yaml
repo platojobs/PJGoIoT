@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -19,6 +19,8 @@ info:
     - 所有时间字段为 RFC 3339（UTC）。
     - 自 `0.4.0` 起支持设备测量读数（readings）：随 `/sync/push` 批量写入、按设备唯一键分页查询与聚合，
       服务端保留 90 天。读数按客户端生成的 `id` 幂等，不要求设备已存在于 `user_devices`。
+    - 自 `0.5.0` 起读数链路新增长周期分桶序列 `/readings/series` 与指标清单 `/readings/metrics`：
+      前者按 **UTC** 对齐做 `1m`/`1h`/`1d` 聚合，后者列出设备已上报的指标及其计数与时间范围。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -50,7 +52,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.4.0"
+                version: "0.5.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -464,6 +466,135 @@ paths:
                 windowEnd: "2026-11-05T01:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /my/devices/{platform}/{externalId}/readings/series:
+    get:
+      tags: [user]
+      operationId: getDeviceReadingsSeries
+      summary: 某设备指定指标的长周期分桶序列
+      description: |
+        把任意时间范围内的读数聚合为固定粒度的桶，逐桶返回 `count`/`min`/`max`/`avg`/`last`。
+
+        - `metric`、`from`、`to`、`bucket` 均 **必填**，缺失或非法返回 400；
+        - `bucket` 只能是 `1m`、`1h`、`1d`；
+        - `from`/`to` 为 RFC3339，闭区间（`recordedAt >= from && recordedAt <= to`），要求 `to > from`；
+        - 时间跨度上限 **90 天**（与服务端保留期一致），超出返回 400；
+        - 单次最多返回 **500** 个桶；参数会产生的桶数超过 500 时返回 400，提示改用更粗的 `bucket` 或缩短范围；
+        - 桶边界按 **UTC** 对齐：`1m` 对齐整分钟、`1h` 对齐整点、`1d` 对齐 UTC 零点（00:00:00Z），
+          与客户端本地时区和夏令时无关；`start` 为桶起点（含），`end = start + bucket`（不含）；
+        - 只返回 `count > 0` 的桶，按 `start` 升序；范围内无数据时 `buckets: []` 且 HTTP 200；
+        - `last` 为桶内 `recordedAt` 最大的读数值（同一时刻按 `id` 倒序取第一条）；
+        - 响应的 `unit` 取时间范围内最新一条读数的单位；
+        - 越权、设备已删除或设备不存在统一返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
+        - name: metric
+          in: query
+          required: true
+          description: 指标名，小写 snake_case，1–32 字符
+          schema:
+            type: string
+            example: temperature_celsius
+        - name: from
+          in: query
+          required: true
+          description: 起始时间（含），RFC3339，必须早于 `to`
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          description: 结束时间（含），RFC3339；与 `from` 的跨度不超过 90 天
+          schema:
+            type: string
+            format: date-time
+        - name: bucket
+          in: query
+          required: true
+          description: 分桶粒度，UTC 对齐
+          schema:
+            type: string
+            enum: ["1m", "1h", "1d"]
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadingsSeries"
+              example:
+                metric: temperature_celsius
+                unit: celsius
+                bucket: 1h
+                from: "2026-11-04T00:00:00Z"
+                to: "2026-11-05T00:00:00Z"
+                buckets:
+                  - start: "2026-11-04T01:00:00Z"
+                    end: "2026-11-04T02:00:00Z"
+                    count: 12
+                    min: 20.9
+                    max: 21.8
+                    avg: 21.35
+                    last: 21.8
+                  - start: "2026-11-04T02:00:00Z"
+                    end: "2026-11-04T03:00:00Z"
+                    count: 5
+                    min: 21.0
+                    max: 21.4
+                    avg: 21.2
+                    last: 21.1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /my/devices/{platform}/{externalId}/readings/metrics:
+    get:
+      tags: [user]
+      operationId: listDeviceReadingMetrics
+      summary: 某设备已上报的指标清单
+      description: |
+        返回该设备出现过的全部指标，按 `lastAt` **倒序**（同一 `lastAt` 时按 `metric` 升序）。
+
+        - `count` 为该指标的读数总数，`firstAt`/`lastAt` 为最早/最晚的 `recordedAt`；
+        - `unit` 为该指标最近一条读数（`recordedAt` 最大）的单位；同一指标存在多个单位时，
+          客户端应以此单位展示（历史读数可能使用旧单位）；
+        - 设备已注册但从未上报读数时 `items: []` 且 HTTP 200；
+        - 越权、设备已删除或设备不存在统一返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadingMetrics"
+              example:
+                items:
+                  - metric: relative_humidity
+                    unit: "%"
+                    count: 42
+                    firstAt: "2026-11-01T00:00:00Z"
+                    lastAt: "2026-11-04T23:59:00Z"
+                  - metric: temperature_celsius
+                    unit: celsius
+                    count: 168
+                    firstAt: "2026-10-30T00:00:00Z"
+                    lastAt: "2026-11-04T23:00:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1325,3 +1456,86 @@ components:
           type: string
           format: date-time
           description: now
+
+    ReadingsBucket:
+      type: object
+      required: [start, end, count, min, max, avg, last]
+      description: UTC 对齐的单个时间桶；只出现在 `count > 0` 的桶。
+      properties:
+        start:
+          type: string
+          format: date-time
+          description: 桶起点（含），UTC 对齐
+        end:
+          type: string
+          format: date-time
+          description: 桶终点（不含）= start + bucket
+        count:
+          type: integer
+          format: int64
+        min:
+          type: number
+          format: double
+        max:
+          type: number
+          format: double
+        avg:
+          type: number
+          format: double
+        last:
+          type: number
+          format: double
+          description: 桶内 `recordedAt` 最大的值
+
+    ReadingsSeries:
+      type: object
+      required: [metric, unit, bucket, from, to, buckets]
+      description: 按 `start` 升序；只含有数据的桶，无数据时 `buckets` 为空数组。
+      properties:
+        metric:
+          type: string
+        unit:
+          type: string
+          description: 时间范围内最新一条读数的单位；无数据时为空串
+        bucket:
+          type: string
+          enum: ["1m", "1h", "1d"]
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReadingsBucket"
+
+    ReadingMetric:
+      type: object
+      required: [metric, unit, count, firstAt, lastAt]
+      properties:
+        metric:
+          type: string
+        unit:
+          type: string
+          description: 该指标最近一条读数的单位（多单位时以此为准）
+        count:
+          type: integer
+          format: int64
+        firstAt:
+          type: string
+          format: date-time
+        lastAt:
+          type: string
+          format: date-time
+
+    ReadingMetrics:
+      type: object
+      required: [items]
+      description: 按 `lastAt` 倒序（同一时间按 `metric` 升序）；无数据时 `items` 为空数组。
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReadingMetric"

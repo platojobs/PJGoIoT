@@ -188,6 +188,43 @@ type ReadingsQuery struct {
 	Cursor string
 }
 
+// ReadingsBucket 是一个时间桶的聚合结果；Last 是桶内 recordedAt 最新的值。
+type ReadingsBucket struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+	Count int64     `json:"count"`
+	Min   *float64  `json:"min"`
+	Max   *float64  `json:"max"`
+	Avg   *float64  `json:"avg"`
+	Last  *float64  `json:"last"`
+}
+
+// ReadingsSeries 是 GET .../readings/series 的响应体。
+// 桶按 start 升序，且只包含 count>0 的桶；无数据时 Buckets 为空数组。
+type ReadingsSeries struct {
+	Metric  string           `json:"metric"`
+	Unit    string           `json:"unit"`
+	Bucket  string           `json:"bucket"`
+	From    time.Time        `json:"from"`
+	To      time.Time        `json:"to"`
+	Buckets []ReadingsBucket `json:"buckets"`
+}
+
+// ReadingMetric 是指标清单中的一项。
+// Unit 取该指标最近一条读数的单位；FirstAt / LastAt 为该指标的记录时间范围。
+type ReadingMetric struct {
+	Metric  string    `json:"metric"`
+	Unit    string    `json:"unit"`
+	Count   int64     `json:"count"`
+	FirstAt time.Time `json:"firstAt"`
+	LastAt  time.Time `json:"lastAt"`
+}
+
+// ReadingMetrics 是 GET .../readings/metrics 的响应体，按 LastAt 倒序。
+type ReadingMetrics struct {
+	Items []ReadingMetric `json:"items"`
+}
+
 // PushRequest 是 POST /sync/push 的请求体。
 // Readings 自 v0.4.0 起可选；缺失时行为与旧客户端完全一致。
 type PushRequest struct {

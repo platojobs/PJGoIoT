@@ -60,6 +60,14 @@ type readingsSummaryQuery struct {
 	Hours  *int   `form:"hours" binding:"omitempty,min=1,max=2160"`
 }
 
+// readingsSeriesQuery 是读数分桶序列的查询参数；必填项在 handler 内逐项校验。
+type readingsSeriesQuery struct {
+	Metric string `form:"metric"`
+	From   string `form:"from"`
+	To     string `form:"to"`
+	Bucket string `form:"bucket"`
+}
+
 // pushPayload 是 POST /sync/push 的请求 DTO，利用 validator 标签做基础校验。
 // devices 与 readings 至少有一个非空，两者都缺省或都为空时返回 400。
 type pushPayload struct {

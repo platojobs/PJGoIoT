@@ -110,6 +110,81 @@ func (s *Server) handleReadingsSummary(c *gin.Context, rawPlatform, rawExternalI
 	c.JSON(http.StatusOK, summary)
 }
 
+// handleReadingsSeries 处理 GET /my/devices/{platform}/{externalId}/readings/series。
+// 时间桶按 UTC 网格对齐（1h 整点、1d UTC 零点）；桶数上限 500、跨度上限 90 天。
+func (s *Server) handleReadingsSeries(c *gin.Context, rawPlatform, rawExternalID string) {
+	platform, externalID, ok := s.resolveReadingsDeviceKey(c, rawPlatform, rawExternalID)
+	if !ok {
+		return
+	}
+
+	var query readingsSeriesQuery
+	if err := c.ShouldBindQuery(&query); err != nil {
+		failValidation(c, err)
+		return
+	}
+	if strings.TrimSpace(query.Metric) == "" {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "metric 不能为空")
+		return
+	}
+	metric, err := validate.NormalizeMetric(query.Metric)
+	if err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "metric 不合法: "+err.Error())
+		return
+	}
+	size, err := validate.NormalizeBucket(query.Bucket)
+	if err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "bucket 不合法: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(query.From) == "" || strings.TrimSpace(query.To) == "" {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "from 与 to 必填（RFC3339）")
+		return
+	}
+	from, err := time.Parse(time.RFC3339, query.From)
+	if err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "from 必须是 RFC3339 时间")
+		return
+	}
+	to, err := time.Parse(time.RFC3339, query.To)
+	if err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "to 必须是 RFC3339 时间")
+		return
+	}
+	if _, err := validate.ValidateSeriesRange(from, to, size); err != nil {
+		fail(c, http.StatusBadRequest, CodeBadRequest, err.Error())
+		return
+	}
+
+	series, err := s.store.ReadingsSeries(c.Request.Context(), userID(c), platform, externalID, metric, from, to, query.Bucket)
+	if err != nil {
+		s.storeFailure(c, "查询读数序列失败", err)
+		return
+	}
+	if series.Buckets == nil {
+		series.Buckets = []model.ReadingsBucket{}
+	}
+	c.JSON(http.StatusOK, series)
+}
+
+// handleReadingsMetrics 处理 GET /my/devices/{platform}/{externalId}/readings/metrics。
+func (s *Server) handleReadingsMetrics(c *gin.Context, rawPlatform, rawExternalID string) {
+	platform, externalID, ok := s.resolveReadingsDeviceKey(c, rawPlatform, rawExternalID)
+	if !ok {
+		return
+	}
+
+	result, err := s.store.ReadingsMetrics(c.Request.Context(), userID(c), platform, externalID)
+	if err != nil {
+		s.storeFailure(c, "查询指标清单失败", err)
+		return
+	}
+	if result.Items == nil {
+		result.Items = []model.ReadingMetric{}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 // resolveReadingsDeviceKey 校验路径中的设备键；非法时写 400 并返回 false。
 func (s *Server) resolveReadingsDeviceKey(c *gin.Context, rawPlatform, rawExternalID string) (string, string, bool) {
 	platform, err := validate.NormalizePlatform(rawPlatform)

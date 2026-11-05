@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -371,6 +372,214 @@ func getSummary(t *testing.T, h http.Handler, token, path string) readingsSummar
 	var out readingsSummary
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("解析 summary 失败: %v body=%s", err, rec.Body.String())
+	}
+	return out
+}
+
+type readingsSeries struct {
+	Metric  string `json:"metric"`
+	Unit    string `json:"unit"`
+	Bucket  string `json:"bucket"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Buckets []struct {
+		Start string   `json:"start"`
+		End   string   `json:"end"`
+		Count int64    `json:"count"`
+		Min   *float64 `json:"min"`
+		Max   *float64 `json:"max"`
+		Avg   *float64 `json:"avg"`
+		Last  *float64 `json:"last"`
+	} `json:"buckets"`
+}
+
+type readingsMetrics struct {
+	Items []struct {
+		Metric  string `json:"metric"`
+		Unit    string `json:"unit"`
+		Count   int64  `json:"count"`
+		FirstAt string `json:"firstAt"`
+		LastAt  string `json:"lastAt"`
+	} `json:"items"`
+}
+
+// TestReadingsSeries 覆盖 UTC 分桶对齐、桶内聚合、空区间与参数校验。
+func TestReadingsSeries(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+
+	base := time.Date(2026, 10, 30, 23, 10, 0, 0, time.UTC)
+	readings := []string{
+		readingJSON("a1111111-1111-4111-8111-111111111111", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "10", "celsius", base),
+		readingJSON("a2222222-2222-4222-8222-222222222222", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "20", "celsius", base.Add(30*time.Minute)),
+		readingJSON("a3333333-3333-4333-8333-333333333333", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "30", "celsius", time.Date(2026, 10, 31, 0, 5, 0, 0, time.UTC)),
+		readingJSON("a4444444-4444-4444-8444-444444444444", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "40", "celsius", time.Date(2026, 10, 31, 0, 55, 0, 0, time.UTC)),
+		readingJSON("a5555555-5555-4555-8555-555555555555", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "50", "fahrenheit", time.Date(2026, 11, 1, 0, 20, 0, 0, time.UTC)),
+	}
+	body := pushBody(t, "["+deviceJSON("b1111111-1111-4111-8111-111111111111", "AA:BB:CC:00:00:01", base)+"]", readings)
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 1h：跨整点分桶，桶内 min/max/avg/last 与 count 正确。
+	path := "/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/series?" +
+		"metric=temperature_celsius&bucket=1h&from=2026-10-30T23:00:00Z&to=2026-10-31T00:59:00Z"
+	series := getSeries(t, h, user.Token, path)
+	if len(series.Buckets) != 2 {
+		t.Fatalf("1h 桶数=%d", len(series.Buckets))
+	}
+	first := series.Buckets[0]
+	if first.Start != "2026-10-30T23:00:00Z" || first.End != "2026-10-31T00:00:00Z" {
+		t.Fatalf("1h 桶未按 UTC 整点对齐: start=%s end=%s", first.Start, first.End)
+	}
+	if first.Count != 2 || *first.Min != 10 || *first.Max != 20 || *first.Avg != 15 || *first.Last != 20 {
+		t.Fatalf("1h 首桶聚合错误: %+v", first)
+	}
+	second := series.Buckets[1]
+	if second.Start != "2026-10-31T00:00:00Z" || second.Count != 2 ||
+		*second.Min != 30 || *second.Max != 40 || *second.Avg != 35 || *second.Last != 40 {
+		t.Fatalf("1h 次桶聚合错误: %+v", second)
+	}
+	if series.Unit != "celsius" {
+		t.Fatalf("序列单位应取窗口内最新读数: %s", series.Unit)
+	}
+
+	// 1d：对齐 UTC 零点，跨日边界正确，且只返回有数据的桶。
+	dayPath := "/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/series?" +
+		"metric=temperature_celsius&bucket=1d&from=2026-10-30T00:00:00Z&to=2026-11-02T23:59:59Z"
+	days := getSeries(t, h, user.Token, dayPath)
+	if len(days.Buckets) != 3 {
+		t.Fatalf("1d 桶数=%d（空桶不应返回）", len(days.Buckets))
+	}
+	for i, want := range []string{"2026-10-30T00:00:00Z", "2026-10-31T00:00:00Z", "2026-11-01T00:00:00Z"} {
+		ends := []string{"2026-10-31T00:00:00Z", "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"}
+		if days.Buckets[i].Start != want || days.Buckets[i].End != ends[i] {
+			t.Fatalf("1d 桶 %d start=%s end=%s", i, days.Buckets[i].Start, days.Buckets[i].End)
+		}
+	}
+	if days.Buckets[0].Count != 2 || days.Buckets[1].Count != 2 || days.Buckets[2].Count != 1 {
+		t.Fatalf("1d 桶 count 错误: %+v", days.Buckets)
+	}
+	if days.Buckets[2].Last == nil || *days.Buckets[2].Last != 50 || days.Buckets[2].Min == nil || *days.Buckets[2].Min != 50 {
+		t.Fatalf("1d 单值桶聚合错误: %+v", days.Buckets[2])
+	}
+
+	// 空区间返回 []。
+	empty := getSeries(t, h, user.Token,
+		"/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/series?metric=relative_humidity&bucket=1h&from=2026-10-30T00:00:00Z&to=2026-10-31T00:00:00Z")
+	if empty.Buckets == nil || len(empty.Buckets) != 0 {
+		t.Fatalf("空区间应返回空数组: %+v", empty.Buckets)
+	}
+
+	// 参数校验。
+	cases := []struct{ name, query string }{
+		{"缺少 metric", "bucket=1h&from=2026-10-30T00:00:00Z&to=2026-10-31T00:00:00Z"},
+		{"缺少 from", "metric=temperature_celsius&bucket=1h&to=2026-10-31T00:00:00Z"},
+		{"缺少 to", "metric=temperature_celsius&bucket=1h&from=2026-10-30T00:00:00Z"},
+		{"非法 bucket", "metric=temperature_celsius&bucket=5m&from=2026-10-30T00:00:00Z&to=2026-10-31T00:00:00Z"},
+		{"to 不大于 from", "metric=temperature_celsius&bucket=1h&from=2026-10-31T00:00:00Z&to=2026-10-31T00:00:00Z"},
+		{"跨度超 90 天", "metric=temperature_celsius&bucket=1d&from=2026-07-25T00:00:00Z&to=2026-10-31T00:00:00Z"},
+		{"桶数超 500", "metric=temperature_celsius&bucket=1m&from=2026-10-20T00:00:00Z&to=2026-10-22T00:00:00Z"},
+		{"非法时间", "metric=temperature_celsius&bucket=1h&from=yesterday&to=2026-10-31T00:00:00Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, http.MethodGet,
+				"/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/series?"+tc.query, "", user.Token, nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if tc.name == "桶数超 500" && !bytes.Contains(rec.Body.Bytes(), []byte("更粗")) {
+				t.Fatalf("桶数超限未提示更粗粒度: %s", rec.Body.String())
+			}
+		})
+	}
+
+	// 跨用户与不存在设备 404。
+	other := newUser(t, h)
+	if rec := do(t, h, http.MethodGet, path, "", other.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("跨用户 series status=%d", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet,
+		"/api/v1/my/devices/android/AA:BB:CC:00:00:02/readings/series?"+
+			"metric=temperature_celsius&bucket=1h&from=2026-10-30T00:00:00Z&to=2026-10-31T00:00:00Z",
+		"", user.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在设备 series status=%d", rec.Code)
+	}
+}
+
+// TestReadingsMetrics 覆盖指标清单的计数、单位与倒序。
+func TestReadingsMetrics(t *testing.T) {
+	h := newHandler(t, 0)
+	user := newUser(t, h)
+
+	base := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+	readings := []string{
+		readingJSON("c1111111-1111-4111-8111-111111111111", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "20", "celsius", base),
+		readingJSON("c2222222-2222-4222-8222-222222222222", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "21", "celsius", base.Add(10*time.Minute)),
+		readingJSON("c3333333-3333-4333-8333-333333333333", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "22", "fahrenheit", base.Add(20*time.Minute)),
+		readingJSON("c4444444-4444-4444-8444-444444444444", "android", "AA:BB:CC:00:00:01", "relative_humidity", "40", "percent", base.Add(30*time.Minute)),
+		readingJSON("c5555555-5555-4555-8555-555555555555", "android", "AA:BB:CC:00:00:01", "relative_humidity", "45", "percent", base.Add(40*time.Minute)),
+	}
+	body := pushBody(t, "["+deviceJSON("d1111111-1111-4111-8111-111111111111", "AA:BB:CC:00:00:01", base)+"]", readings)
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	metrics := getMetrics(t, h, user.Token, "/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/metrics")
+	if len(metrics.Items) != 2 {
+		t.Fatalf("指标数量=%d", len(metrics.Items))
+	}
+	if metrics.Items[0].Metric != "relative_humidity" || metrics.Items[0].Count != 2 ||
+		metrics.Items[0].Unit != "percent" ||
+		metrics.Items[0].FirstAt != "2026-10-31T10:30:00Z" || metrics.Items[0].LastAt != "2026-10-31T10:40:00Z" {
+		t.Fatalf("首项指标错误: %+v", metrics.Items[0])
+	}
+	if metrics.Items[1].Metric != "temperature_celsius" || metrics.Items[1].Count != 3 ||
+		metrics.Items[1].Unit != "fahrenheit" ||
+		metrics.Items[1].FirstAt != "2026-10-31T10:00:00Z" || metrics.Items[1].LastAt != "2026-10-31T10:20:00Z" {
+		t.Fatalf("次项指标错误: %+v", metrics.Items[1])
+	}
+
+	// 无数据返回空数组。
+	other := newUser(t, h)
+	body = pushBody(t, `[{"id":"e1111111-1111-4111-8111-111111111111","platform":"ios","externalId":"e2222222-2222-4222-8222-222222222222","updatedAt":"`+base.Format(time.RFC3339)+`"}]`, nil)
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, other.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("注册空设备 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	empty := getMetrics(t, h, other.Token, "/api/v1/my/devices/ios/e2222222-2222-4222-8222-222222222222/readings/metrics")
+	if empty.Items == nil || len(empty.Items) != 0 {
+		t.Fatalf("无数据应返回空数组: %+v", empty.Items)
+	}
+
+	// 跨用户 404。
+	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/AA:BB:CC:00:00:01/readings/metrics", "", other.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("跨用户 metrics status=%d", rec.Code)
+	}
+}
+
+func getSeries(t *testing.T, h http.Handler, token, path string) readingsSeries {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, path, "", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s status=%d body=%s", path, rec.Code, rec.Body.String())
+	}
+	var out readingsSeries
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析 series 失败: %v body=%s", err, rec.Body.String())
+	}
+	return out
+}
+
+func getMetrics(t *testing.T, h http.Handler, token, path string) readingsMetrics {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, path, "", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s status=%d body=%s", path, rec.Code, rec.Body.String())
+	}
+	var out readingsMetrics
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析 metrics 失败: %v body=%s", err, rec.Body.String())
 	}
 	return out
 }

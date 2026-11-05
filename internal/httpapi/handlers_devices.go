@@ -186,6 +186,10 @@ func (s *Server) handleMyDeviceRoute(c *gin.Context) {
 		s.handleReadingsList(c, parts[0], parts[1])
 	case len(parts) == 4 && parts[2] == "readings" && parts[3] == "summary":
 		s.handleReadingsSummary(c, parts[0], parts[1])
+	case len(parts) == 4 && parts[2] == "readings" && parts[3] == "series":
+		s.handleReadingsSeries(c, parts[0], parts[1])
+	case len(parts) == 4 && parts[2] == "readings" && parts[3] == "metrics":
+		s.handleReadingsMetrics(c, parts[0], parts[1])
 	default:
 		fail(c, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 	}
