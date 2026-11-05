@@ -1332,6 +1332,7 @@ seed 数据来源与边界：
 | v0.15.0 HTTP 层结构同步 | 通过：`TestSyncChangesHouseholdStructure` 经 fixture 走完整 HTTP 链路（建房→邀请→建房→改名→移除→改名），验证两个账号 `GET /sync/changes` 的条目与可见性 |
 | v0.15.0 迁移 | 本轮无 schema 变更（`change_log` 已有 `user_id`/`entity`/`entity_id` 列），未新增迁移；版本保持 `000012` |
 | v0.15.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.11.0** |
+| v0.15.0 CI | 通过：GitHub Actions [run 42058675285](https://github.com/platojobs/PJGoIoT/actions/runs/42058675285)，四个 job 全绿；日志确认 `TestHouseholdStructureChangesPostgres` 与 `TestHouseholdStructureChangesCursorExpiredPostgres` 在 `Postgres 集成测试` 中实际 PASS，`OpenAPI 契约校验` 步骤实际执行且读到 `version: 0.11.0` |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |

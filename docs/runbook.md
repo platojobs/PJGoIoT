@@ -65,6 +65,7 @@
 | v0.15.0 未知 entity | **已验证** | `TestSyncChangesUnknownEntityIgnoredByOldClient`：含 `household`/`room`/未来 entity 的响应可被老客户端解析并忽略，`nextCursor` 正常推进 |
 | v0.15.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.11.0 |
 | v0.15.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
+| v0.15.0 CI | **已验证** | GitHub Actions [run 42058675285](https://github.com/platojobs/PJGoIoT/actions/runs/42058675285) 四 job 全绿；日志确认 `TestHouseholdStructureChangesPostgres` / `...CursorExpiredPostgres` 实际 PASS，`OpenAPI 契约校验` 读到 `version: 0.11.0` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
