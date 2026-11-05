@@ -47,6 +47,8 @@
 | v0.12.0 家庭模型与回填 | **已验证** | 迁移 `000011` 在真实 PG 上 `up → down → up`：旧用户设备回填「我的家」、`room_id=NULL`；down 后家庭表与 2 个新列全部移除，再 up 结果一致 |
 | v0.12.0 家庭权限与共享 | **已验证** | 真实 PG `TestHouseholdSharingPostgres`：邀请码一次性/跨家庭 404、member 改名 403、member 改他人设备 404、成员可读设备与读数、删房间清空 `room_id`、删家庭设备回个人家庭；HTTP fixture 测试 `TestHouseholdLifecycleAndPermissions` 同样通过 |
 | v0.12.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → 0 error（13 条既有 warning） |
+| v0.12.0 CI | **已验证** | GitHub Actions [run 42037369419](https://github.com/platojobs/PJGoIoT/actions/runs/42037369419)：构建与测试、配置与脚本校验、smoke、镜像构建 4 job 全绿 |
+| v0.11.0 CI 补跑 | **已验证** | `v0.11-fix` [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向修复提交 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -1045,7 +1047,23 @@ Woohoo! Your API description is valid. 🎉
 You have 13 warnings.
 ```
 
-0 error；warning 均为既有的 info/tags/501/login 示例等问题，非本轮新增。
+0 error；warning 均为 info/tags/501/login 示例等非阻断类型（本轮新增 `household` tag 也触发 1 条 tag 描述缺失 warning），非本轮新代码错误。
+
+#### 9.11.5 CI（GitHub Actions）
+
+```text
+run 42037369419（main, c36db9a）
+构建与测试 success / 配置与脚本校验 success / 压测门槛（smoke） success / 构建镜像 success
+
+run 42037314989（v0.11-fix, 33839cf）
+全部 job success（v0.11.0 的 shellcheck 修复验证）
+```
+
+首次 v0.11.0 CI（run 42029098771）仅 `配置与脚本校验` 失败：
+shellcheck 对 `trap` 清理函数报 SC2317（不可达）与 SC2329（未调用），
+并对 `multi-instance-check.sh` 中未使用的 `APPLIED_IDS` 报 SC2034。
+修复方式：删除无用命令替换、在脚本头部声明
+`# shellcheck disable=SC2317,SC2329`（仅屏蔽 trap 回调误报）。
 
 ## 10. 本地栈自检步骤（可复现）
 

@@ -1227,7 +1227,9 @@ seed 数据来源与边界：
 | v0.11.0 限流真相 | 通过：`scripts/shared-rate-limit-check.sh`，memory 后端双实例放行 6/分钟（2 倍额度）；postgres 后端全局只放行 3 个，两个实例均返回 429 |
 | v0.12.0 家庭模型与迁移回填 | 通过（真实 PostgreSQL）：迁移 `000011` 在临时库上 `up → down → up`；旧账号自动获得「我的家」个人家庭与 owner 成员，设备 `household_id` 回填、`room_id` 为 NULL；down 后 4 张家庭表与 2 个新列全部移除，再 up 回填结果一致 |
 | v0.12.0 家庭共享与权限 | 通过（真实 PostgreSQL）：`TestHouseholdSharingPostgres` 覆盖邀请码一次性、跨家庭 404、member 改名 403、member 改他人设备 404、成员可读共享设备与读数、共享变更进入 `/sync/changes`、删房间清空 `roomId`、删家庭后设备回个人家庭；HTTP 层 `TestHouseholdLifecycleAndPermissions` 通过 |
-| v0.12.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条既有 warning）；契约版本 0.8.0 |
+| v0.12.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning：info/tags/示例类，本轮新增 `household` tag 触发 1 条描述缺失）；契约版本 0.8.0 |
+| v0.12.0 CI | 通过：GitHub Actions [run 42037369419](https://github.com/platojobs/PJGoIoT/actions/runs/42037369419)，`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` 4 个 job 全绿（commit `c36db9a`） |
+| v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
