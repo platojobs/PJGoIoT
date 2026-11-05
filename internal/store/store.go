@@ -30,13 +30,18 @@ var (
 	ErrForbidden = errors.New("没有操作权限")
 	// ErrHouseholdOwnerMustTransfer 表示 owner 在还有其他成员时不能退出/不能移除自己。
 	// HTTP 层映射为 409，并给出可读提示。
-	ErrHouseholdOwnerMustTransfer = errors.New("家庭还有其他成员，请先移除成员或转让家庭")
+	ErrHouseholdOwnerMustTransfer = errors.New("家庭还有其他成员，请先转让所有权或移除其他成员")
 	// ErrHouseholdOwnerCannotRemoveSelf 表示 owner 不能把自己移出家庭。
 	ErrHouseholdOwnerCannotRemoveSelf = errors.New("owner 不能移除自己")
 	// ErrPersonalHouseholdImmutable 表示个人家庭不支持退出等操作。
 	ErrPersonalHouseholdImmutable = errors.New("个人家庭不支持该操作")
 	// ErrRoomOrderMismatch 表示整段房间排序与当前房间集合不一致（缺项/多项/重复）。
 	ErrRoomOrderMismatch = errors.New("房间排序列表必须包含家庭内全部房间且不能重复")
+	// ErrHouseholdTargetNotMember 表示转让所有权的目标用户不是该家庭成员。
+	// HTTP 层映射为 404，与「跨家庭一律 404」保持一致，不暴露用户是否存在。
+	ErrHouseholdTargetNotMember = errors.New("目标用户不是该家庭成员")
+	// ErrHouseholdTargetAlreadyOwner 表示目标用户已经是该家庭 owner（转让给自己）。
+	ErrHouseholdTargetAlreadyOwner = errors.New("目标用户已经是该家庭 owner")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -123,6 +128,11 @@ type Store interface {
 	// LeaveHousehold 让成员自己退出；personal 家庭不可退出；owner 还有其他成员时返回 ErrHouseholdOwnerMustTransfer；
 	// owner 单独退出时家庭随之删除。
 	LeaveHousehold(ctx context.Context, userID string, householdID string) error
+	// TransferHouseholdOwnership 由 owner 把所有权转让给同家庭另一成员。
+	// 事务内同时改 household_members.role 与 households.owner_user_id，保证任意时刻恰好一个 owner。
+	// 个人家庭返回 ErrPersonalHouseholdImmutable；目标非成员返回 ErrHouseholdTargetNotMember；
+	// 目标是自己（已是 owner）返回 ErrHouseholdTargetAlreadyOwner；非 owner 调用返回 ErrForbidden。
+	TransferHouseholdOwnership(ctx context.Context, userID string, householdID string, targetUserID string) error
 	// CreateHouseholdInvitation 由 owner 签发一次性邀请码（只存哈希）。
 	CreateHouseholdInvitation(ctx context.Context, userID string, householdID string, codeHash string, expiresAt time.Time) (model.HouseholdInvitation, error)
 	// ListHouseholdInvitations 由 owner 查看未使用的邀请码；只返回哈希前缀与状态。

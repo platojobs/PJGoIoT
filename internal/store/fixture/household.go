@@ -193,7 +193,7 @@ func (s *Store) ListHouseholdMembers(ctx context.Context, userID string, househo
 	}
 	out := make([]model.HouseholdMember, 0, len(h.members))
 	for uid, role := range h.members {
-		m := model.HouseholdMember{UserID: uid, Role: role, Kind: "anonymous", JoinedAt: h.CreatedAt}
+		m := model.HouseholdMember{UserID: uid, Role: role, Kind: "anonymous", JoinedAt: h.CreatedAt, IsSelf: uid == userID}
 		if data, ok := s.users[uid]; ok {
 			m.Kind = data.kind
 			m.JoinedAt = data.createdAt
@@ -226,6 +226,37 @@ func (s *Store) RemoveHouseholdMember(ctx context.Context, userID string, househ
 	}
 	s.moveUserDevicesToPersonalLocked(targetUserID, householdID)
 	delete(h.members, targetUserID)
+	return nil
+}
+
+// TransferHouseholdOwnership 实现 store.Store。
+// 单机 fixture 用全局写锁串行化：并发转让只有第一笔成功，后到者角色已变为 member 而得到 ErrForbidden。
+func (s *Store) TransferHouseholdOwnership(ctx context.Context, userID string, householdID string, targetUserID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, err := s.requireHouseholdLocked(userID, householdID, false)
+	if err != nil {
+		return err
+	}
+	if h.members[userID] != "owner" {
+		return store.ErrForbidden
+	}
+	if h.Personal {
+		return store.ErrPersonalHouseholdImmutable
+	}
+	if targetUserID == userID {
+		return store.ErrHouseholdTargetAlreadyOwner
+	}
+	role, ok := h.members[targetUserID]
+	if !ok {
+		return store.ErrHouseholdTargetNotMember
+	}
+	if role == "owner" {
+		return store.ErrHouseholdTargetAlreadyOwner
+	}
+	h.members[userID] = "member"
+	h.members[targetUserID] = "owner"
+	h.OwnerUserID = targetUserID
 	return nil
 }
 

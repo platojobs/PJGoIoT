@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.13.0）
+# PJGoIoT 运行手册（v0.14.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -54,6 +54,11 @@
 | v0.13.0 迁移 000012 | **已验证** | 临时库 `up → down → up`：`household_invitations.id` 列与两个索引可正确增删，回填结果一致 |
 | v0.13.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.9.0 |
 | v0.13.0 CI | **已验证** | GitHub Actions [run 42042030047](https://github.com/platojobs/PJGoIoT/actions/runs/42042030047) 全绿；`构建与测试` 中 `OpenAPI 契约校验` 步骤实际执行并通过，`Postgres 集成测试` 正则含 `TestHouseholdManagementPostgres` |
+| v0.14.0 所有权转让 | **已验证** | 真实 PG `TestHouseholdOwnershipPostgres`：转让后单 owner、`owner_user_id` 同步；目标非成员 404 语义、个人家庭 400、转让给自己 400、member 调用 403；旧 owner 读 200 / 结构性写 403 / 可 `leave`；HTTP `TestHouseholdOwnershipTransfer` 同步通过 |
+| v0.14.0 并发转让 | **已验证** | `TestHouseholdOwnershipTransferConcurrentPostgres`：两笔并发转让恰好 1 成功 1 `ErrForbidden`，`role='owner'` 行数恒为 1 |
+| v0.14.0 可见性与错误码 | **已验证** | 被移除成员 token 读家庭/成员/房间/邀请码均 404；缺项重排 409 且 `error.code=ROOM_SET_MISMATCH`；`HouseholdMember.isSelf` 生效 |
+| v0.14.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.10.0 |
+| v0.14.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -78,7 +83,7 @@
 cat > .env <<'EOF'
 DOMAIN=localhost
 POSTGRES_PASSWORD=change-me-strong-password
-APP_VERSION=0.13.0
+APP_VERSION=0.14.0
 TOKEN_TTL_DAYS=180
 METRICS_ENABLED=true
 RUN_MIGRATIONS_ON_BOOT=true
@@ -121,7 +126,7 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 1. **备份**（必须先做）：`./deploy/scripts/backup.sh`
 2. **预检迁移**：只跑迁移、不启动服务：
    `docker compose run --rm --no-deps --entrypoint /migrate api1 -direction up`。
-3. **构建新镜像**：`APP_VERSION=0.13.0 docker compose build`
+3. **构建新镜像**：`APP_VERSION=0.14.0 docker compose build`
 4. **逐实例滚动替换**：
    ```bash
    bash scripts/rolling-restart.sh
@@ -591,7 +596,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 - 热点 IP 会在单行上排队；若 `pg_stat_activity` 出现大量相同 `bucket` 的等待，
   考虑前置网关限流或调大 `RATE_LIMIT_PER_MINUTE`。
 
-### 7.13 家庭 / 房间 / 成员排障（v0.12.0 引入，v0.13.0 扩展）
+### 7.13 家庭 / 房间 / 成员排障（v0.12.0 引入，v0.13.0 扩展，v0.14.0 补转让）
 
 #### 7.13.1 看不到家庭或家庭内设备
 
@@ -626,8 +631,29 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 - member 修改**他人设备**返回 404（不暴露设备存在性）；member 可以修改自己 push 的设备，
   包括把它移动到共享家庭或指定房间。
 
-#### 7.13.4 删除家庭后的数据去向
+#### 7.13.4 所有权转让与 owner 退出（v0.14.0）
 
+- `POST /households/{id}/transfer-ownership`，body `{"userId":"<家庭成员>"}`。仅 owner 可调用；
+  目标必须是该家庭现有成员，否则 **404**（与跨家庭 404 一致）；个人家庭 **400**；转给自己 **400**；
+  member 调用 **403**。
+- 事务内对 `households` 行 `FOR UPDATE` 后同时改两处：`household_members.role`（原 owner→member、
+  目标→owner）与 `households.owner_user_id`，因此任意时刻恰好一个 owner。
+- 并发转让被行锁串行化：只有一笔成功，其余返回 **403**（调用者已不是 owner）；若运维在告警里看到
+  同一家庭短时间内多笔 403，属于客户端并发重试，不是数据不一致。
+- **owner 退出被 409 拒绝时**：`error.code=CONFLICT`，message 为
+  「家庭还有其他成员，请先转让所有权或移除其他成员后再退出」。产品流程固定为：
+  1）`GET /households/{id}/members` 选成员；2）转让；3）以 member 身份 `leave`。
+  若只有 owner 一人，直接 `leave` 会删除该家庭。
+- 核对单 owner 不变量：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT h.id,h.owner_user_id,count(*) FILTER (WHERE m.role='owner') AS owner_rows
+       FROM households h JOIN household_members m ON m.household_id=h.id
+      WHERE h.id='<householdId>' GROUP BY h.id,h.owner_user_id;"
+  ```
+  `owner_rows` 必须为 1，且 `owner_user_id` 对应同一行。
+
+#### 7.13.5 删除家庭后的数据去向
 - 成员、房间、邀请码级联删除；设备回到各自 owner 的个人家庭且 `room_id` 清空；
 - 设备与读数不删除，`change_log` 行保留但 `household_id` 置 NULL；
 - 个人家庭不可删除（403）；若客户端需要“解散家庭”，只能删除非个人家庭。
@@ -639,13 +665,13 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
     "SELECT user_id,household_id,room_id FROM user_devices WHERE household_id='<householdId>';"
   ```
 
-#### 7.13.5 成员移除 / 退出出错
+#### 7.13.6 成员移除 / 退出出错
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | owner 移除自己 → **400** | 移除接口不用于退群 | 改用 `POST /households/{id}/leave` |
 | member 调用移除 → **403** | 只有 owner 能移除成员 | 由 owner 操作；member 只能自己 leave |
-| owner 退出 → **409 CONFLICT** | 家庭还有其他成员 | 先 `DELETE /members/{userId}` 移除成员，或由目标成员自己 leave；当前没有“转让 owner”接口 |
+| owner 退出 → **409 CONFLICT** | 家庭还有其他成员 | v0.14.0 起用 `POST /households/{id}/transfer-ownership` 转让给成员后再 leave；或先 `DELETE /members/{userId}` 移除其他成员（见 §7.13.4） |
 | 退出个人家庭 → **400** | 个人家庭不可退出 | 个人家庭随账号存在，不能退 |
 | 非成员退出 → **404** | 跨家庭一律 404 | 确认 userId 与 householdId 对应关系 |
 
@@ -657,7 +683,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   ```
 - owner 作为唯一成员退出会**删除整个非个人家庭**（成员/房间/邀请码级联），操作前建议备份。
 
-#### 7.13.6 邀请码管理
+#### 7.13.7 邀请码管理
 
 - `GET /households/{id}/invitations` 只返回 `codeHashPrefix`（8 位）与 `status`，**不返回明文**；
   这是设计约束，不可为排障临时改接口。
@@ -673,12 +699,13 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   ```
 - `household_id=NULL` 的行只是猜码失败计数，不属于任何家庭，也不会出现在管理列表。
 
-#### 7.13.7 房间排序 / 重排 409
+#### 7.13.8 房间排序 / 重排 409
 
 - 单房间排序：`PATCH /households/{id}/rooms/{roomId}` 传 `sortOrder`（非负整数）。
 - 整段重排：`PUT /households/{id}/rooms/order`，body `{"roomIds":[...]}`，必须**恰好覆盖全部房间**；
-  缺项、多项、重复 id → **409 CONFLICT**（不会部分写入）。
-- 客户端收到 409 后应重新 `GET /households/{id}/rooms`，按最新列表重算顺序再提交整段。
+  缺项、多项、重复 id → **409**，且 `error.code` 为可机读的 **`ROOM_SET_MISMATCH`**（v0.14.0 起）。
+  客户端按 code 判断，不要解析 message 文本。
+- 客户端收到 `ROOM_SET_MISMATCH` 后应重新 `GET /households/{id}/rooms`，按最新列表重算顺序再提交整段。
 - 服务端在事务内 `SELECT ... FOR UPDATE` 锁住该家庭房间行，再按数组下标写 `0..n-1`；
   并发重排按行锁串行，后提交者覆盖先提交者（last write wins），不会出现重复序号。
 - 核对序号连续性：

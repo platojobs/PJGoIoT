@@ -261,11 +261,11 @@ func (s *Store) ListHouseholdMembers(ctx context.Context, userID string, househo
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.user_id, m.role, u.kind, m.joined_at
+		SELECT m.user_id, m.role, u.kind, m.joined_at, (m.user_id = $2) AS is_self
 		FROM household_members m
 		JOIN users u ON u.id = m.user_id
 		WHERE m.household_id = $1
-		ORDER BY m.joined_at ASC, m.user_id`, hid)
+		ORDER BY m.joined_at ASC, m.user_id`, hid, uid)
 	if err != nil {
 		return nil, fmt.Errorf("查询家庭成员失败: %w", err)
 	}
@@ -276,7 +276,7 @@ func (s *Store) ListHouseholdMembers(ctx context.Context, userID string, househo
 			m  model.HouseholdMember
 			id uuid.UUID
 		)
-		if err := rows.Scan(&id, &m.Role, &m.Kind, &m.JoinedAt); err != nil {
+		if err := rows.Scan(&id, &m.Role, &m.Kind, &m.JoinedAt, &m.IsSelf); err != nil {
 			return nil, fmt.Errorf("解析家庭成员失败: %w", err)
 		}
 		m.UserID = id.String()
@@ -409,6 +409,94 @@ func (s *Store) LeaveHousehold(ctx context.Context, userID string, householdID s
 			DELETE FROM household_members WHERE household_id = $1 AND user_id = $2`, hid, uid); err != nil {
 			return fmt.Errorf("退出家庭失败: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+	return nil
+}
+
+// TransferHouseholdOwnership 实现 store.Store。
+//
+// 并发方案：事务内先对 households 行加 FOR UPDATE 行锁，再做角色校验与两处写入，
+// 因此同时发起的两笔转让会被串行化：后到者拿到锁后重新读到「自己已不是 owner」而返回 ErrForbidden，
+// 不会出现两个 owner 或零 owner。最后对 households 用 owner_user_id 条件更新兜底，
+// 若影响行数为 0（极端情况下角色行与 households 不一致），整笔回滚并返回 ErrForbidden。
+func (s *Store) TransferHouseholdOwnership(ctx context.Context, userID string, householdID string, targetUserID string) error {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("非法 user id: %w", err)
+	}
+	hid, err := uuid.Parse(householdID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	tid, err := uuid.Parse(targetUserID)
+	if err != nil {
+		return store.ErrHouseholdTargetNotMember
+	}
+	ctx, cancel := context.WithTimeout(ctx, householdTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		personal bool
+		ownerID  uuid.UUID
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT is_personal, owner_user_id FROM households WHERE id = $1 FOR UPDATE`, hid).
+		Scan(&personal, &ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询家庭失败: %w", err)
+	}
+	// 行锁释放后重新确认调用者角色：并发转让的后到者会在这里拿到 ErrForbidden。
+	if err := requireHouseholdOwner(ctx, tx, uid, hid); err != nil {
+		return err
+	}
+	if personal {
+		return store.ErrPersonalHouseholdImmutable
+	}
+	if tid == uid {
+		return store.ErrHouseholdTargetAlreadyOwner
+	}
+
+	var targetRole string
+	err = tx.QueryRowContext(ctx, `
+		SELECT role FROM household_members WHERE household_id = $1 AND user_id = $2 FOR UPDATE`,
+		hid, tid).Scan(&targetRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrHouseholdTargetNotMember
+	}
+	if err != nil {
+		return fmt.Errorf("查询成员失败: %w", err)
+	}
+	if targetRole == "owner" {
+		return store.ErrHouseholdTargetAlreadyOwner
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE household_members SET role = 'member' WHERE household_id = $1 AND user_id = $2`, hid, uid); err != nil {
+		return fmt.Errorf("降级原 owner 失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE household_members SET role = 'owner' WHERE household_id = $1 AND user_id = $2`, hid, tid); err != nil {
+		return fmt.Errorf("升级新 owner 失败: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE households SET owner_user_id = $2 WHERE id = $1 AND owner_user_id = $3`, hid, tid, ownerID)
+	if err != nil {
+		return fmt.Errorf("更新家庭 owner 失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return store.ErrForbidden
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交事务失败: %w", err)

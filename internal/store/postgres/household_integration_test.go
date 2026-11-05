@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,6 +157,16 @@ func TestHouseholdManagementPostgres(t *testing.T) {
 	if _, err := st.GetHousehold(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("被移除成员应 NotFound: err=%v", err)
 	}
+	// 被移除成员的 token 不能再读到该家庭的任何数据。
+	if _, err := st.ListHouseholdMembers(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("被移除成员读成员列表应 NotFound: err=%v", err)
+	}
+	if _, err := st.ListHouseholdRooms(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("被移除成员读房间应 NotFound: err=%v", err)
+	}
+	if _, err := st.ListHouseholdInvitations(ctx, memberID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("被移除成员读邀请码应 NotFound: err=%v", err)
+	}
 	got, err := st.GetUserDeviceByKey(ctx, memberID, "android", memberExt)
 	if err != nil || got.HouseholdID == nil || *got.HouseholdID != memberPersonal {
 		t.Fatalf("被移除成员设备应回个人家庭: %+v err=%v", got, err)
@@ -192,6 +203,194 @@ func TestHouseholdManagementPostgres(t *testing.T) {
 	if err := st.LeaveHousehold(ctx, ownerID, ownerPersonal); !errors.Is(err, store.ErrPersonalHouseholdImmutable) {
 		t.Fatalf("个人家庭退出应被拒绝: err=%v", err)
 	}
+}
+
+func TestHouseholdOwnershipPostgres(t *testing.T) {
+	dsn := testDSN(t)
+	runMigrations(t, dsn)
+	ctx := context.Background()
+	st, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ownerID := newHouseholdUser(t, st)
+	memberID := newHouseholdUser(t, st)
+	otherID := newHouseholdUser(t, st)
+	outsiderID := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, ownerID, memberID, otherID, outsiderID) })
+
+	ownerPersonal := mustPersonalHousehold(t, st, ownerID)
+	home, err := st.CreateHousehold(ctx, ownerID, "转让家庭")
+	if err != nil {
+		t.Fatalf("创建家庭失败: %v", err)
+	}
+	join := func(userID string) {
+		t.Helper()
+		codeHash := hashOf("transfer-code-" + uuid.NewString())
+		if _, err := st.CreateHouseholdInvitation(ctx, ownerID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+			t.Fatalf("创建邀请码失败: %v", err)
+		}
+		if _, err := st.ClaimHouseholdInvitation(ctx, userID, codeHash, time.Now().UTC(), 10*time.Minute); err != nil {
+			t.Fatalf("领取邀请码失败: %v", err)
+		}
+	}
+	join(memberID)
+	join(otherID)
+
+	// 目标非成员 → ErrHouseholdTargetNotMember
+	if err := st.TransferHouseholdOwnership(ctx, ownerID, home.ID, outsiderID); !errors.Is(err, store.ErrHouseholdTargetNotMember) {
+		t.Fatalf("目标非成员应 TargetNotMember: err=%v", err)
+	}
+	// 个人家庭不可转让
+	if err := st.TransferHouseholdOwnership(ctx, ownerID, ownerPersonal, memberID); !errors.Is(err, store.ErrPersonalHouseholdImmutable) {
+		t.Fatalf("个人家庭转让应拒绝: err=%v", err)
+	}
+	// 不能转让给自己
+	if err := st.TransferHouseholdOwnership(ctx, ownerID, home.ID, ownerID); !errors.Is(err, store.ErrHouseholdTargetAlreadyOwner) {
+		t.Fatalf("转让给自己应拒绝: err=%v", err)
+	}
+	// 非 owner 不能转让
+	if err := st.TransferHouseholdOwnership(ctx, memberID, home.ID, otherID); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("成员转让应 Forbidden: err=%v", err)
+	}
+
+	// 成功转让：单 owner、owner_user_id 同步
+	if err := st.TransferHouseholdOwnership(ctx, ownerID, home.ID, memberID); err != nil {
+		t.Fatalf("转让失败: %v", err)
+	}
+	owners, ownerUserID := householdOwnerState(t, dsn, home.ID)
+	if owners != 1 || ownerUserID != memberID {
+		t.Fatalf("转让后应恰好一个 owner 且指向目标: owners=%d owner_user_id=%s", owners, ownerUserID)
+	}
+
+	// 成员列表 isSelf
+	members, err := st.ListHouseholdMembers(ctx, memberID, home.ID)
+	if err != nil {
+		t.Fatalf("查询成员失败: %v", err)
+	}
+	if len(members) != 3 {
+		t.Fatalf("成员数应为 3: %+v", members)
+	}
+	for _, m := range members {
+		if m.IsSelf != (m.UserID == memberID) {
+			t.Fatalf("isSelf 标记不正确: %+v", m)
+		}
+		wantRole := "member"
+		if m.UserID == memberID {
+			wantRole = "owner"
+		}
+		if m.Role != wantRole {
+			t.Fatalf("角色不正确: %+v", m)
+		}
+	}
+
+	// 旧 owner 边界：读 200（角色 member），结构性写 403，可正常退出
+	view, err := st.GetHousehold(ctx, ownerID, home.ID)
+	if err != nil || view.Role != "member" || view.OwnerUserID != memberID {
+		t.Fatalf("旧 owner 视图不正确: %+v err=%v", view, err)
+	}
+	if err := st.RenameHousehold(ctx, ownerID, home.ID, "旧 owner 改名"); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("旧 owner 改名应 Forbidden: err=%v", err)
+	}
+	if _, err := st.CreateHouseholdRoom(ctx, ownerID, home.ID, "旧 owner 房间", 0); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("旧 owner 建房应 Forbidden: err=%v", err)
+	}
+	if err := st.LeaveHousehold(ctx, ownerID, home.ID); err != nil {
+		t.Fatalf("旧 owner 转让后退出失败: %v", err)
+	}
+	if _, err := st.GetHousehold(ctx, ownerID, home.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("旧 owner 退出后应 NotFound: err=%v", err)
+	}
+	// 新 owner 还有成员时不能退出
+	if err := st.LeaveHousehold(ctx, memberID, home.ID); !errors.Is(err, store.ErrHouseholdOwnerMustTransfer) {
+		t.Fatalf("新 owner 有其他成员应拒退: err=%v", err)
+	}
+}
+
+func TestHouseholdOwnershipTransferConcurrentPostgres(t *testing.T) {
+	dsn := testDSN(t)
+	runMigrations(t, dsn)
+	ctx := context.Background()
+	st, err := postgres.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ownerID := newHouseholdUser(t, st)
+	aID := newHouseholdUser(t, st)
+	bID := newHouseholdUser(t, st)
+	t.Cleanup(func() { cleanupUsers(t, dsn, ownerID, aID, bID) })
+
+	home, err := st.CreateHousehold(ctx, ownerID, "并发转让")
+	if err != nil {
+		t.Fatalf("创建家庭失败: %v", err)
+	}
+	for _, uid := range []string{aID, bID} {
+		codeHash := hashOf("conc-code-" + uuid.NewString())
+		if _, err := st.CreateHouseholdInvitation(ctx, ownerID, home.ID, codeHash, time.Now().UTC().Add(10*time.Minute)); err != nil {
+			t.Fatalf("创建邀请码失败: %v", err)
+		}
+		if _, err := st.ClaimHouseholdInvitation(ctx, uid, codeHash, time.Now().UTC(), 10*time.Minute); err != nil {
+			t.Fatalf("领取邀请码失败: %v", err)
+		}
+	}
+
+	// 两笔并发转让（同一 owner 转给不同目标）：只有一笔能成功。
+	results := make([]error, 2)
+	var wg sync.WaitGroup
+	for i, target := range []string{aID, bID} {
+		wg.Add(1)
+		go func(idx int, targetUserID string) {
+			defer wg.Done()
+			results[idx] = st.TransferHouseholdOwnership(context.Background(), ownerID, home.ID, targetUserID)
+		}(i, target)
+	}
+	wg.Wait()
+
+	success, forbidden := 0, 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, store.ErrForbidden):
+			forbidden++
+		default:
+			t.Fatalf("并发转让出现非预期错误: %v", err)
+		}
+	}
+	if success != 1 || forbidden != 1 {
+		t.Fatalf("并发转让应一胜一 403: success=%d forbidden=%d results=%+v", success, forbidden, results)
+	}
+
+	owners, ownerUserID := householdOwnerState(t, dsn, home.ID)
+	if owners != 1 {
+		t.Fatalf("并发转让后必须恰好一个 owner: owners=%d", owners)
+	}
+	if ownerUserID != aID && ownerUserID != bID {
+		t.Fatalf("owner_user_id 应指向获胜目标: %s", ownerUserID)
+	}
+}
+
+// householdOwnerState 返回家庭内 owner 角色行数与 households.owner_user_id，用于校验单 owner 不变量。
+func householdOwnerState(t *testing.T, dsn, householdID string) (int, string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	defer db.Close()
+	var owners int
+	if err := db.QueryRow(`SELECT count(*) FROM household_members WHERE household_id = $1 AND role = 'owner'`, householdID).Scan(&owners); err != nil {
+		t.Fatalf("统计 owner 失败: %v", err)
+	}
+	var ownerUserID string
+	if err := db.QueryRow(`SELECT owner_user_id::text FROM households WHERE id = $1`, householdID).Scan(&ownerUserID); err != nil {
+		t.Fatalf("查询 owner_user_id 失败: %v", err)
+	}
+	return owners, ownerUserID
 }
 
 func mustPersonalHousehold(t *testing.T, st *postgres.Store, userID string) string {

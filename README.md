@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.9.0**（v0.13.0 新增成员移除/退出、邀请码管理、房间整段重排与 `roomCount`）；服务版本 **v0.13.0**（家庭共享 + 成员与邀请码管理 + 房间排序；沿用 v0.11.0 的双实例与滚动发布）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.10.0**（v0.14.0 新增所有权转让、成员 `isSelf` 与 `ROOM_SET_MISMATCH` 错误码）；服务版本 **v0.14.0**（家庭共享 + 成员/邀请码管理 + 房间排序 + 所有权转让）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -97,9 +97,10 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/households/{id}` | Bearer | 200 | 家庭详情（成员可读，跨家庭 404） |
 | PATCH | `/households/{id}` | Bearer | 200 | 改家庭名（仅 owner，member 403） |
 | DELETE | `/households/{id}` | Bearer | 204 | 删家庭（仅 owner；个人家庭 403；设备回个人家庭） |
-| GET | `/households/{id}/members` | Bearer | 200 | 成员列表（成员可读） |
+| GET | `/households/{id}/members` | Bearer | 200 | 成员列表（成员可读；每行含 `isSelf` 标记当前账号本人） |
 | DELETE | `/households/{id}/members/{userId}` | Bearer | 204 | 移除成员（仅 owner；不能移除自己/唯一成员；设备回该成员个人家庭） |
 | POST | `/households/{id}/leave` | Bearer | 204 | 成员退出；owner 有其他成员 409，个人家庭 400，owner 独退删家庭 |
+| POST | `/households/{id}/transfer-ownership` | Bearer | 200 | 转让所有权（仅 owner；目标是本家庭成员的 `userId`，非成员 404，个人家庭 400） |
 | POST | `/households/{id}/invitations` | Bearer | 201 | 签发一次性邀请码（仅 owner；TTL 10 分钟） |
 | GET | `/households/{id}/invitations` | Bearer | 200 | 邀请码管理列表（仅 owner；只有哈希前缀/状态/时间，绝不返回明文） |
 | DELETE | `/households/{id}/invitations/{invitationId}` | Bearer | 204 | 撤销未使用的邀请码（仅 owner） |
@@ -111,7 +112,7 @@ make dev-postgres   # Postgres 模式启动 API
 | DELETE | `/households/{id}/rooms/{roomId}` | Bearer | 204 | 删房间（仅 owner；设备 `roomId` 置 null） |
 | GET | `/metrics`（根路径） | 否 | 200 | Prometheus 文本指标；不受限流，`METRICS_ENABLED=false` 时 404 |
 
-### 家庭、房间与成员（v0.12.0 引入，v0.13.0 补齐管理与排序）
+### 家庭、房间与成员（v0.12.0 引入，v0.13.0 补齐管理与排序，v0.14.0 补所有权转让）
 
 对齐米家的「账号 → 家庭 → 房间 → 设备」结构：设备仍由写入它的账号拥有，家庭只决定可见范围与房间归类。
 
@@ -141,6 +142,7 @@ make dev-postgres   # Postgres 模式启动 API
 | 创建/修改/删除房间 | 200/201/204 | **403** | 404 |
 | 整段重排房间 | 200 | **403** | 404 |
 | 移除成员 | 204 | **403**（含移除自己） | 404 |
+| 转让所有权 | 200 | **403** | 404 |
 | 退出家庭 | 见下节 | 204 | 404 |
 | 修改**自己的**设备 alias/room/household | 200 | 200 | — |
 | 修改**他人**的设备 | 404（设备不属于自己） | 404 | 404 |
@@ -156,13 +158,34 @@ make dev-postgres   # Postgres 模式启动 API
 | 同上 | 目标不是该家庭成员 | **404** |
 | 同上 | 家庭是 `is_personal=true` | **400**（个人家庭不可变） |
 | `POST /households/{id}/leave` | member 自己退出 | 204；设备回个人家庭；成员行删除 |
-| 同上 | owner 且还有其他成员 | **409**（`CONFLICT`，提示先转让所有权或移除其他成员） |
+| 同上 | owner 且还有其他成员 | **409**（`CONFLICT`，message 明确为「家庭还有其他成员，请先转让所有权或移除其他成员后再退出」） |
 | 同上 | owner 且是唯一成员 | 204；整个非个人家庭被删除（成员/房间/邀请码级联） |
 | 同上 | 退出个人家庭 | **400**（个人家庭不可退出） |
 | 同上 | 非成员 | **404** |
 
 - 退出/移除都把设备归还到**该成员自己的**个人家庭，而不是留在原家庭；设备与读数不删除。
-- 错误响应沿用统一结构，`409` 的 `message` 为可读中文，客户端可直接展示（例如“家庭还有其他成员，请先转让所有权或移除成员”）。
+- 错误响应沿用统一结构，`409` 的 `message` 为可读中文，客户端可直接展示。
+
+**所有权转让（v0.14.0）**：
+
+- `POST /households/{id}/transfer-ownership`，body `{"userId":"<目标成员>"}`；仅 owner 可调用。
+- 事务内一次性完成：原 owner 降为 `member`、目标升为 `owner`、`households.owner_user_id` 同步更新，
+  提交前对 `households` 行加 `FOR UPDATE` 行锁，保证任意时刻**恰好一个 owner**（不会出现两个 owner 或零 owner）。
+- **并发**：多笔同时转让被行锁串行化，只有第一笔成功；后到者角色已变，返回 **403**。
+- 错误语义：目标不是该家庭成员 → **404**（与跨家庭 404 一致，不泄露用户是否存在）；
+  目标是自己 → **400**；个人家庭 → **400**；非 owner 调用 → **403**。
+- 转让后原 owner 成为普通成员：读接口仍 200，结构性写（改名/删家庭/建房/签发邀请码/移除成员）一律 403，
+  并可正常 `POST /households/{id}/leave` 退出。
+
+**owner 想退出时的产品流程**（务必按此顺序，避免 409）：
+
+1. `GET /households/{id}/members` 选一个成员；
+2. `POST /households/{id}/transfer-ownership` 转让；
+3. 再以普通成员身份 `POST /households/{id}/leave`。
+
+若家庭里只有 owner 一人，直接 `leave` 即可（家庭会被删除）；若不想转让，就先
+`DELETE /households/{id}/members/{userId}` 把其他成员全部移除，再 `leave`。
+
 
 **邀请码安全设计**：
 - 8 位、32 字符表（去掉 `0/O/1/I`），约 40 bit 熵；与配对码复用同一生成/规范化/哈希实现；
@@ -184,7 +207,7 @@ make dev-postgres   # Postgres 模式启动 API
 
 - `PATCH /households/{id}/rooms/{roomId}` 支持 `name` 与 `sortOrder`（单房间增量更新）；`sortOrder` 非负整数，越界 400。
 - 推荐客户端使用 **整段顺序提交**：`PUT /households/{id}/rooms/order`，body `{"roomIds":["<roomA>","<roomB>",...]}`，服务端在一个事务里按数组下标写 `sort_order = 0..n-1`。
-- 冲突处理采用「整表快照 + 严格校验」：请求必须**恰好覆盖该家庭的全部房间**，缺项、多项、重复 id 一律 **409 `CONFLICT`**（不会静默忽略或部分写入），客户端重新 `GET /households/{id}/rooms` 后整段重提即可。
+- 冲突处理采用「整表快照 + 严格校验」：请求必须**恰好覆盖该家庭的全部房间**，缺项、多项、重复 id 一律 **409**，响应体 `error.code` 为可机读的 **`ROOM_SET_MISMATCH`**（v0.14.0 起），`message` 仅作展示；客户端按 code 判断后重新 `GET /households/{id}/rooms` 再整段重提，不要解析 message 文本。
 - 事务内先 `SELECT ... FOR UPDATE` 锁定该家庭房间行，再逐行更新，因此并发重排不会产生交错序号；两个并发请求按行锁串行，后提交者覆盖前者的顺序（last write wins），不会出现同一序号两条房间。
 - 单房间 `PATCH sortOrder` 只改一行，不做整段重排；并发插入/拖拽时仍建议改用 `PUT .../rooms/order`，避免多个客户端各自算出的序号互相插空。
 - 家庭列表 `GET /households` 的 `roomCount` 与 `GET /households/{id}/rooms` 同步变化，客户端首页刷新即可看到。
@@ -1137,7 +1160,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.13.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.9.0 不是同一个号 |
+| `APP_VERSION` | `0.14.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.10.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1280,6 +1303,12 @@ seed 数据来源与边界：
 | v0.13.0 迁移 000012 | 通过（真实 PostgreSQL，临时库）：`up → down → up`；`household_invitations.id` 列与 `household_invitations_id_idx` / `household_invitations_active_idx` 可正确增删 |
 | v0.13.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.9.0** |
 | v0.13.0 CI | 通过：GitHub Actions [run 42042030047](https://github.com/platojobs/PJGoIoT/actions/runs/42042030047)，`构建与测试`、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）` 全绿；`构建与测试` 中 `OpenAPI 契约校验` 步骤实际执行并通过，`Postgres 集成测试` 正则已包含 `TestHouseholdManagementPostgres`（commit `3f5380f`） |
+| v0.14.0 所有权转让 | 通过（真实 PostgreSQL）：`TestHouseholdOwnershipPostgres` 覆盖成功转让后单 owner 不变量、目标非成员 `ErrHouseholdTargetNotMember`、个人家庭拒绝、转让给自己拒绝、member 调用 403、旧 owner 读 200/写 403/可 `leave`、新 owner 有其他成员拒绝退出；HTTP 层 `TestHouseholdOwnershipTransfer` 同步覆盖 403/404/400 边界与 `isSelf` |
+| v0.14.0 并发转让 | 通过（真实 PostgreSQL）：`TestHouseholdOwnershipTransferConcurrentPostgres` 两个 goroutine 并发转让给不同目标，恰好 1 笔成功、1 笔 `ErrForbidden`，库内 `role='owner'` 行数为 1 且 `households.owner_user_id` 指向获胜目标 |
+| v0.14.0 可见性修正 | 通过：被移除成员的 token 读取家庭/成员/房间/邀请码一律 404（`TestHouseholdManagementPostgres` 断言）；`TestHouseholdRoomSetMismatchCode` 断言缺项重排返回 409 且 `error.code == ROOM_SET_MISMATCH` |
+| v0.14.0 迁移 | 本轮无 schema 变更，未新增迁移；迁移版本保持 `000012`（已在 v0.13.0 验证 `up → down → up`） |
+| v0.14.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.10.0** |
+| v0.14.0 CI | 通过：GitHub Actions run `__CI_RUN_ID__`，四个 job 全绿；`Postgres 集成测试` 正则已放宽为 `TestHousehold`，`OpenAPI 契约校验` 步骤实际执行 |
 | v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
@@ -1380,8 +1409,8 @@ git push origin main
 gh run watch --exit-status
 
 # 4. 打 annotated tag 并推送（不要动历史 tag）
-git tag -a v0.13.0 -m 'v0.13.0: 成员与邀请码管理、房间整段重排'
-git push origin v0.13.0
+git tag -a v0.14.0 -m 'v0.14.0: 家庭所有权转让、成员 isSelf、ROOM_SET_MISMATCH'
+git push origin v0.14.0
 ```
 
 - CI 的 `OpenAPI 契约校验` 步骤（`npx @redocly/cli lint api/openapi.yaml`）是发布门槛，失败即不发 tag。

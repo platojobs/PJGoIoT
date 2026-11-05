@@ -98,6 +98,7 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	households.GET("/:id/members", s.handleListHouseholdMembers)
 	households.DELETE("/:id/members/:userId", s.handleRemoveHouseholdMember)
 	households.POST("/:id/leave", s.handleLeaveHousehold)
+	households.POST("/:id/transfer-ownership", s.handleTransferHouseholdOwnership)
 	households.POST("/:id/invitations", s.handleCreateHouseholdInvitation)
 	households.GET("/:id/invitations", s.handleListHouseholdInvitations)
 	households.DELETE("/:id/invitations/:invitationId", s.handleRevokeHouseholdInvitation)

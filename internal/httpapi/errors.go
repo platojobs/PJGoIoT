@@ -37,6 +37,8 @@ const (
 	CodeInternal            = "INTERNAL"
 	CodeResyncRequired      = "RESYNC_REQUIRED"
 	CodeTimeout             = "TIMEOUT"
+	// CodeRoomSetMismatch 用于整段房间重排时集合不一致，客户端可直接据此代码触发「重新拉取再提交」。
+	CodeRoomSetMismatch = "ROOM_SET_MISMATCH"
 )
 
 type errorBody struct {
@@ -124,13 +126,17 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 		case errors.Is(last, store.ErrForbidden):
 			writeError(c.Writer, http.StatusForbidden, CodeForbidden, "没有操作权限")
 		case errors.Is(last, store.ErrHouseholdOwnerMustTransfer):
-			writeError(c.Writer, http.StatusConflict, CodeConflict, "家庭还有其他成员，请先移除成员或转让家庭后再退出")
+			writeError(c.Writer, http.StatusConflict, CodeConflict, "家庭还有其他成员，请先转让所有权或移除其他成员后再退出")
 		case errors.Is(last, store.ErrHouseholdOwnerCannotRemoveSelf):
 			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "owner 不能移除自己")
 		case errors.Is(last, store.ErrPersonalHouseholdImmutable):
 			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "个人家庭不支持退出或该操作")
+		case errors.Is(last, store.ErrHouseholdTargetNotMember):
+			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "目标用户不是该家庭成员")
+		case errors.Is(last, store.ErrHouseholdTargetAlreadyOwner):
+			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "目标用户已经是该家庭 owner")
 		case errors.Is(last, store.ErrRoomOrderMismatch):
-			writeError(c.Writer, http.StatusConflict, CodeConflict, "房间排序列表与当前房间不一致，请刷新后整段重新提交")
+			writeError(c.Writer, http.StatusConflict, CodeRoomSetMismatch, "房间排序列表与当前房间不一致，请刷新后整段重新提交")
 		case errors.Is(last, store.ErrNotFound):
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		case errors.Is(last, store.ErrIdempotencyConflict):

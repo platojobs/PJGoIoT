@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.9.0
+  version: 0.10.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -29,6 +29,9 @@ info:
     - 自 `0.12.0` 起引入家庭（household）模型：每个账号自动拥有一个不可删除的个人家庭「我的家」，
       可创建共享家庭、邀请成员、划分房间；家庭成员可读家庭内全部设备与读数，写权限按角色区分。
       跨家庭访问一律 404，不泄露资源是否存在。
+    - 自 `0.13.0` 起补齐家庭成员与邀请码管理、房间整段重排与 `roomCount`。
+    - 自 `0.10.0`（服务 v0.14.0）起新增家庭所有权转让 `POST /households/{id}/transfer-ownership`，
+      成员列表增加 `isSelf`，房间整段重排的 409 携带可机读 `ROOM_SET_MISMATCH`。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -1276,7 +1279,11 @@ paths:
         成员自己退出，无需请求体。设备回到退出者个人家庭并清空 `roomId`。
 
         - 个人家庭（`personal=true`）不可退出，返回 **400**；
-        - owner 在还有其他成员时不能退出，返回 **409 CONFLICT**，需先移除成员或转让家庭；
+        - owner 在还有其他成员时不能退出，返回 **409 CONFLICT**，message 为
+          「家庭还有其他成员，请先转让所有权或移除其他成员后再退出」；
+          正确顺序是先调用 `POST /households/{id}/transfer-ownership` 转让给他人，
+          再以普通成员身份退出，或先用 `DELETE /households/{id}/members/{userId}` 移除其他成员；
+        - owner 在转让后角色变为 `member`，退出能力随之恢复；
         - owner 是唯一成员时退出会**删除该家庭**（含房间与邀请码），设备回到个人家庭；
         - 非成员与不存在的家庭统一返回 404。
       security:
@@ -1294,6 +1301,59 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+
+  /households/{id}/transfer-ownership:
+    post:
+      tags: [household]
+      operationId: transferHouseholdOwnership
+      summary: 转让家庭所有权
+      description: |
+        仅当前 owner 可调用（其他成员返回 **403 FORBIDDEN**，非成员返回 **404**）。
+        请求体为目标成员的 `userId`。
+
+        服务端在单个事务内完成三件事，保证任意时刻**恰好一个 owner**：
+        1. 原 owner 的 `household_members.role` 降为 `member`；
+        2. 目标的 `role` 升为 `owner`；
+        3. `households.owner_user_id` 更新为目标。
+
+        **并发**：事务先对 `households` 行加 `FOR UPDATE` 行锁，因此同时发起的多笔转让被串行化，
+        只有第一笔成功，其余返回 **403**（调用者已不再是 owner），不会出现两个 owner 或零 owner。
+
+        **错误语义**
+        - 目标不在该家庭内：**404**（与「跨家庭一律 404」一致，不暴露用户是否存在）；
+        - 目标就是自己（已是 owner）：**400**；
+        - 个人家庭（`personal=true`）：**400**；
+        - 调用者不是 owner：**403**；非成员/家庭不存在：**404**。
+
+        成功后原 owner 作为普通成员仍可读取家庭数据；若其为唯一成员以外的普通成员，
+        可直接调用 `POST /households/{id}/leave` 退出。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdOwnershipTransfer"
+            example:
+              userId: "8a9b0c1d-2e3f-4a5b-9c6d-7e8f9a0b1c2d"
+      responses:
+        "200":
+          description: 转让成功，返回调用者视角的家庭详情（此时 `role=member`，`ownerUserId` 为新 owner）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Household"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /households/{id}/invitations:
     post:
@@ -1454,8 +1514,10 @@ paths:
         并返回重排后的完整列表。
 
         冲突处理：并发重排时房间行锁串行化，最后一个提交者获胜，不会产生部分排序。
-        若期间有房间被创建/删除导致集合不一致，返回 **409 CONFLICT**，客户端应重新拉取
-        房间列表后整段重提；不要用逐条 PATCH `sortOrder` 的方式插序，否则可能产生重复/交错顺序。
+        若期间有房间被创建/删除导致集合不一致，返回 **409**，且响应体 `error.code` 为
+        **`ROOM_SET_MISMATCH`**（自 0.10.0），客户端可直接按该 code 判断并重新拉取
+        房间列表后整段重提，不要依赖 message 文本；不要用逐条 PATCH `sortOrder` 的方式插序，
+        否则可能产生重复/交错顺序。
       security:
         - bearerAuth: []
       parameters:
@@ -1822,6 +1884,7 @@ components:
                 - INTERNAL
                 - RESYNC_REQUIRED
                 - TIMEOUT
+                - ROOM_SET_MISMATCH
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -2624,7 +2687,7 @@ components:
 
     HouseholdMember:
       type: object
-      required: [userId, role, kind, joinedAt]
+      required: [userId, role, kind, isSelf, joinedAt]
       properties:
         userId:
           type: string
@@ -2636,6 +2699,11 @@ components:
           type: string
           enum: [anonymous, account]
           description: 账号类型
+        isSelf:
+          type: boolean
+          description: |
+            该行是否为当前调用账号本人（自 0.10.0）。客户端据此渲染「我」，
+            无需自行比对 `userId`。
         joinedAt:
           type: string
           format: date-time
@@ -2692,6 +2760,15 @@ components:
           minLength: 1
           maxLength: 64
           description: 新家庭名（去除首尾空白后校验）
+
+    HouseholdOwnershipTransfer:
+      type: object
+      required: [userId]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: 目标成员 userId，必须是该家庭现有成员（否则 404）
 
     HouseholdInvitationClaim:
       type: object

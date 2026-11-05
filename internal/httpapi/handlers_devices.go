@@ -242,6 +242,8 @@ func (s *Server) storeFailure(c *gin.Context, operation string, err error) {
 		errors.Is(err, store.ErrForbidden) ||
 		errors.Is(err, store.ErrHouseholdOwnerMustTransfer) ||
 		errors.Is(err, store.ErrHouseholdOwnerCannotRemoveSelf) ||
+		errors.Is(err, store.ErrHouseholdTargetNotMember) ||
+		errors.Is(err, store.ErrHouseholdTargetAlreadyOwner) ||
 		errors.Is(err, store.ErrPersonalHouseholdImmutable) ||
 		errors.Is(err, store.ErrRoomOrderMismatch) ||
 		errors.Is(err, store.ErrTimeout) || errors.Is(err, store.ErrCursorExpired) ||

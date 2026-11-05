@@ -56,7 +56,7 @@ jobs:
         run: go run ./cmd/migrate -direction up
 
       - name: Postgres 集成测试
-        run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices|TestSharedRateLimiterAcrossInstances|TestHouseholdSharingPostgres|TestHouseholdManagementPostgres' -v
+        run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices|TestSharedRateLimiterAcrossInstances|TestHousehold' -v
 
       - name: OpenAPI 契约校验
         run: npx --yes @redocly/cli@latest lint api/openapi.yaml
@@ -100,7 +100,7 @@ jobs:
             RATE_LIMIT_BURST=0 \
             PAIRING_CLAIM_RATE_PER_MINUTE=0 \
             PAIRING_CLAIM_BURST=0 \
-            APP_VERSION=0.13.0 \
+            APP_VERSION=0.14.0 \
             ADDR=127.0.0.1:18080 \
             /tmp/pjgoiot-api >/tmp/api.log 2>&1 &
           echo $! >/tmp/api.pid

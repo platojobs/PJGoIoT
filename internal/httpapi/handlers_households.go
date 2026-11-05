@@ -33,6 +33,10 @@ type householdInvitationRequest struct {
 	Code string `json:"code"`
 }
 
+type householdTransferRequest struct {
+	UserID string `json:"userId"`
+}
+
 type householdInvitationResponse struct {
 	Code      string    `json:"code"`
 	ExpiresAt time.Time `json:"expiresAt"`
@@ -184,6 +188,30 @@ func (s *Server) handleLeaveHousehold(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// handleTransferHouseholdOwnership 仅 owner 可把所有权转让给同家庭另一成员。
+// 目标不是成员返回 404，个人家庭 400；转让后原 owner 降为 member，可正常退出。
+func (s *Server) handleTransferHouseholdOwnership(c *gin.Context) {
+	var req householdTransferRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, CodeInvalidJSON, "请求体不是合法 JSON")
+		return
+	}
+	if !validUUID(req.UserID) {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "userId 必须是 UUID")
+		return
+	}
+	if err := s.store.TransferHouseholdOwnership(c.Request.Context(), userID(c), c.Param("id"), req.UserID); err != nil {
+		s.storeFailure(c, "转让家庭所有权失败", err)
+		return
+	}
+	h, err := s.store.GetHousehold(c.Request.Context(), userID(c), c.Param("id"))
+	if err != nil {
+		s.storeFailure(c, "查询家庭失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, h)
 }
 
 // handleCreateHouseholdInvitation 仅 owner 可签发一次性邀请码，只返回明文一次。

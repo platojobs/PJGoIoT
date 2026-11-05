@@ -110,10 +110,12 @@ type Household struct {
 }
 
 // HouseholdMember 是家庭成员视图。
+// isSelf 标记该行是否为当前调用账号本人，客户端据此渲染「我」，无需自行比对 userId。
 type HouseholdMember struct {
 	UserID   string    `json:"userId"`
 	Role     string    `json:"role"`
 	Kind     string    `json:"kind"`
+	IsSelf   bool      `json:"isSelf"`
 	JoinedAt time.Time `json:"joinedAt"`
 }
 

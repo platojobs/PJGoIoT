@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +35,13 @@ type roomResp struct {
 	HouseholdID string `json:"householdId"`
 	Name        string `json:"name"`
 	SortOrder   int    `json:"sortOrder"`
+}
+
+type memberResp struct {
+	UserID string `json:"userId"`
+	Role   string `json:"role"`
+	Kind   string `json:"kind"`
+	IsSelf bool   `json:"isSelf"`
 }
 
 type invitationResp struct {
@@ -208,6 +217,130 @@ func TestHouseholdLifecycleAndPermissions(t *testing.T) {
 	// 个人家庭不可删除
 	if rec := do(t, h, http.MethodDelete, "/api/v1/households/"+personalID, "", owner.Token, nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("个人家庭删除应 403: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHouseholdOwnershipTransfer(t *testing.T) {
+	h := newHandler(t, 0)
+	owner := newUser(t, h)
+	member := newUser(t, h)
+	outsider := newUser(t, h)
+
+	personal := decode[itemsResponse[householdResp]](t, do(t, h, http.MethodGet, "/api/v1/households", "", owner.Token, nil)).Items[0]
+	if !personal.Personal {
+		t.Fatalf("首个家庭应为个人家庭: %+v", personal)
+	}
+
+	rec := do(t, h, http.MethodPost, "/api/v1/households", `{"name":"转让测试"}`, owner.Token, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("创建家庭 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	home := decode[householdResp](t, rec)
+
+	inv := decode[invitationResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/invitations", "", owner.Token, nil))
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/invitations/claim", `{"code":"`+inv.Code+`"}`, member.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("成员加入失败 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	transfer := func(token, target string, want int) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/transfer-ownership", `{"userId":"`+target+`"}`, token, nil)
+		if rec.Code != want {
+			t.Fatalf("转让所有权 status=%d want=%d body=%s", rec.Code, want, rec.Body.String())
+		}
+		return rec
+	}
+
+	// 权限与参数边界
+	transfer(member.Token, owner.UserID, http.StatusForbidden)
+	transfer(outsider.Token, owner.UserID, http.StatusNotFound)
+	transfer(owner.Token, outsider.UserID, http.StatusNotFound)
+	transfer(owner.Token, owner.UserID, http.StatusBadRequest)
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+personal.ID+"/transfer-ownership",
+		`{"userId":"`+member.UserID+`"}`, owner.Token, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("个人家庭转让应 400: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/transfer-ownership", `{"userId":"not-a-uuid"}`, owner.Token, nil); rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法 userId 应 400: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 成功转让：调用者身份已变为 member
+	rec = transfer(owner.Token, member.UserID, http.StatusOK)
+	after := decode[householdResp](t, rec)
+	if after.Role != "member" || after.OwnerUserID != member.UserID {
+		t.Fatalf("转让后家庭视图不符合预期: %+v", after)
+	}
+
+	// 旧 owner：读 200，结构性写 403
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", owner.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("旧 owner 读取应 200: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	oldView := decode[householdResp](t, do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", owner.Token, nil))
+	if oldView.Role != "member" || oldView.OwnerUserID != member.UserID {
+		t.Fatalf("旧 owner 视图不正确: %+v", oldView)
+	}
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodPatch, "/api/v1/households/" + home.ID, `{"name":"旧 owner 改名"}`},
+		{http.MethodDelete, "/api/v1/households/" + home.ID, ""},
+		{http.MethodPost, "/api/v1/households/" + home.ID + "/rooms", `{"name":"旧 owner 建房间"}`},
+		{http.MethodPost, "/api/v1/households/" + home.ID + "/invitations", ""},
+		{http.MethodDelete, "/api/v1/households/" + home.ID + "/members/" + member.UserID, ""},
+	} {
+		if rec := do(t, h, tc.method, tc.path, tc.body, owner.Token, nil); rec.Code != http.StatusForbidden {
+			t.Fatalf("旧 owner %s %s 应 403: status=%d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 新 owner：成员列表只有本人 isSelf=true
+	members := decode[itemsResponse[memberResp]](t, do(t, h, http.MethodGet, "/api/v1/households/"+home.ID+"/members", "", member.Token, nil))
+	if len(members.Items) != 2 {
+		t.Fatalf("成员数应为 2: %+v", members.Items)
+	}
+	for _, m := range members.Items {
+		if wantSelf := m.UserID == member.UserID; m.IsSelf != wantSelf {
+			t.Fatalf("isSelf 标记不正确: %+v", m)
+		}
+		if wantRole := map[bool]string{true: "owner", false: "member"}[m.UserID == member.UserID]; m.Role != wantRole {
+			t.Fatalf("角色不正确: %+v", m)
+		}
+	}
+
+	// owner 带其他成员退出：409 且提示先转让所有权
+	rec = do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", member.Token, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("owner 有其他成员退出应 409: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := decode[errResponse](t, rec); !strings.Contains(body.Error.Message, "转让所有权") {
+		t.Fatalf("409 提示应包含转让所有权: %s", body.Error.Message)
+	}
+
+	// 转让后旧 owner 恢复退出能力
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", owner.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("旧 owner 转让后退出应 204: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v1/households/"+home.ID, "", owner.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("旧 owner 退出后应 404: status=%d", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/leave", "", member.Token, nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("新 owner 独退应 204: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHouseholdRoomSetMismatchCode(t *testing.T) {
+	h := newHandler(t, 0)
+	owner := newUser(t, h)
+	rec := do(t, h, http.MethodPost, "/api/v1/households", `{"name":"排序码"}`, owner.Token, nil)
+	home := decode[householdResp](t, rec)
+	r1 := decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"客厅"}`, owner.Token, nil))
+	decode[roomResp](t, do(t, h, http.MethodPost, "/api/v1/households/"+home.ID+"/rooms", `{"name":"卧室"}`, owner.Token, nil))
+
+	rec = do(t, h, http.MethodPut, "/api/v1/households/"+home.ID+"/rooms/order",
+		fmt.Sprintf(`{"roomIds":[%q]}`, r1.ID), owner.Token, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("缺项重排应 409: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := decode[errResponse](t, rec); body.Error.Code != "ROOM_SET_MISMATCH" {
+		t.Fatalf("应返回可机读 code ROOM_SET_MISMATCH: %s", rec.Body.String())
 	}
 }
 
