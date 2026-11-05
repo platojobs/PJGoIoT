@@ -1,4 +1,4 @@
-# SLO 与错误预算（v0.9.0）
+# SLO 与错误预算（v0.11.0）
 
 本文定义 PJGoIoT API 的 3 条 SLO、对应 PromQL、错误预算算法，以及与
 [deploy/prometheus/alerts.yml](../deploy/prometheus/alerts.yml) 的告警映射。
@@ -123,7 +123,47 @@ CI 的 smoke 门槛（devices 400ms、series 400ms、push 4000ms）是**发布�
 值班顺序：先看 SLO-1 主告警 → 看 `ApiDBErrorsIncreasing` 与 API 日志 `request_id`；
 延迟告警 → 看 Grafana「各 route P95」与 CI perf-smoke 最近一次结果。
 
-## 4. 已知限制
+## 4. 容量假设（v0.11.0）
+
+SLO 的达成依赖下列部署与容量前提；前提变化时需重新评估阈值。
+
+### 4.1 实例数与负载均衡
+
+- 默认拓扑：2 个 API 实例（`api1`/`api2`）共享 1 个 PostgreSQL 16，前置 Caddy 轮询。
+- Caddy 主动健康检查 `/api/v1/health`（2s 间隔、`max_fails=1`、`fail_duration=5s`），
+  单实例故障在约 2–5s 内摘除；`lb_try_duration=3s`、`lb_retries=2` 允许一次重试。
+- 滚动发布期间任一时刻至少 1 个实例在线；实测 532 请求 0 停机（见 runbook §9.10.2）。
+- 容量按“单实例可承载 RPS × 在线实例数”估算；v0.8.0 压测的 1 065 RPS（devices）是
+  **2 vCPU Docker VM 下单实例**的上限，不代表线上多实例线性扩展。
+
+### 4.2 数据库
+
+- 所有实例共享连接池上限：每实例 `DB_MAX_OPEN_CONNS=20`，2 实例合计 40；
+  Postgres `max_connections` 必须大于 实例数 × 20 + 运维预留。
+- `change_log` 的 `seq` 由数据库序列生成，跨实例严格递增；push 事务对用户行持
+  `pg_advisory_xact_lock`，同一用户跨实例并发 push 串行化，不同用户不互相阻塞。
+- 读数、变更、幂等键仍按保留期由 `cmd/cleanup` 清理；多实例不改变清理语义。
+
+### 4.3 限流
+
+- `RATE_LIMIT_BACKEND=memory`（默认）：每个实例独立计数，N 个实例的全局额度约为
+  N × `RATE_LIMIT_PER_MINUTE`。**SLO-1 的 5xx 不包含 429**；但客户端若因额度放大而放大重试，
+  仍可能推高数据库负载，必须按实例数修正容量假设。
+- `RATE_LIMIT_BACKEND=postgres`：全局限额按配置值生效；每个受限请求增加 1 次
+  `rate_limit_buckets` UPSERT，单热点 IP 会在该行排队。容量评估需把这次写计入数据库 QPS；
+  DB 故障时限流降级为进程内（fail-open），此时额度回到 N 倍，属于可用性优先的已知取舍。
+- 部署约束：若把限流当作硬性防刷边界，必须使用 `postgres` 后端或在 Caddy/前置网关做限流；
+  单实例部署可继续使用 `memory`。
+
+### 4.4 发布与观测
+
+- 发布闸门：CI `perf-smoke` 的 devices/series p95 400ms、push p95 4 000ms、错误率 0%，
+  比线上 SLO 宽松 2–3 倍，只拦截明显回归。
+- `/metrics` 由各实例独立暴露；Prometheus 需分别抓取 `api1:8080` 与 `api2:8080`
+  （或经 Caddy 内网路由），否则 `ApiRequestRateDroppedToZero` 可能因只抓到一个实例而误报。
+- 滚动期间两实例版本不一致的时间窗应小于 15 分钟；新旧代码必须兼容同一 schema。
+
+## 5. 已知限制
 
 - `histogram_quantile` 是桶插值，p95 在桶边界（250ms/500ms）附近存在误差，阈值判断以趋势为准。
 - 低流量时（<1 req/s）5 分钟窗口样本过少，SLO 计算会抖动；告警使用 1h 窗口缓解。

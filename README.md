@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.10.0**（push 事务边界收紧、数据库故障 503 语义、迁移演练）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例，不新增字段，契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.11.0**（双实例 + Caddy 负载均衡、优雅下线与滚动发布、可选 Postgres 共享限流）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例，不新增字段；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，不改业务契约，契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -363,7 +363,7 @@ API 不直接暴露公网，`/metrics` 即使开启也只能在内网抓取；Pr
 | `GET /healthz` | liveness | 只返回进程状态，不访问数据库；容器/编排器判断是否重启 |
 | `GET /api/v1/health` | readiness | 2 秒超时内 Ping 存储；失败 503，应摘流量但不要重启 |
 
-镜像默认 `HEALTHCHECK` 用 `/healthz`；compose 的 `api` 通过 `HEALTHCHECK_URL` 覆盖为 readiness，供 `caddy` 的 `service_healthy` 使用。
+镜像默认 `HEALTHCHECK` 用 `/healthz`；compose 的 `api1`/`api2` 通过 `HEALTHCHECK_URL` 覆盖为 readiness，供 `caddy` 的 `service_healthy` 使用。
 
 #### 备份与恢复（可执行脚本）
 
@@ -487,7 +487,7 @@ curl -sk "https://localhost/api/v1/sync/changes?cursor=$s1"     -H "Authorizatio
 命令：
 
 ```bash
-RATE_LIMIT_PER_MINUTE=0 docker compose up -d api
+RATE_LIMIT_PER_MINUTE=0 docker compose up -d api1 api2
 go run ./cmd/loadgen -base-url https://localhost -duration 30s -warmup 3s
 # 单场景：-scenario devices|push|series
 ```
@@ -1013,6 +1013,9 @@ PJGoIoT/
 | `FIXTURES_DIR` | `./fixtures` | fixture 模式数据目录 |
 | `RATE_LIMIT_PER_MINUTE` | `120` | 每 IP 每分钟令牌数；`<=0` 关闭限流 |
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
+| `RATE_LIMIT_BACKEND` | `memory` | `memory`（进程内，默认）或 `postgres`（跨实例共享计数；要求 `STORE=postgres`） |
+| `SHUTDOWN_DRAIN_SECONDS` | `5` | 收到 SIGTERM 后先把 readiness 置 503、继续服务的时间（compose 默认 8s） |
+| `INSTANCE_ID` | 空 | 写入响应头 `X-Instance`，用于确认请求由哪个实例处理 |
 | `PAIRING_CLAIM_RATE_PER_MINUTE` | `20` | 配对码领取接口的每 IP 每分钟令牌数；`<=0` 关闭该接口独立限流 |
 | `PAIRING_CLAIM_BURST` | `10` | 配对码领取接口的每 IP 令牌桶容量 |
 | `METRICS_ENABLED` | `true` | 是否注册根路径 `/metrics`；生产可关闭或仅内网暴露 |
@@ -1020,7 +1023,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.10.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
+| `APP_VERSION` | `0.11.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1147,6 +1150,13 @@ seed 数据来源与边界：
 | v0.10.0 故障注入 | 通过（本机 Docker PG + 本机 API）：停机 36s 期间 `my/devices`/`push` 30/30 为 503 `UNAVAILABLE`，`/healthz` 30/30 为 200，`/api/v1/health` 30/30 为 503；重启后 0s 自愈；`statement_timeout=100ms` → 3 次 503 `TIMEOUT` 且 `db_errors_total` 0→3；池=2 时 devices 200 并发 7 330 请求 p95 540ms 0% 错误，push 100 并发 113×200 + 137×503 p95 10.2s |
 | v0.10.0 迁移演练 | 通过：`scripts/migrate-drill.sh` 三场景可重复执行——空库→9；000001 数据→9 且 `platform/external_id/device_type/expires_at` 回填正确；down 8 步→1 再 up→9，`users/tokens/user_devices/change_log` 行数 1/1/1/1 不丢（readings 因 000006 down 归零，已知语义） |
 | v0.10.0 GitHub Actions | **通过**（run 42007845297，commit c61e0c6）：`构建与测试`、`构建镜像`、`配置与脚本校验`（含 `scripts/migrate-drill.sh` 的 `bash -n`/shellcheck）、`压测门槛（smoke）`（devices p95 11ms / push 392ms / series 6ms，错误率 0%，`SMOKE PASS`）均 success；tag `v0.10.0` 指向 c61e0c6 |
+| v0.11.0 双实例负载均衡 | 通过：`scripts/multi-instance-check.sh` 经 Caddy 打 20 次探测，`api1`/`api2` 各 10 次；两个实例共享同一 Postgres |
+| v0.11.0 跨实例 seq 与游标 | 通过：30 个并发 push 打到两个实例，同时轮询 `/sync/changes`；最终 `change_log` 31 条与拉取集合完全一致，`seq` 严格递增、无缺口、无越过未提交变更 |
+| v0.11.0 跨实例幂等 | 通过：同一 `Idempotency-Key` 在实例 A 首次 200，重放打到实例 B 返回 200 且 `Idempotent-Replayed: true`、响应体一致；同 key 不同 body → 409 `IDEMPOTENCY_CONFLICT` |
+| v0.11.0 摘流行为 | 通过：`api1` 停止期间持续 160 个请求经 Caddy 全部 200（0 个 502），尾部只由 `api2` 服务；重启 `api1` 后重新接流量 |
+| v0.11.0 滚动发布 | 通过：`scripts/rolling-restart.sh` 532 个请求全部 200，502=0、连接失败=0，停机请求数 **0**（`api1=239`、`api2=293`） |
+| v0.11.0 并发迁移 | 通过：`scripts/migration-concurrency-check.sh` 外部持有 migrate advisory lock 5s，两个实例同时启动均在 5 261ms 后就绪，最终 `version=10 dirty=false`、`schema_migrations` 仅 1 行、5 张关键表存在 |
+| v0.11.0 限流真相 | 通过：`scripts/shared-rate-limit-check.sh`，memory 后端双实例放行 6/分钟（2 倍额度）；postgres 后端全局只放行 3 个，两个实例均返回 429 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1157,6 +1167,63 @@ seed 数据来源与边界：
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
   go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v
 ```
+
+## 多实例部署（v0.11.0）
+
+compose 默认起两个 API 实例 `api1`、`api2`，共享同一个 Postgres；Caddy 在两者之间做
+轮询负载均衡（`lb_policy round_robin`），并用主动健康检查（`/api/v1/health`，2s 间隔）
+自动摘除不健康实例。两个实例都在内部 `backend` 网络里，只有 Caddy 暴露 80/443。
+
+```bash
+docker compose up -d --build
+docker compose ps                       # api1/api2/postgres 均 healthy，caddy Up
+curl -k https://localhost/api/v1/health # 响应头 X-Instance: api1 或 api2
+```
+
+- `X-Instance` 来自 `INSTANCE_ID`，用于确认实际服务实例；不参与业务契约。
+- 两个实例启动时都会执行迁移，golang-migrate 使用 PG advisory lock 串行化；
+  实测第二个实例会等待锁而不是并发执行（见 runbook §9.10）。
+- 迁移必须先于新代码完成（前滚设计）；滚动发布脚本会逐实例摘流、重启并等待健康。
+- 会话不落进程：token、幂等键、`change_log` 都在 Postgres，任何实例都能处理任意请求。
+- 限流默认仍是**进程内计数**，双实例等于 2 倍额度；需要全局额度时设置
+  `RATE_LIMIT_BACKEND=postgres`（见下节）。
+
+### 滚动发布
+
+```bash
+bash scripts/rolling-restart.sh        # 逐实例摘流 → stop → start → 等健康 → 归还流量
+```
+
+脚本在全程持续打请求（经 Caddy，约 20 req/s），每个实例执行：
+
+1. `docker compose stop <instance>`：SIGTERM 后 readiness 立即返回 503，Caddy 健康检查
+   把它摘除；进程仍继续服务 `SHUTDOWN_DRAIN_SECONDS`（compose 默认 8s）后退出；
+2. `docker compose start <instance>`，等待 healthy；
+3. 继续观察 3s，确认该实例重新接流量。
+
+实测 532 个请求全部 200（0 个 502、0 个连接失败），停机请求数为 **0**。
+
+### 限流边界
+
+| 后端 | 计数范围 | 双实例实际额度 | 代价 |
+| --- | --- | --- | --- |
+| `memory`（默认） | 单进程 | **2× `RATE_LIMIT_PER_MINUTE`** | 无额外依赖；额度随实例数线性放大 |
+| `postgres` | 全实例共享 | 1× | 每个限流请求 1 次 UPSERT；高并发同一 IP 会在单行上排队；DB 故障时**降级为进程内限流**并打 warn 日志 |
+
+`postgres` 后端使用 `rate_limit_buckets` 表（迁移 `000010`）做令牌桶，单条
+`INSERT ... ON CONFLICT ... RETURNING` 原子扣减；每 5 分钟惰性清理 10 分钟未更新的桶。
+
+实测（`scripts/shared-rate-limit-check.sh`，额度 3/分钟、burst 3）：
+
+- `memory`：两个实例合计放行 6 个请求，第 7 个起 429 → 确认为 2 倍额度；
+- `postgres`：两个实例合计只放行 3 个，两个实例都返回 429 → 全局额度生效。
+
+取值建议：
+
+- 单实例，或已有前置网关/云 WAF 做全局限流 → `memory` 即可；
+- 多实例且限流是硬约束（防刷、防配额滥用）→ `postgres`；接受每请求一次数据库写，
+  并监控 `pjgoiot_db_errors_total`；Redis 未引入（多一个需要高可用与持久化运维的组件）。
+- `RATE_LIMIT_PER_MINUTE<=0` 仍然完全关闭限流（压测用）。
 
 ## 已知限制与下一步
 
@@ -1169,7 +1236,7 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - `/metrics` 的 `route` 标签依赖 Gin 路由模板；若新增通配路由，需要同步扩展 `routeLabel`，否则会退化为通配模板（不影响正确性，只降低可分性）。
 - 读数查询要求设备已存在于 `user_devices`；隐式设备写入的读数在注册前不可查。
 - 读数支持单指标聚合（`min/max/avg/last`）、UTC 对齐的 `1m/1h/1d` 分桶序列，以及设备维度指标清单；跨指标合并统计按需再扩展。
-- 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
+- 限流默认是单进程内存令牌桶，多实例部署时各实例独立计数（N 个实例约 N 倍额度）；需要全局限流时设置 `RATE_LIMIT_BACKEND=postgres`，其单行热点与数据库故障降级语义见「限流边界」。
 - fixture 模式的用户与设备数据在重启后丢失，仅用于本地联调与测试。
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。
 - 删除时 payload 采用本次 push 提交的字段；客户端删除前应提交完整业务字段，或仅依赖 `deletedAt`。

@@ -57,7 +57,7 @@ type exportResp struct {
 func newHandlerWithStore(t *testing.T, cfg config.Config, st *fixture.Store) http.Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return httpapi.New(cfg, st, logger)
+	return httpapi.New(cfg, st, logger, nil)
 }
 
 func createPairingCode(t *testing.T, h http.Handler, token string) pairingCodeResp {
@@ -392,7 +392,7 @@ func TestRequestIDAndLogs(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	h2 := httpapi.New(config.Config{Version: "test", MetricsEnabled: true}, st, logger)
+	h2 := httpapi.New(config.Config{Version: "test", MetricsEnabled: true}, st, logger, nil)
 	user := newUser(t, h2)
 	do(t, h2, http.MethodGet, "/api/v1/my/devices", "", user.Token, map[string]string{"X-Request-Id": "log-req-1"})
 

@@ -29,7 +29,7 @@ func newHandler(t *testing.T, rateLimit int) http.Handler {
 		RateLimitPerMin:    rateLimit,
 		RateLimitBurst:     rateLimit,
 		MetricsEnabled:     true,
-	}, st, logger)
+	}, st, logger, nil)
 }
 
 func do(t *testing.T, h http.Handler, method, path, body, token string, headers map[string]string) *httptest.ResponseRecorder {

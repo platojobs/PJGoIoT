@@ -1,0 +1,11 @@
+# 仅用于本地/CI 的多实例实测：把 api1/api2 直接发布到回环端口，便于把请求精确打到某个实例。
+# 生产不要使用本文件——外部流量必须只经 Caddy（HTTPS 终止 + 负载均衡）。
+#
+# 用法：docker compose -f docker-compose.yml -f deploy/compose.multi-instance-test.yml up -d
+services:
+  api1:
+    ports:
+      - "127.0.0.1:18081:8080"
+  api2:
+    ports:
+      - "127.0.0.1:18082:8080"

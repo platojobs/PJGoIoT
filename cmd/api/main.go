@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,7 +74,9 @@ func main() {
 	}
 	cleanupCancel()
 
-	handler := httpapi.New(cfg, st, logger)
+	// draining 为 true 后 readiness 立即返回 503；滚动发布脚本依赖该信号让反代先摘流量。
+	var draining atomic.Bool
+	handler := httpapi.New(cfg, st, logger, &draining)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
@@ -84,7 +87,8 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("服务启动", "addr", cfg.Addr, "store", cfg.StoreBackend, "version", cfg.Version)
+		logger.Info("服务启动", "addr", cfg.Addr, "store", cfg.StoreBackend,
+			"version", cfg.Version, "instance", cfg.InstanceID)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP 服务异常退出", "error", err)
 			os.Exit(1)
@@ -95,7 +99,17 @@ func main() {
 	defer stop()
 	<-ctx.Done()
 
-	logger.Info("收到退出信号，开始优雅关闭")
+	// 优雅下线分两步：
+	//  1. 先把 readiness 置为失败，让 Caddy 在 health_interval 内把本实例摘掉；
+	//  2. 继续服务 drain 窗口，等待已经路由到本实例的请求完成，再真正关闭。
+	// 若跳过第 2 步，反代在“发现不健康”之前仍可能把新请求打到正在退出的进程上，产生 502。
+	logger.Info("收到退出信号，开始优雅关闭", "drain", cfg.ShutdownDrain.String(), "instance", cfg.InstanceID)
+	draining.Store(true)
+	if cfg.ShutdownDrain > 0 {
+		time.Sleep(cfg.ShutdownDrain)
+	}
+
+	logger.Info("drain 结束，关闭 HTTP 服务")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {

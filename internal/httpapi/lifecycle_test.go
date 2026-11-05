@@ -71,7 +71,7 @@ func newStubHandler(t *testing.T, st store.Store) http.Handler {
 		CORSAllowedOrigins: []string{"*"},
 		MetricsEnabled:     true,
 		TokenTTLDays:       180,
-	}, st, logger)
+	}, st, logger, nil)
 }
 
 func newFixtureStore(t *testing.T) *fixture.Store {

@@ -1,7 +1,67 @@
-# 生产形态编排：Caddy（HTTPS 终止/反代）→ API → PostgreSQL。
+# 生产形态编排：Caddy（HTTPS 终止/反代 + 双实例负载均衡）→ api1/api2 → PostgreSQL。
 # 本地默认 http://localhost 自动跳转 https://localhost（Caddy 自签证书）。
 # 已在本地按 docs/runbook.md「本地栈自检步骤」实际运行并验证（见该文档 §0/§9）。
 name: pjgoiot
+
+# 两个 API 实例共享同一份配置，只有 INSTANCE_ID 不同。
+# YAML 锚点会被 `docker compose config` 展开；修改端口/镜像/依赖时只改这里。
+x-api-common: &api-common
+  build:
+    context: .
+    args:
+      APP_VERSION: "0.11.0"
+      GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
+  image: pjgoiot-api:0.11.0
+  restart: unless-stopped
+  environment: &api-env
+    STORE: postgres
+    DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
+    ADDR: ":8080"
+    APP_VERSION: "0.11.0"
+    # 启动即迁移；golang-migrate 自带数据库级 advisory lock，双实例同时启动时
+    # 只有一个实例真正执行迁移，另一个等待锁后发现已是最新版本。
+    RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
+    # memory：进程内令牌桶（默认，单实例语义）；postgres：跨实例共享计数。
+    # 双实例下若保持 memory，实际额度是配置值的 2 倍（见 README「限流边界」）。
+    RATE_LIMIT_BACKEND: "${RATE_LIMIT_BACKEND:-memory}"
+    RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
+    RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-40}"
+    PAIRING_CLAIM_RATE_PER_MINUTE: "${PAIRING_CLAIM_RATE_PER_MINUTE:-20}"
+    PAIRING_CLAIM_BURST: "${PAIRING_CLAIM_BURST:-10}"
+    CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+    LOG_LEVEL: "${LOG_LEVEL:-info}"
+    # token 有效期（天）；过期后中间件返回 401，cleanup 负责删除。
+    TOKEN_TTL_DAYS: "${TOKEN_TTL_DAYS:-180}"
+    # /metrics 仅在容器网络内可达；Caddy 显式拒绝公网访问该路径。
+    METRICS_ENABLED: "${METRICS_ENABLED:-true}"
+    # 健康检查走 readiness（含数据库 Ping）；镜像默认 liveness 为 /healthz。
+    HEALTHCHECK_URL: "http://127.0.0.1:8080/api/v1/health"
+    # 收到 SIGTERM 后先把 readiness 切为 503（Caddy 摘流），继续服务 N 秒再关闭。
+    # 必须大于 Caddy 的健康检查发现时间（health_interval 2s）；容器 stop_grace_period 为 20s。
+    SHUTDOWN_DRAIN_SECONDS: "${SHUTDOWN_DRAIN_SECONDS:-8}"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # 不发布 8080 到宿主机：所有外部流量必须经 Caddy（HTTPS + 安全头）。
+  expose:
+    - "8080"
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+    - edge
+  # Docker 默认 stop 只等 10s；drain 8s + 关闭 HTTP 需要更多余量。
+  stop_grace_period: 20s
+  healthcheck:
+    # readiness（含 DB Ping）；失败即被 Caddy 与 Docker 标记为不健康。
+    test: ["CMD", "/api", "-healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 15s
 
 services:
   postgres:
@@ -26,47 +86,21 @@ services:
       - no-new-privileges:true
     networks:
       - backend
+      # Docker 的 internal 网络不会建立端口映射；额外挂一个普通桥接网络，
+      # 才能把 5432 发布到宿主机回环（仅供本地测试/备份，生产可删掉该网络与 ports）。
+      - dbhost
 
-  api:
-    build:
-      context: .
-      args:
-        APP_VERSION: "0.10.0"
-    image: pjgoiot-api:0.10.0
-    restart: unless-stopped
+  api1:
+    <<: *api-common
     environment:
-      STORE: postgres
-      DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
-      ADDR: ":8080"
-      APP_VERSION: "0.10.0"
-      # 启动即迁移；迁移失败进程退出，不会以旧 schema 半可用运行。
-      RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
-      RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
-      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-40}"
-      PAIRING_CLAIM_RATE_PER_MINUTE: "${PAIRING_CLAIM_RATE_PER_MINUTE:-20}"
-      PAIRING_CLAIM_BURST: "${PAIRING_CLAIM_BURST:-10}"
-      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
-      LOG_LEVEL: "${LOG_LEVEL:-info}"
-      # token 有效期（天）；过期后中间件返回 401，cleanup 负责删除。
-      TOKEN_TTL_DAYS: "${TOKEN_TTL_DAYS:-180}"
-      # /metrics 仅在容器网络内可达；Caddy 显式拒绝公网访问该路径。
-      METRICS_ENABLED: "${METRICS_ENABLED:-true}"
-      # 健康检查走 readiness（含数据库 Ping）；镜像默认 liveness 为 /healthz。
-      HEALTHCHECK_URL: "http://127.0.0.1:8080/api/v1/health"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    # 不发布 8080 到宿主机：所有外部流量必须经 Caddy（HTTPS + 安全头）。
-    expose:
-      - "8080"
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - backend
-      - edge
+      <<: *api-env
+      INSTANCE_ID: api1
+
+  api2:
+    <<: *api-common
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api2
 
   caddy:
     image: caddy:2.8-alpine
@@ -83,7 +117,9 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      api:
+      api1:
+        condition: service_healthy
+      api2:
         condition: service_healthy
     security_opt:
       - no-new-privileges:true
@@ -97,8 +133,9 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.10.0"
-    image: pjgoiot-api:0.10.0
+        APP_VERSION: "0.11.0"
+        GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
+    image: pjgoiot-api:0.11.0
     entrypoint: ["/cleanup"]
     command:
       - "-retention-days"
@@ -133,3 +170,5 @@ networks:
   backend:
     internal: true
   edge:
+  # 仅用于把 Postgres 端口映射到宿主机回环（internal 网络无法发布端口）。
+  dbhost:

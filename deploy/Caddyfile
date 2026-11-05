@@ -1,4 +1,4 @@
-# Caddy：HTTPS 终止 + 反向代理。域名由 compose 的 DOMAIN 环境变量注入。
+# Caddy：HTTPS 终止 + 反向代理 + 双实例负载均衡。域名由 compose 的 DOMAIN 环境变量注入。
 # 本地默认 DOMAIN=localhost，使用 Caddy 内置 CA 自签证书（浏览器会提示不受信任）。
 # 生产：把 `tls internal` 改为 `tls <你的邮箱>`，并把 DOMAIN 设为真实域名（需 80/443 可达）。
 {$DOMAIN:localhost} {
@@ -19,10 +19,22 @@
 		-Server
 	}
 
-	reverse_proxy api:8080 {
-		health_uri /healthz
-		health_interval 30s
-		health_timeout 3s
+	# 上游：api1 / api2 共享同一 Postgres。轮询即可；两个实例权重相同。
+	# - 健康检查用 readiness（/api/v1/health）：DB 不可用或实例正在 drain 时返回 503，
+	#   Caddy 立即把该实例摘掉，而不是把 5xx 透传给客户端。
+	# - lb_try_duration/lb_retries：实例刚被摘除或连接被拒时，在 3s 内换另一个上游重试，
+	#   覆盖“健康检查还没来得及发现”的窗口。
+	reverse_proxy api1:8080 api2:8080 {
+		lb_policy round_robin
+		lb_try_duration 3s
+		lb_retries 2
+
+		health_uri /api/v1/health
+		health_interval 2s
+		health_timeout 2s
+		health_status 200
+		max_fails 1
+		fail_duration 5s
 	}
 
 	log {

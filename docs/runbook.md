@@ -1,6 +1,7 @@
-# PJGoIoT 运行手册（v0.10.0）
+# PJGoIoT 运行手册（v0.11.0）
 
-> 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机部署形态（Caddy → API → PostgreSQL）。
+> 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
+> （Caddy → `api1`/`api2` → PostgreSQL）。
 > 本手册区分「已验证」与「未验证」，未实际执行的步骤不得当作已验证结论。
 
 ## 0. 本机验证状态（2026-11-05）
@@ -36,9 +37,16 @@
 | v0.10.0 push 整批单事务与计数守恒 | **已验证** | 真实 PG `TestPushTransactionBoundaries`：重复 id/键 400、读数校验失败整批回滚、5 个崩溃注入点零残留、`applied+skipped==len(readings)`、并发 push 游标无缺口 |
 | v0.10.0 故障注入（停机/重启/慢查询/连接池） | **已验证** | 见 §9.9：PG 停 36s 全部 503 `UNAVAILABLE`；重启 0s 自愈；100ms `statement_timeout` → 503 `TIMEOUT`；池=2 高并发排队后 503 `TIMEOUT` |
 | v0.10.0 迁移演练脚本 | **已验证** | `bash scripts/migrate-drill.sh` 三场景可重复执行：空库→9、000001 数据→9 回填、down 8 步→1 再 up→9；见 §9.9 |
+| v0.11.0 双实例 + Caddy 负载均衡 | **已验证** | 20 次探测 `api1`/`api2` 各 10 次；响应头 `X-Instance` 正确；见 §9.10 |
+| v0.11.0 跨实例 seq 与游标 | **已验证** | 30 个并发 push 打到两个实例并同时轮询 changes；31 条 seq 与库内集合一致、严格递增、无缺口 |
+| v0.11.0 跨实例幂等 | **已验证** | 同 key 实例 A 首次 200，实例 B 重放 200 + `Idempotent-Replayed: true`；不同 body 409 `IDEMPOTENCY_CONFLICT` |
+| v0.11.0 停止实例摘流 | **已验证** | `api1` 停止期间 160 个请求全部 200、0 个 502；重启后恢复接流量 |
+| v0.11.0 滚动发布 | **已验证** | `scripts/rolling-restart.sh` 532 请求全 200，停机请求数 **0**（api1=239 / api2=293） |
+| v0.11.0 并发迁移 | **已验证** | advisory lock 外部持有 5s，两实例同时启动均 5 261ms 后就绪，`version=10 dirty=false`、迁移表仅 1 行 |
+| v0.11.0 共享限流 | **已验证** | memory 双实例 3/分钟额度实际放行 6；postgres 后端全局只放行 3，两实例均 429 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
-| 数小时长稳压 / 多实例 | **未验证** | 仅做 30s/场景短时压测与 10s smoke 及 v0.10.0 故障注入；未做数小时长稳与多实例限流 |
+| 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
 | Android/iOS 真机局域网访问 e2e 栈 | **未验证** | 栈绑定 127.0.0.1，仅验证模拟器可用路径；两个客户端仓库本轮未实际执行 |
 
 ## 1. 部署前检查清单
@@ -69,26 +77,27 @@ EOF
 # 2) 静态校验编排
 docker compose config --quiet
 
-# 3) 构建并启动（postgres 健康后 api 才启动；api 启动时自动迁移）
+# 3) 构建并启动（postgres 健康后 api1/api2 才启动；两个实例启动时都会尝试迁移）
 docker compose up -d --build
 
-# 4) 等待 api 健康（readiness 含数据库 Ping）
+# 4) 等待两个实例健康（readiness 含数据库 Ping）
 docker compose ps
-docker compose exec api /api -healthcheck
+docker compose exec api1 /api -healthcheck
+docker compose exec api2 /api -healthcheck
 
-# 5) 验证 HTTPS 终止与反向代理（自签证书用 -k）
+# 5) 验证 HTTPS 终止与反向代理（自签证书用 -k；X-Instance 显示实际实例）
 curl -k https://localhost/api/v1/health
 curl -k https://localhost/healthz
-# /metrics 不应被公网读到（Caddy 返回 404）
 curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 ```
 
 首次启动行为：
 
 - `postgres` 先拉起并通过 `pg_isready` 健康检查；
-- `api` 仅在 `postgres` healthy 后启动，并执行迁移（`RUN_MIGRATIONS_ON_BOOT=true`）；
+- `api1`/`api2` 仅在 `postgres` healthy 后启动，并各执行迁移（`RUN_MIGRATIONS_ON_BOOT=true`）；
+  两个实例同时启动时由 golang-migrate 的 PG advisory lock 串行化，后到者等待，不会重复建表；
 - 迁移失败（含 dirty）→ 进程非零退出，`restart: unless-stopped` 会重试；**不会在旧 schema 上提供服务**；
-- `caddy` 等 `api` 健康后才启动，避免 502。
+- `caddy` 等两个实例都健康后才启动，避免 502。
 
 健康探针区别：
 
@@ -97,16 +106,29 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 | `GET /healthz` | liveness（进程存活） | 否 | 进程卡死/未启动，应重启容器 |
 | `GET /api/v1/health` | readiness（可服务） | 是（2s 超时 Ping） | 数据库不可用，摘流量但不要重启 |
 
-## 3. 升级流程
+## 3. 升级流程（滚动发布）
 
 1. **备份**（必须先做）：`./deploy/scripts/backup.sh`
 2. **预检迁移**：只跑迁移、不启动服务：
-   `docker compose run --rm --no-deps --entrypoint /migrate api -direction up`（本轮已实测，输出 `迁移完成 version=8 dirty=false`）。
-3. **构建新镜像**：`APP_VERSION=0.8.0 docker compose build api`
-4. **滚动替换**：`docker compose up -d api caddy`
+   `docker compose run --rm --no-deps --entrypoint /migrate api1 -direction up`。
+3. **构建新镜像**：`APP_VERSION=0.11.0 docker compose build`
+4. **逐实例滚动替换**：
+   ```bash
+   bash scripts/rolling-restart.sh
+   ```
+   脚本对 `api1`、`api2` 依次执行：`stop`（SIGTERM → readiness 503 → Caddy 摘流 →
+   继续服务 `SHUTDOWN_DRAIN_SECONDS`）→ `start` → 等 healthy → 观察 3s 重新接流量。
+   全程持续打请求并统计非 200 数量；v0.11.0 实测停机请求数为 0。
+   也可手工执行同样顺序：
+   ```bash
+   docker compose stop api1 && docker compose start api1
+   docker compose exec api1 /api -healthcheck
+   docker compose stop api2 && docker compose start api2
+   docker compose exec api2 /api -healthcheck
+   ```
 5. **验证**：
-   - `docker compose exec api /api -healthcheck`
-   - `curl -k https://$DOMAIN/api/v1/health`
+   - `docker compose exec api1 /api -healthcheck`、`docker compose exec api2 /api -healthcheck`
+   - `curl -k https://$DOMAIN/api/v1/health`（多打几次，看 `X-Instance` 是否两个实例都能命中）
    - `curl -k https://$DOMAIN/healthz`
    - 抽查 `GET /my/devices`、`POST /sync/push`（用测试账号）；
    - 查看 `/metrics` 的 5xx 与延迟是否正常。
@@ -116,15 +138,20 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 
 - 迁移是**前滚**设计；新版本必须先迁移再切流量。
 - `RUN_MIGRATIONS_ON_BOOT=false` 仅用于「迁移由独立 Job 执行」的编排；此时必须保证迁移先完成。
+- 两个实例版本不一致期间（滚动窗口内），新旧代码必须兼容同一 schema；本项目迁移只加列/加表，
+  但新增业务字段时仍需按“先迁移、后切流量”的顺序。
+- `RATE_LIMIT_BACKEND=postgres` 时，滚动期间限流额度不会翻倍（计数在数据库）；`memory` 时
+  滚动窗口内额度会短暂按新旧实例组合叠加。
 
 ## 4. 回滚流程
 
 ### 4.1 只回滚镜像（推荐）
 
 ```bash
-# 将 compose 中 api 镜像/构建版本改回上一版本号后
-docker compose up -d --no-deps api
-docker compose exec api /api -healthcheck
+# 将 compose 中 api1/api2 镜像/构建版本改回上一版本号后，逐实例滚动
+bash scripts/rolling-restart.sh
+docker compose exec api1 /api -healthcheck
+docker compose exec api2 /api -healthcheck
 ```
 
 前提：**新版本迁移没有破坏旧代码依赖的列/语义**。本项目 000003–000008 迁移均为加列/加表/加索引，
@@ -133,8 +160,8 @@ docker compose exec api /api -healthcheck
 ### 4.2 回滚迁移（高风险，谨慎）
 
 ```bash
-# 只回退一步（示例：7 → 6）
-docker compose run --rm --entrypoint /migrate api -direction down
+# 只回退一步（示例：9 → 8）
+docker compose run --rm --entrypoint /migrate api1 -direction down
 ```
 
 风险：
@@ -181,7 +208,7 @@ DATABASE_URL='postgres://pjgoiot:<pass>@127.0.0.1:55432/pjgoiot_restoretest?sslm
 ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
 
 # 方式 B：docker 模式，直接恢复到 compose 的 postgres 库
-# 建议先 `docker compose stop api`，恢复完成后再 start，避免恢复期间业务写入
+# 建议先 `docker compose stop api1 api2`，恢复完成后再 start，避免恢复期间业务写入
 RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
 ```
 
@@ -298,7 +325,7 @@ SELECT count(*) FROM user_devices;
 
 ### 7.1 API 启动即退出 / 数据库连接失败
 
-- 看 `docker compose logs api`，确认 `DATABASE_URL` 主机名是 `postgres`（compose 服务名），不是 `localhost`；
+- 看 `docker compose logs api1 api2`，确认 `DATABASE_URL` 主机名是 `postgres`（compose 服务名），不是 `localhost`；
 - `pg_isready` 是否健康：`docker compose ps postgres`；
 - 密码含特殊字符需 URL 编码；`sslmode=disable` 仅用于内网；
 - 迁移失败会打印 `启动迁移失败`，进程退出是预期行为。
@@ -307,14 +334,16 @@ SELECT count(*) FROM user_devices;
 
 - 现象：启动日志 `Dirty database version N. Fix and force version.`；
 - 处理：`SELECT * FROM schema_migrations;` 确认实际 schema；修复失败 SQL 或用备份恢复；
-- 清理 dirty（确认 schema 已正确后）：`docker compose run --rm --entrypoint /migrate api -direction force -version <N>`；
+- 清理 dirty（确认 schema 已正确后）：`docker compose run --rm --entrypoint /migrate api1 -direction force -version <N>`；
 - **不要**在 dirty 状态下反复重启。
 
 ### 7.3 大量 429
 
 - `RATE_LIMIT_PER_MINUTE`/`BURST` 过小，或客户端重试风暴；
 - 配对码领取有独立限流：`PAIRING_CLAIM_RATE_PER_MINUTE`/`PAIRING_CLAIM_BURST`；
-- 通过访问日志按 `ip`、`path` 聚合定位来源；确认没有共享出口 IP 误伤。
+- 通过访问日志按 `ip`、`path` 聚合定位来源；确认没有共享出口 IP 误伤；
+- **多实例**：`RATE_LIMIT_BACKEND=memory` 时每个实例独立计数，双实例额度约为配置值的 2 倍；
+  若 429 数量与配置明显不符，先确认后端与实例数（`docker compose exec api1 printenv | grep RATE_LIMIT`）；
 
 ### 7.4 `/metrics` 为空或 404
 
@@ -459,7 +488,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   docker compose logs --tail=50 postgres
   docker compose exec -T postgres pg_isready -U pjgoiot
   # API 日志里应能看到 "数据库暂时不可用" + request_id
-  docker compose logs --tail=100 api | grep -E "UNAVAILABLE|数据库暂时不可用|request_id"
+  docker compose logs --tail=100 api1 api2 | grep -E "UNAVAILABLE|数据库暂时不可用|request_id"
   ```
 - 重启 API 不是必需的：`database/sql` 会丢弃坏连接，Postgres 恢复后首个请求即成功
   （v0.10.0 实测停机 36s 后恢复用时 0s，无需重启 API）。
@@ -475,7 +504,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
     -c "SELECT state, count(*) FROM pg_stat_activity WHERE datname='pjgoiot' GROUP BY state;"
   # 连接池配置（默认 20/10）
-  docker compose exec -T api printenv | grep DB_MAX
+  docker compose exec -T api1 printenv | grep DB_MAX
   ```
 - 处理：先按 §7.7 找慢 SQL；确认数据库本身不慢后，再把 `DB_MAX_OPEN_CONNS` 调到
   覆盖预期并发。**不要**通过调大 HTTP `ReadTimeout` 掩盖排队（v0.10.0 已给鉴权查询加 3s 预算，
@@ -490,6 +519,55 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 
 排障时不要用 `/healthz` 200 来判断“服务可用”；判断数据库链路必须看 `/api/v1/health`。
 
+### 7.12 多实例 / 滚动发布排障（v0.11.0）
+
+#### 7.12.1 只有 `api1` 接到流量
+
+- Caddy 主动健康检查依赖 `/api/v1/health`；若某实例 readiness 失败，Caddy 会摘除它：
+  `docker compose exec caddy wget -qO- http://api1:8080/api/v1/health`、
+  `docker compose logs --tail=50 api1`；
+- 确认 `deploy/Caddyfile` 的 upstream 同时包含 `api1:8080` 与 `api2:8080`；
+- 连续请求看实例分布：
+  ```bash
+  for i in $(seq 1 10); do
+    curl -sk -D - -o /dev/null https://localhost/api/v1/health | grep -i x-instance
+  done
+  ```
+
+#### 7.12.2 滚动期间出现 502
+
+- 正常滚动**不该**有 502：SIGTERM 后实例先把 readiness 置 503，Caddy 2s 健康检查摘除，
+  进程再继续服务 `SHUTDOWN_DRAIN_SECONDS`（compose 默认 8s）；
+- 若出现 502，依次检查：
+  1. `SHUTDOWN_DRAIN_SECONDS` 是否小于 Caddy 摘除所需时间（至少 2 个健康检查周期）；
+  2. `docker compose ps` 的 `stop_grace_period` 是否被改小；
+  3. Caddy 日志 `docker compose logs caddy` 是否有 `no healthy upstreams`；
+- 回滚方式：`docker compose up -d api1 api2` 重新拉起两个实例，再重跑滚动脚本。
+
+#### 7.12.3 迁移锁等待
+
+- 两个实例同时启动时，后到者会等待 advisory lock；日志出现
+  `try lock failed` / 迁移耗时变长是**预期**，不是脏数据；
+- 确认锁与迁移状态：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+    -c "SELECT locktype, classid, objid, pid, granted FROM pg_locks WHERE locktype='advisory';"
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+    -c "SELECT * FROM schema_migrations;"
+  ```
+- 若长时间不结束，先确认是否有实例在做 DDL；不要在两个实例上同时手工执行迁移。
+- 迁移完成后两个实例都会继续启动；`schema_migrations` 只应有 1 行。
+
+#### 7.12.4 共享限流后端
+
+- `RATE_LIMIT_BACKEND=postgres` 时，限流依赖 `rate_limit_buckets` 表（迁移 000010）；
+  表不存在会启动失败（配置校验要求先完成迁移）；
+- 数据库故障时限流**降级为进程内**并打 warn 日志：
+  `docker compose logs api1 api2 | grep -i '限流'`；这是可用性优先的取舍，
+  故障期间全局限流退化为单实例限流；
+- 热点 IP 会在单行上排队；若 `pg_stat_activity` 出现大量相同 `bucket` 的等待，
+  考虑前置网关限流或调大 `RATE_LIMIT_PER_MINUTE`。
+
 ## 8. 监控与告警
 
 - 抓取目标：`api:8080/metrics`（内网），样例见 `deploy/prometheus/scrape.yml`；
@@ -502,7 +580,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   `pjgoiot_http_request_duration_seconds_bucket{route="..."}`；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0）
+## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0 / v0.10.0 / v0.11.0）
 
 ### 9.1 构建与启动
 
@@ -792,6 +870,73 @@ GitHub Actions（run 42007845297，commit c61e0c6，tag `v0.10.0`）：`构建�
 `配置与脚本校验`（含 `scripts/migrate-drill.sh` 的 `bash -n`/shellcheck）、`压测门槛（smoke）`
 （devices p95 11ms / push 392ms / series 6ms，错误率 0%）均 success。
 
+### 9.10 v0.11.0 多实例、滚动发布与限流（真实输出）
+
+四个脚本均可重复执行，前置条件：Docker daemon、80/443/55432 可用，且本地已有
+`pjgoiot-api:0.11.0` 镜像（`NO_BUILD=1` 时不重新构建）。
+
+#### 9.10.1 双实例与 Caddy 负载均衡（`scripts/multi-instance-check.sh`）
+
+```text
+[ok] api1 ready（X-Instance: api1）
+[ok] api2 ready（X-Instance: api2）
+[ok] Caddy 负载均衡：20 次探测 api1=10 api2=10
+[ok] 跨实例鉴权：实例 A 登录、实例 B 复用 token 读 /my/devices
+[ok] 跨实例幂等：A 首次 200；B 重放 200 + Idempotent-Replayed: true，body 一致
+[ok] 同 key 不同 body：409 IDEMPOTENCY_CONFLICT
+[ok] 并发 push：30 批打到两个实例，change_log 共 31 条
+[ok] 游标：轮询 /sync/changes 拉到的 seq 集合 == 库内集合，严格递增、无缺口
+[ok] 停止 api1：160 个请求经 Caddy 全部 200（0 个 502），尾部只由 api2 服务
+[ok] 重启 api1：重新 healthy 并恢复接流量
+```
+
+`seq` 严格有序的原因不是“单实例串行”，而是 push 事务内对用户行持有
+`pg_advisory_xact_lock`，`change_log` 的 `seq` 在该事务提交前不会对其他事务可见；
+两个实例并发 push 同一用户时按事务串行，不同用户互不阻塞。游标只有在 `seq` 已提交后才可见，
+因此不会越过未提交变更。
+
+#### 9.10.2 滚动发布停机请求数（`scripts/rolling-restart.sh`）
+
+```text
+负载：2 个 worker 经 Caddy，约 20 req/s
+逐实例：stop（SIGTERM drain）→ start → wait healthy → 观察 3s
+结果：总请求=532 非200=0（502=0 连接失败=0）
+      api1=239 api2=293
+[PASS] 停机请求数=0
+```
+
+#### 9.10.3 并发迁移（`scripts/migration-concurrency-check.sh`）
+
+```text
+空库 pjgoiot_migconc；迁移 advisory lock id = 1942488908
+外部 psql 会话持有锁 5s
+api1/api2 同时以 RUN_MIGRATIONS_ON_BOOT=true 启动
+两者就绪耗时：5261ms（均 > 5s 锁持有时间）
+version=10 dirty=false
+schema_migrations 行数：1
+表存在：users/user_devices/change_log/readings/rate_limit_buckets = 5/5
+[PASS]
+```
+
+结论：golang-migrate 的 PG advisory lock 跨实例有效，只有先拿到锁的实例执行迁移，
+另一个等待后直接看到已是最新版本；不会并发建表或出现 dirty。
+
+#### 9.10.4 限流边界（`scripts/shared-rate-limit-check.sh`）
+
+```text
+场景 A：RATE_LIMIT_BACKEND=memory，额度 3/min，burst 3
+  经 Caddy 串行请求：前 6 个 200，第 7 个起 429
+  => 双实例各 3 个 = 2 倍额度（已知限制）
+
+场景 B：RATE_LIMIT_BACKEND=postgres，额度 3/min，burst 3
+  经 Caddy 串行请求：前 3 个 200，之后两个实例均返回 429
+  => 全局限额生效
+```
+
+运维成本：`postgres` 后端每个请求多一次 UPSERT；`rate_limit_buckets` 只保存活跃 IP 的桶，
+5 分钟惰性清理 10 分钟未更新的行；数据库故障时降级为进程内限流（可用性优先）。
+未引入 Redis：避免新增高可用、持久化与网络运维面。
+
 ## 10. 本地栈自检步骤（可复现）
 
 ```bash
@@ -816,19 +961,19 @@ curl -k -sS -o /dev/null -w '%{http_code}\n' https://localhost/metrics   # 期�
 
 # 4) 容器内指标（distroless 无 curl，用带 node 的容器进 edge 网络）
 docker run --rm --network pjgoiot_edge node:20-alpine node -e \
-  "fetch('http://api:8080/metrics').then(r=>console.log(r.status))"       # 期望 200
+  "fetch('http://api1:8080/metrics').then(r=>console.log(r.status))"    # 期望 200
 
 # 5) 非 root / 只读（distroless 无 id，用 inspect/top）
-docker inspect pjgoiot-api-1 --format 'User={{.Config.User}} Readonly={{.HostConfig.ReadonlyRootfs}}'
-docker top pjgoiot-api-1 -o uid,pid,comm
-echo x > /tmp/x && docker cp /tmp/x pjgoiot-api-1:/x                      # 期望失败
+docker inspect pjgoiot-api1-1 --format 'User={{.Config.User}} Readonly={{.HostConfig.ReadonlyRootfs}}'
+docker top pjgoiot-api1-1 -o uid,pid,comm
+echo x > /tmp/x && docker cp /tmp/x pjgoiot-api1-1:/x                     # 期望失败
 
 # 6) 请求 ID
 curl -k -sS -D - -o /dev/null -H 'X-Request-Id: local-verify-123' https://localhost/healthz | grep -i x-request-id
 curl -k -sS -D - -o /dev/null https://localhost/healthz | grep -i x-request-id
 
-# 7) 迁移日志
-docker compose logs api | grep '启动迁移完成'
+# 7) 迁移日志（两个实例都应就绪；后到者等待锁）
+docker compose logs api1 api2 | grep '启动迁移完成'
 
 # 8) PromQL（无需宿主机 promtool）
 docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
@@ -838,9 +983,9 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
 
 # 9) docker 模式备份 / 恢复
 BACKUP_MODE=docker ./deploy/scripts/backup.sh
-docker compose stop api
+docker compose stop api1 api2
 RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
-docker compose start api
+docker compose start api1 api2
 
 # 10) v0.8.0 生命周期：清理与 410（先准备 3 台设备与 3 条 change_log）
 TOKEN=$(curl -k -sS -X POST https://localhost/api/v1/auth/anonymous | jq -r .token)
@@ -853,12 +998,12 @@ curl -k -sS -w '\nHTTP %{http_code}\n' \
   "https://localhost/api/v1/sync/changes?cursor=$((<最老 seq>-1))" -H "Authorization: Bearer $TOKEN"  # 期望 410
 
 # 11) v0.8.0 压测（不进 CI；先关闭限流）
-RATE_LIMIT_PER_MINUTE=0 docker compose up -d api
+RATE_LIMIT_PER_MINUTE=0 docker compose up -d api1 api2
 go run ./cmd/loadgen -base-url https://localhost -duration 30s -warmup 3s
 go run ./cmd/loadgen -base-url https://localhost -scenario devices -concurrency 100 -duration 30s
 go run ./cmd/loadgen -base-url https://localhost -scenario push    -concurrency 50  -duration 30s
 go run ./cmd/loadgen -base-url https://localhost -scenario series  -concurrency 50  -duration 30s
-RATE_LIMIT_PER_MINUTE=120 docker compose up -d api                     # 恢复默认限流
+RATE_LIMIT_PER_MINUTE=120 docker compose up -d api1 api2               # 恢复默认限流
 
 # 12) 收尾（保留卷）
 docker compose down

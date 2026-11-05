@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +28,9 @@ import (
 type Store struct {
 	db *sql.DB
 	q  *sqlcgen.Queries
+	// rateLimitSweep 记录上次清理 rate_limit_buckets 的时间（Unix 秒），
+	// 用于共享限流的惰性清理，避免引入独立的定时任务。
+	rateLimitSweep atomic.Int64
 }
 
 // New 打开连接并验证可用性。

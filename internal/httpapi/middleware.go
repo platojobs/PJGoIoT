@@ -43,6 +43,10 @@ func (s *Server) requestID() gin.HandlerFunc {
 			id = newRequestID()
 		}
 		c.Header("X-Request-Id", id)
+		// 多实例部署时用于确认请求落到哪个实例（值为 INSTANCE_ID，未设置则不返回）。
+		if s.cfg.InstanceID != "" {
+			c.Header("X-Instance", s.cfg.InstanceID)
+		}
 		c.Set(ctxKeyRequestID, id)
 		c.Next()
 	}
@@ -141,7 +145,7 @@ func (s *Server) rateLimit() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if !s.limiter.allow(c.ClientIP()) {
+		if !s.limiter.allow(c.Request.Context(), c.ClientIP()) {
 			c.Header("Retry-After", "60")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, errorBody{
 				Error: errorDetail{Code: CodeRateLimited, Message: "请求过于频繁，请稍后再试"},

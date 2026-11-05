@@ -95,7 +95,7 @@ func (s *Server) claimRateLimit() gin.HandlerFunc {
 		return func(c *gin.Context) { c.Next() }
 	}
 	return func(c *gin.Context) {
-		if !s.claimLimiter.allow(c.ClientIP()) {
+		if !s.claimLimiter.allow(c.Request.Context(), c.ClientIP()) {
 			c.Header("Retry-After", "60")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, errorBody{
 				Error: errorDetail{Code: CodeRateLimited, Message: "配对码尝试过于频繁，请稍后再试"},

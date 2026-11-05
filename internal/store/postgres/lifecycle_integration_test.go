@@ -132,7 +132,9 @@ func TestCleanupAndRetentionLifecycle(t *testing.T) {
 	if _, replayed, err := st.Push(ctx, userID, body, opts); err != nil || !replayed {
 		t.Fatalf("重放 replayed=%v err=%v", replayed, err)
 	}
-	if _, err := st.CleanupIdempotencyKeys(ctx, time.Now().UTC()); err != nil {
+	// 截止时间取未来 1 分钟：Postgres 容器与宿主时钟存在毫秒级偏差，
+	// 直接用 time.Now() 可能小于事务 now()，导致刚写入的键未被清理。
+	if _, err := st.CleanupIdempotencyKeys(ctx, time.Now().UTC().Add(time.Minute)); err != nil {
 		t.Fatalf("CleanupIdempotencyKeys: %v", err)
 	}
 	// 清理后同 key 同请求按新请求重新处理（设备 LWW 命中 unchanged），不会误报 409。

@@ -56,7 +56,7 @@ jobs:
         run: go run ./cmd/migrate -direction up
 
       - name: Postgres 集成测试
-        run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices' -v
+        run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices|TestSharedRateLimiterAcrossInstances' -v
 
   perf-smoke:
     name: 压测门槛（smoke）
@@ -97,7 +97,7 @@ jobs:
             RATE_LIMIT_BURST=0 \
             PAIRING_CLAIM_RATE_PER_MINUTE=0 \
             PAIRING_CLAIM_BURST=0 \
-            APP_VERSION=0.10.0 \
+            APP_VERSION=0.11.0 \
             ADDR=127.0.0.1:18080 \
             /tmp/pjgoiot-api >/tmp/api.log 2>&1 &
           echo $! >/tmp/api.pid
@@ -162,21 +162,33 @@ jobs:
           ruby -ryaml <<'RUBY'
           files = %w[docker-compose.yml deploy/prometheus/alerts.yml deploy/prometheus/scrape.yml]
           files.each do |f|
-            YAML.load_file(f)
+            YAML.load_file(f, aliases: true)
             puts "YAML ok: #{f}"
           end
 
-          compose = YAML.load_file('docker-compose.yml')
-          %w[api postgres caddy].each do |svc|
+          compose = YAML.load_file('docker-compose.yml', aliases: true)
+          %w[api1 api2 postgres caddy].each do |svc|
             abort "compose 缺少服务: #{svc}" unless compose.fetch('services').key?(svc)
           end
-          api = compose['services']['api']
-          abort 'api 未等待 postgres 健康' unless api.dig('depends_on', 'postgres', 'condition') == 'service_healthy'
-          abort 'api 未启用只读文件系统' unless api['read_only'] == true
-          abort 'caddy 未暴露 443' unless compose['services']['caddy']['ports'].map(&:to_s).any? { |p| p.include?('443') }
+          %w[api1 api2].each do |name|
+            api = compose['services'][name]
+            abort "#{name} 未等待 postgres 健康" unless api.dig('depends_on', 'postgres', 'condition') == 'service_healthy'
+            abort "#{name} 未启用只读文件系统" unless api['read_only'] == true
+            abort "#{name} 缺少 drain 配置" unless api.dig('environment', 'SHUTDOWN_DRAIN_SECONDS')
+          end
+          caddy = compose['services']['caddy']
+          %w[api1 api2].each do |name|
+            abort "caddy 未等待 #{name} 健康" unless caddy.dig('depends_on', name, 'condition') == 'service_healthy'
+          end
+          abort 'caddy 未暴露 443' unless caddy['ports'].map(&:to_s).any? { |p| p.include?('443') }
           abort 'cleanup 未使用 maintenance profile' unless compose['services']['cleanup']['profiles'].include?('maintenance')
 
-          alerts = YAML.load_file('deploy/prometheus/alerts.yml')
+          caddyfile = File.read('deploy/Caddyfile')
+          abort 'Caddyfile 未配置双实例上游' unless caddyfile.include?('api1:8080 api2:8080')
+          abort 'Caddyfile 未使用 readiness 健康检查' unless caddyfile.include?('health_uri /api/v1/health')
+          abort 'Caddyfile 未配置上游重试' unless caddyfile.include?('lb_try_duration')
+
+          alerts = YAML.load_file('deploy/prometheus/alerts.yml', aliases: true)
           rules = alerts.fetch('groups').flat_map { |g| g.fetch('rules') }
           abort "告警规则少于 5 条: #{rules.size}" if rules.size < 5
           rules.each do |r|
@@ -194,7 +206,8 @@ jobs:
           set -euo pipefail
           scripts=(deploy/scripts/backup.sh deploy/scripts/restore.sh
             scripts/stack-for-e2e.sh scripts/seed-for-e2e.sh scripts/validate-dashboard.sh
-            scripts/migrate-drill.sh)
+            scripts/migrate-drill.sh scripts/rolling-restart.sh scripts/multi-instance-check.sh
+            scripts/migration-concurrency-check.sh scripts/shared-rate-limit-check.sh)
           for f in "${scripts[@]}"; do
             bash -n "$f"
             echo "bash -n ok: $f"

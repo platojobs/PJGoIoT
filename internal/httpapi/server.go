@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,13 +18,16 @@ type Server struct {
 	store        store.Store
 	log          *slog.Logger
 	cfg          config.Config
-	limiter      *ipLimiter
+	limiter      rateLimiter
 	claimLimiter *ipLimiter
 	metrics      *metricsRegistry
+	// draining 为 true 时 readiness 立即返回 503，用于滚动发布时先摘流量再退出。
+	draining *atomic.Bool
 }
 
 // New 构建基于 Gin 的 HTTP handler（含全局中间件与路由分组）。
-func New(cfg config.Config, st store.Store, logger *slog.Logger) http.Handler {
+// draining 为 nil 表示不参与下线下线流程（测试与单次运行使用）。
+func New(cfg config.Config, st store.Store, logger *slog.Logger, draining *atomic.Bool) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -32,9 +36,10 @@ func New(cfg config.Config, st store.Store, logger *slog.Logger) http.Handler {
 		store:        st,
 		log:          logger,
 		cfg:          cfg,
-		limiter:      newIPLimiter(cfg.RateLimitPerMin, cfg.RateLimitBurst),
+		limiter:      newRateLimiter(cfg, st, logger),
 		claimLimiter: newIPLimiter(cfg.PairingClaimPerMin, cfg.PairingClaimBurst),
 		metrics:      newMetricsRegistry(),
+		draining:     draining,
 	}
 
 	r := gin.New()
@@ -105,8 +110,13 @@ func (s *Server) handleLiveness(c *gin.Context) {
 	})
 }
 
-// handleHealth 是就绪探针：数据库 Ping 失败返回 503。
+// handleHealth 是就绪探针：数据库 Ping 失败或实例正在下线时返回 503。
 func (s *Server) handleHealth(c *gin.Context) {
+	// 滚动发布时先置 draining，让反向代理在实例仍可服务时摘流量。
+	if s.draining != nil && s.draining.Load() {
+		writeError(c.Writer, http.StatusServiceUnavailable, CodeUnavailable, "实例正在下线")
+		return
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 	if err := s.store.Ping(ctx); err != nil {
