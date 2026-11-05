@@ -73,7 +73,7 @@ func (s *Server) accessLog() gin.HandlerFunc {
 		c.Next()
 
 		status := c.Writer.Status()
-		s.metrics.observeRequest(c.Request.Method, status, time.Since(start))
+		s.metrics.observeRequest(c.Request.Method, routeLabel(c), status, time.Since(start))
 
 		attrs := []any{
 			"request_id", c.GetString(ctxKeyRequestID),
@@ -181,6 +181,37 @@ func (s *Server) requireAuth() gin.HandlerFunc {
 		c.Set(ctxKeyUserID, userID)
 		c.Set(ctxKeyTokenHash, auth.Hash(token))
 		c.Next()
+	}
+}
+
+// routeLabel 返回低基数的路由模板，作为 Prometheus 的 route 标签。
+// Gin 对 /my/devices/*key 只会给出通配模板，因此这里按真实路径还原读数子资源，
+// 否则 devices 与 readings/series 会混在同一个 route 下，无法支撑分接口 SLO。
+func routeLabel(c *gin.Context) string {
+	full := c.FullPath()
+	if full == "" {
+		return "unmatched"
+	}
+	if !strings.Contains(full, "*") {
+		return full
+	}
+	const prefix = "/api/v1/my/devices/"
+	path := c.Request.URL.Path
+	if !strings.HasPrefix(path, prefix) {
+		return full
+	}
+	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
+	switch {
+	case len(parts) == 1 && parts[0] != "":
+		return "/api/v1/my/devices/:key"
+	case len(parts) == 2 && parts[0] != "" && parts[1] != "":
+		return "/api/v1/my/devices/:platform/:externalId"
+	case len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] == "readings":
+		return "/api/v1/my/devices/:platform/:externalId/readings"
+	case len(parts) == 4 && parts[0] != "" && parts[1] != "" && parts[2] == "readings":
+		return "/api/v1/my/devices/:platform/:externalId/readings/" + parts[3]
+	default:
+		return full
 	}
 }
 

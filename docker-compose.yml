@@ -31,14 +31,14 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.8.0"
-    image: pjgoiot-api:0.8.0
+        APP_VERSION: "0.9.0"
+    image: pjgoiot-api:0.9.0
     restart: unless-stopped
     environment:
       STORE: postgres
       DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
       ADDR: ":8080"
-      APP_VERSION: "0.8.0"
+      APP_VERSION: "0.9.0"
       # 启动即迁移；迁移失败进程退出，不会以旧 schema 半可用运行。
       RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
       RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
@@ -97,8 +97,8 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.8.0"
-    image: pjgoiot-api:0.8.0
+        APP_VERSION: "0.9.0"
+    image: pjgoiot-api:0.9.0
     entrypoint: ["/cleanup"]
     command:
       - "-retention-days"

@@ -16,7 +16,13 @@ var latencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5,
 
 type requestKey struct {
 	method string
+	route  string
 	status int
+}
+
+type durationKey struct {
+	method string
+	route  string
 }
 
 type latencyHistogram struct {
@@ -29,28 +35,29 @@ type latencyHistogram struct {
 type metricsRegistry struct {
 	mu        sync.Mutex
 	requests  map[requestKey]uint64
-	durations map[string]*latencyHistogram
+	durations map[durationKey]*latencyHistogram
 	dbErrors  uint64
 }
 
 func newMetricsRegistry() *metricsRegistry {
 	return &metricsRegistry{
 		requests:  map[requestKey]uint64{},
-		durations: map[string]*latencyHistogram{},
+		durations: map[durationKey]*latencyHistogram{},
 	}
 }
 
-func (m *metricsRegistry) observeRequest(method string, status int, d time.Duration) {
+func (m *metricsRegistry) observeRequest(method, route string, status int, d time.Duration) {
 	seconds := d.Seconds()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.requests[requestKey{method: method, status: status}]++
+	m.requests[requestKey{method: method, route: route, status: status}]++
 
-	h, ok := m.durations[method]
+	key := durationKey{method: method, route: route}
+	h, ok := m.durations[key]
 	if !ok {
 		h = &latencyHistogram{counts: make([]uint64, len(latencyBuckets))}
-		m.durations[method] = h
+		m.durations[key] = h
 	}
 	for i, le := range latencyBuckets {
 		if seconds <= le {
@@ -73,9 +80,9 @@ func (m *metricsRegistry) render(counts model.StoreCounts) string {
 	for k, v := range m.requests {
 		requests[k] = v
 	}
-	durations := make(map[string]latencyHistogram, len(m.durations))
-	for method, h := range m.durations {
-		durations[method] = latencyHistogram{
+	durations := make(map[durationKey]latencyHistogram, len(m.durations))
+	for key, h := range m.durations {
+		durations[key] = latencyHistogram{
 			counts: append([]uint64(nil), h.counts...),
 			sum:    h.sum,
 			total:  h.total,
@@ -85,7 +92,7 @@ func (m *metricsRegistry) render(counts model.StoreCounts) string {
 	m.mu.Unlock()
 
 	var b strings.Builder
-	b.WriteString("# HELP pjgoiot_http_requests_total HTTP 请求总数，按 method 与 status 分组。\n")
+	b.WriteString("# HELP pjgoiot_http_requests_total HTTP 请求总数，按 method、route 与 status 分组。\n")
 	b.WriteString("# TYPE pjgoiot_http_requests_total counter\n")
 	keys := make([]requestKey, 0, len(requests))
 	for k := range requests {
@@ -95,32 +102,40 @@ func (m *metricsRegistry) render(counts model.StoreCounts) string {
 		if keys[i].method != keys[j].method {
 			return keys[i].method < keys[j].method
 		}
+		if keys[i].route != keys[j].route {
+			return keys[i].route < keys[j].route
+		}
 		return keys[i].status < keys[j].status
 	})
 	for _, k := range keys {
-		fmt.Fprintf(&b, "pjgoiot_http_requests_total{method=%q,status=%q} %d\n",
-			escapeLabel(k.method), strconv.Itoa(k.status), requests[k])
+		fmt.Fprintf(&b, "pjgoiot_http_requests_total{method=%q,route=%q,status=%q} %d\n",
+			escapeLabel(k.method), escapeLabel(k.route), strconv.Itoa(k.status), requests[k])
 	}
 
-	b.WriteString("# HELP pjgoiot_http_request_duration_seconds HTTP 请求耗时直方图。\n")
+	b.WriteString("# HELP pjgoiot_http_request_duration_seconds HTTP 请求耗时直方图，按 method 与 route 分组。\n")
 	b.WriteString("# TYPE pjgoiot_http_request_duration_seconds histogram\n")
-	methods := make([]string, 0, len(durations))
-	for method := range durations {
-		methods = append(methods, method)
+	durationKeys := make([]durationKey, 0, len(durations))
+	for key := range durations {
+		durationKeys = append(durationKeys, key)
 	}
-	sort.Strings(methods)
-	for _, method := range methods {
-		h := durations[method]
-		for i, le := range latencyBuckets {
-			fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_bucket{method=%q,le=%q} %d\n",
-				escapeLabel(method), strconv.FormatFloat(le, 'f', -1, 64), h.counts[i])
+	sort.Slice(durationKeys, func(i, j int) bool {
+		if durationKeys[i].method != durationKeys[j].method {
+			return durationKeys[i].method < durationKeys[j].method
 		}
-		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_bucket{method=%q,le=\"+Inf\"} %d\n",
-			escapeLabel(method), h.total)
-		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_sum{method=%q} %s\n",
-			escapeLabel(method), strconv.FormatFloat(h.sum, 'f', 6, 64))
-		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_count{method=%q} %d\n",
-			escapeLabel(method), h.total)
+		return durationKeys[i].route < durationKeys[j].route
+	})
+	for _, key := range durationKeys {
+		h := durations[key]
+		for i, le := range latencyBuckets {
+			fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_bucket{method=%q,route=%q,le=%q} %d\n",
+				escapeLabel(key.method), escapeLabel(key.route), strconv.FormatFloat(le, 'f', -1, 64), h.counts[i])
+		}
+		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_bucket{method=%q,route=%q,le=\"+Inf\"} %d\n",
+			escapeLabel(key.method), escapeLabel(key.route), h.total)
+		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_sum{method=%q,route=%q} %s\n",
+			escapeLabel(key.method), escapeLabel(key.route), strconv.FormatFloat(h.sum, 'f', 6, 64))
+		fmt.Fprintf(&b, "pjgoiot_http_request_duration_seconds_count{method=%q,route=%q} %d\n",
+			escapeLabel(key.method), escapeLabel(key.route), h.total)
 	}
 
 	b.WriteString("# HELP pjgoiot_db_errors_total 数据库/存储层错误总数。\n")

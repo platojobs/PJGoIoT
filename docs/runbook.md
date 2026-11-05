@@ -28,9 +28,15 @@
 | v0.8.0 游标失效 410 | **已验证** | 旧游标 `seq0-1` → `410 RESYNC_REQUIRED`；新游标 `seq0` → 200 且剩 2 条；`/my/devices` 仍 3 台 |
 | v0.8.0 token 过期 | **已验证** | 过期 token → 401；`/auth/anonymous` 返回 `expiresAt` 且与库内一致；`CleanupTokens` 后行数 0 |
 | v0.8.0 压测（3 场景，30s） | **已验证** | 见 §9.7 与 README「容量与压测结果」；devices p95 215 ms、push p95 2 005 ms、series p95 127 ms，错误率均 0% |
+| v0.9.0 e2e 栈脚本（起停/自动换端口/迁移/BASE_URL） | **已验证** | `scripts/stack-for-e2e.sh` 自动选端口 65500/65504，迁移 `version=8 dirty=false`，`/health` readiness 通过；`--stop` 清理容器与 `.e2e/` |
+| v0.9.0 seed 幂等 | **已验证** | 连续执行两次，第二次 `skippedReadings=24`、`user_devices=1`、`readings=24`；真实型号与固件/配件来自迁移 seed |
+| v0.9.0 curl 全链路（匿名→push→changes→series→metrics→export→注销） | **已验证** | 见 §9.8；注销 `DELETE /me` 204，旧 token 再访问 401 |
+| v0.9.0 smoke 门槛与真实数字 | **已验证** | devices p95 28 ms、series p95 15 ms、push p95 417 ms，错误率 0%，`SMOKE PASS`（阈值 400/400/4 000 ms） |
+| v0.9.0 dashboard / SLO | **本地已验证** | `scripts/validate-dashboard.sh` 通过（9 面板，指标名均在 Go 代码中）；SLO PromQL 未接入真实 Prometheus 长期抓取 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
-| 数小时长稳压 / 故障注入 / 多实例 | **未验证** | 仅做 30s/场景短时压测，未做故障注入与多实例限流 |
+| 数小时长稳压 / 故障注入 / 多实例 | **未验证** | 仅做 30s/场景短时压测与 10s smoke，未做故障注入与多实例限流 |
+| Android/iOS 真机局域网访问 e2e 栈 | **未验证** | 栈绑定 127.0.0.1，仅验证模拟器可用路径；两个客户端仓库本轮未实际执行 |
 
 ## 1. 部署前检查清单
 
@@ -383,14 +389,52 @@ HTTP/1.1 410 Gone
 - `GET /sync/changes`：已有限制（默认/上限见 openapi）；
 - 超出上限统一返回 `400 BAD_REQUEST`，不会静默截断；客户端应改为分页拉取。
 
+### 7.10 CI 压测 job（perf-smoke）失败
+
+`perf-smoke` 会起 postgres service + API，然后跑 `cmd/loadgen -smoke`。loadgen 在任一场景
+**错误率 > 0 或 p95 超阈值**时打印 `SMOKE ... FAIL reasons=...` 并以非 0 退出，
+job 因此变红（工作流里没有 `|| true`，不要为了方便改成吞错）。
+
+排查顺序：
+
+1. 看 job 日志里 `SMOKE <场景> FAIL` 的 `reasons=`：
+   - `没有完成任何请求`：API 未就绪、限流未关、base URL/端口错误；
+   - `错误率 x% 超过 0%`：先看紧邻的 `statuses=` 分布，4xx 多为契约/种子问题，5xx 看 API 日志；
+   - `p95 361ms 超过 400ms`：真实性能回归，进入第 3 步。
+2. 看失败的 `失败时输出 API 日志` 步骤（`/tmp/api.log` 最后 120 行）：找 `request_id`、
+   `db_errors`、迁移 dirty、连接池耗尽、`statement_timeout`。
+3. 本地复现同一门槛：
+   ```bash
+   bash scripts/stack-for-e2e.sh
+   go run ./cmd/loadgen -base-url "$(grep BASE_URL .e2e/stack.env | cut -d= -f2-)" -smoke
+   bash scripts/stack-for-e2e.sh --stop
+   ```
+   - 本地也超阈值 → 代码/索引/查询回归，按 §7.7 用 `pg_stat_statements` + `EXPLAIN (ANALYZE, BUFFERS)`
+     定位；不要先调大阈值。
+   - 仅 CI 超阈值 → 对比 README 实测表与本次 `SMOKE` 行；runner 与本地 Docker VM 的 CPU 差异、
+     同 runner 上其他 job 抢占都可能造成 2–3x 抖动，可重跑一次确认，但**连续两次超阈值按回归处理**。
+4. 常见原因清单：
+   - `RATE_LIMIT_PER_MINUTE` 没设为 `0`，压测撞 429（错误率非 0）；
+   - smoke 前没有种子数据，series/push 直接 409/404；
+   - 新加索引/迁移未生效（`RUN_MIGRATIONS_ON_BOOT` 被关掉）；
+   - 直方图 `route` 标签缺失不影响 loadgen，但会让 SLO 面板查不到数据（见 §7.4）；
+   - CI 机器降配或 Docker layer cache 失效导致首次请求慢（看 p50 是否也整体抬升）。
+5. **改阈值必须附实测证据**：在 PR 中贴出连续 3 次本机与 CI 的数字，并同步更新
+   README「压测门槛与阈值」的取值依据；没有证据不得放宽。
+
 ## 8. 监控与告警
 
 - 抓取目标：`api:8080/metrics`（内网），样例见 `deploy/prometheus/scrape.yml`；
-- 告警规则见 `deploy/prometheus/alerts.yml`（5xx 比例、P95 延迟、DB 错误、readiness 失败、请求量为 0、指标缺失）；
+- 告警规则见 `deploy/prometheus/alerts.yml`（共 9 条：可用性错误预算燃烧、5xx 比例、devices/series
+  分接口 p95、全局 p95、DB 错误、readiness 失败、请求量为 0、指标缺失）；
+- 3 条 SLO 与告警的对应关系、PromQL 与错误预算算法见 `docs/slo.md`；面板见
+  `deploy/grafana/dashboard.json`（指标名引用由 `scripts/validate-dashboard.sh` 校验）；
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值，不应作为计费/审计依据；
+- v0.9.0 起 HTTP 指标带 `route` 标签（路由模板），分接口查询用
+  `pjgoiot_http_request_duration_seconds_bucket{route="..."}`；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.1 / v0.8.0）
+## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0）
 
 ### 9.1 构建与启动
 
@@ -524,6 +568,49 @@ SELECT count(*) FROM tokens → 0
 
 p95 归因与修正见 README「容量与压测结果」：`/my/devices` 的 N+1 已合并为单条 JOIN（EXPLAIN 0.25 ms），
 push 从约 900 条 SQL/批降到约 7 条；剩余延迟是 2 vCPU 本地 VM 的 CPU/写吞吐上限，不是索引问题。
+
+### 9.8 v0.9.0 真实存储联调栈与 CI 压测门槛
+
+```text
+bash scripts/stack-for-e2e.sh
+ → 启动 Postgres（第 1 次尝试，端口 65500）
+ → Postgres 已就绪: 127.0.0.1:65500
+ → 迁移完成 version=8 dirty=false
+ → 启动 API（第 1 次尝试，端口 65504）
+ → API readiness 通过: http://127.0.0.1:65504
+ → stdout: BASE_URL=http://127.0.0.1:65504
+
+bash scripts/seed-for-e2e.sh
+ → push 结果: applied=1 skippedReadings=0 conflicts=0
+ → 校验通过: user_devices=1 readings=24 metrics=pressure_hpa,relative_humidity,temperature_celsius
+             device_types=5 firmware=ESP-IDF v5.2.2 accessory=USB-C 数据线 public_model=ESP32-C3-DevKitM-1
+
+# 再执行一次：复用 token，skippedReadings=24，user_devices/readings 数量不变
+
+curl 全链路：
+ 匿名登录 201 (expiresAt=2027-05-04T05:05:08Z)
+ push 200 (applied=1, serverSeq=[2])
+ changes?cursor=0 200 (1 条, nextCursor=2)
+ series?metric=temperature_celsius&bucket=1d 200 (2 个桶)
+ metrics 200 (1 个指标, count=8)
+ export 200 (devices=1, readings=8, hasMore=false)
+ DELETE /me 204 → 同一 token 再访问 /my/devices 401 UNAUTHORIZED
+
+bash scripts/stack-for-e2e.sh --stop
+ → 停止 API / 删除 Postgres 容器 / 清理 .e2e/
+```
+
+smoke（真实 Postgres 栈，10s/场景，2s 预热）：
+
+| 场景 | 并发 | 请求数 | RPS | p95 | 阈值 | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `GET /my/devices` | 20 | 20 421 | 2 040.7 | 28 ms | 400 ms | PASS |
+| `POST /sync/push` | 5 | 165 | 16.2 | 417 ms | 4 000 ms | PASS |
+| `GET /readings/series` | 10 | 14 207 | 1 420.2 | 15 ms | 400 ms | PASS |
+| 错误率 | — | — | — | 0% | 0% | PASS |
+
+`bash scripts/validate-dashboard.sh` → 9 个面板结构有效，`pjgoiot_*` 指标均存在于 Go 代码，
+`probe_success` 由 blackbox_exporter 提供（唯一豁免）。
 
 ## 10. 本地栈自检步骤（可复现）
 

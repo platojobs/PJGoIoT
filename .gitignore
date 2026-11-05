@@ -17,3 +17,6 @@ tmp/
 # 测试与覆盖率
 coverage.out
 coverage.html
+
+# e2e 联调栈状态（token、pid、日志，禁止入库）
+.e2e/

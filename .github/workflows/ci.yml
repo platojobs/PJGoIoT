@@ -58,6 +58,72 @@ jobs:
       - name: Postgres 集成测试
         run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices' -v
 
+  perf-smoke:
+    name: 压测门槛（smoke）
+    runs-on: ubuntu-latest
+    needs: build-test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pjgoiot
+          POSTGRES_PASSWORD: pjgoiot
+          POSTGRES_DB: pjgoiot_perf
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pjgoiot -d pjgoiot_perf"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://pjgoiot:pjgoiot@127.0.0.1:5432/pjgoiot_perf?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 启动 API（STORE=postgres）
+        run: |
+          set -euo pipefail
+          go build -o /tmp/pjgoiot-api ./cmd/api
+          STORE=postgres \
+            DATABASE_URL="$DATABASE_URL" \
+            RUN_MIGRATIONS_ON_BOOT=true \
+            RATE_LIMIT_PER_MINUTE=0 \
+            RATE_LIMIT_BURST=0 \
+            PAIRING_CLAIM_RATE_PER_MINUTE=0 \
+            PAIRING_CLAIM_BURST=0 \
+            APP_VERSION=0.9.0 \
+            ADDR=127.0.0.1:18080 \
+            /tmp/pjgoiot-api >/tmp/api.log 2>&1 &
+          echo $! >/tmp/api.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1; then
+              echo "API readiness 通过"
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/api.pid)" 2>/dev/null; then
+              echo "API 进程已退出"
+              cat /tmp/api.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "API 60s 内未就绪"
+          cat /tmp/api.log
+          exit 1
+
+      - name: 运行 smoke（错误率或 p95 超阈值即失败）
+        run: go run ./cmd/loadgen -base-url http://127.0.0.1:18080 -smoke
+
+      - name: 失败时输出 API 日志
+        if: failure()
+        run: tail -n 120 /tmp/api.log
+
   docker-build:
     name: 构建镜像
     runs-on: ubuntu-latest
@@ -120,21 +186,26 @@ jobs:
           puts "alerts ok: #{rules.size} rules"
           RUBY
 
+      - name: 校验 Grafana dashboard（JSON 结构与指标名）
+        run: bash scripts/validate-dashboard.sh
+
       - name: 脚本语法与 shellcheck
         run: |
           set -euo pipefail
-          for f in deploy/scripts/backup.sh deploy/scripts/restore.sh; do
+          scripts=(deploy/scripts/backup.sh deploy/scripts/restore.sh
+            scripts/stack-for-e2e.sh scripts/seed-for-e2e.sh scripts/validate-dashboard.sh)
+          for f in "${scripts[@]}"; do
             bash -n "$f"
             echo "bash -n ok: $f"
           done
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck -x deploy/scripts/backup.sh deploy/scripts/restore.sh
+            shellcheck -x "${scripts[@]}"
             echo "shellcheck ok"
           else
             echo "shellcheck 不可用，仅执行 bash -n（未安装时不伪造通过）"
           fi
           if command -v shfmt >/dev/null 2>&1; then
-            shfmt -d deploy/scripts/backup.sh deploy/scripts/restore.sh
+            shfmt -d "${scripts[@]}"
             echo "shfmt ok"
           else
             echo "shfmt 不可用，跳过格式检查"

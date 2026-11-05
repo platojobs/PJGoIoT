@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,11 +41,29 @@ type config struct {
 	pushDevices    int
 	pushReadings   int
 	concurrency    int
+	pushConc       int
 	seriesConc     int
 	insecure       bool
 	seedReadings   int
 	reportPath     string
 	requestTimeout time.Duration
+
+	smoke         bool
+	maxErrorRate  float64
+	maxP95Devices time.Duration
+	maxP95Series  time.Duration
+	maxP95Push    time.Duration
+}
+
+type scenarioResult struct {
+	name  string
+	conc  int
+	total int
+	rps   float64
+	rate  float64
+	p50   time.Duration
+	p95   time.Duration
+	p99   time.Duration
 }
 
 type stats struct {
@@ -106,12 +125,34 @@ func main() {
 	flag.IntVar(&cfg.pushDevices, "push-devices", 100, "push 场景每请求设备数")
 	flag.IntVar(&cfg.pushReadings, "push-readings", 200, "push 场景每请求读数数")
 	flag.IntVar(&cfg.concurrency, "concurrency", 100, "devices 场景并发")
-	flag.IntVar(&cfg.seriesConc, "series-concurrency", 50, "series 场景并发（push 场景固定 50，可用 -push-concurrency 覆盖）")
+	flag.IntVar(&cfg.pushConc, "push-concurrency", 50, "push 场景并发")
+	flag.IntVar(&cfg.seriesConc, "series-concurrency", 50, "series 场景并发")
 	flag.IntVar(&cfg.seedReadings, "seed-readings", 2000, "series 场景前预置的读数条数（覆盖 90 天）")
 	flag.BoolVar(&cfg.insecure, "insecure-skip-verify", true, "跳过 TLS 校验（自签证书场景）")
 	flag.StringVar(&cfg.reportPath, "report", "", "可选：把 Markdown 结果写入文件")
 	flag.DurationVar(&cfg.requestTimeout, "request-timeout", 10*time.Second, "单请求超时")
+
+	flag.BoolVar(&cfg.smoke, "smoke", false, "CI 短跑模式：10s、低并发（devices 20 / push 5 / series 10），并按阈值断言")
+	flag.Float64Var(&cfg.maxErrorRate, "max-error-rate", 0, "smoke 模式允许的错误率上限（百分比，0 表示必须为 0）")
+	flag.DurationVar(&cfg.maxP95Devices, "max-p95-devices", 400*time.Millisecond, "smoke 模式 devices 场景 p95 上限")
+	flag.DurationVar(&cfg.maxP95Series, "max-p95-series", 400*time.Millisecond, "smoke 模式 series 场景 p95 上限")
+	flag.DurationVar(&cfg.maxP95Push, "max-p95-push", 4*time.Second, "smoke 模式 push 场景 p95 上限")
 	flag.Parse()
+
+	if cfg.smoke {
+		cfg.duration = 10 * time.Second
+		cfg.warmup = 2 * time.Second
+		cfg.deviceCount = 20
+		cfg.concurrency = 20
+		cfg.pushConc = 5
+		cfg.seriesConc = 10
+		cfg.seedReadings = 500
+		cfg.scenario = "all"
+	}
+	if cfg.concurrency <= 0 || cfg.pushConc <= 0 || cfg.seriesConc <= 0 {
+		fmt.Fprintln(os.Stderr, "并发数必须大于 0")
+		os.Exit(1)
+	}
 
 	client := &http.Client{
 		Timeout: cfg.requestTimeout,
@@ -153,7 +194,7 @@ func main() {
 	}
 	list := []scenario{
 		{"GET /my/devices", cfg.concurrency, func(s *stats, _ int) { runDevices(client, base, cfg.token, s) }},
-		{"POST /sync/push", 50, func(s *stats, worker int) { runPush(client, base, cfg.token, cfg, worker, s) }},
+		{"POST /sync/push", cfg.pushConc, func(s *stats, worker int) { runPush(client, base, cfg.token, cfg, worker, s) }},
 		{"GET /readings/series", cfg.seriesConc, func(s *stats, _ int) { runSeries(client, base, cfg.token, macs[0], s) }},
 	}
 	if cfg.scenario != "all" {
@@ -175,6 +216,7 @@ func main() {
 	var lines []string
 	lines = append(lines, "| 场景 | 并发 | 时长 | 请求数 | RPS | p50 | p95 | p99 | 错误率 |")
 	lines = append(lines, "| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+	var results []scenarioResult
 	for _, sc := range list {
 		runWarmup(client, base, cfg, sc.name, sc.concurrency)
 		st := &stats{statuses: map[int]int{}}
@@ -201,6 +243,10 @@ func main() {
 		line := fmt.Sprintf("| %s | %d | %s | %d | %.1f | %s | %s | %s | %.2f%% |",
 			sc.name, sc.concurrency, cfg.duration, total, rps, p50.Round(time.Millisecond), p95.Round(time.Millisecond), p99.Round(time.Millisecond), rate)
 		lines = append(lines, line)
+		results = append(results, scenarioResult{
+			name: sc.name, conc: sc.concurrency, total: total,
+			rps: rps, rate: rate, p50: p50, p95: p95, p99: p99,
+		})
 		fmt.Printf("%s rps=%.1f errors=%.2f%% statuses=%v\n", sc.name, rps, rate, statuses)
 	}
 
@@ -212,6 +258,52 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if cfg.smoke {
+		if !assertSmoke(cfg, results) {
+			os.Exit(1)
+		}
+		fmt.Println("SMOKE PASS: 全部场景满足错误率与 p95 阈值")
+	}
+}
+
+// assertSmoke 校验 smoke 结果：请求数非 0、错误率不超阈值、各场景 p95 不超阈值。
+// 任何一项不满足都会打印原因并让进程非零退出，CI 直接变红。
+func assertSmoke(cfg config, results []scenarioResult) bool {
+	limits := map[string]time.Duration{
+		"GET /my/devices":      cfg.maxP95Devices,
+		"POST /sync/push":      cfg.maxP95Push,
+		"GET /readings/series": cfg.maxP95Series,
+	}
+	ok := true
+	for _, r := range results {
+		limit, known := limits[r.name]
+		var reasons []string
+		if !known {
+			reasons = append(reasons, "未知场景，未配置阈值")
+		}
+		if r.total == 0 {
+			reasons = append(reasons, "没有完成任何请求")
+		}
+		if r.rate > cfg.maxErrorRate {
+			reasons = append(reasons, fmt.Sprintf("错误率 %.2f%% 超过 %.2f%%", r.rate, cfg.maxErrorRate))
+		}
+		if known && r.p95 > limit {
+			reasons = append(reasons, fmt.Sprintf("p95 %s 超过 %s", r.p95.Round(time.Millisecond), limit))
+		}
+		status := "PASS"
+		if len(reasons) > 0 {
+			status = "FAIL"
+			ok = false
+		}
+		fmt.Fprintf(os.Stderr, "SMOKE %s %s: conc=%d requests=%d p95=%s (limit %s) p99=%s error_rate=%.2f%% (limit %.2f%%)",
+			r.name, status, r.conc, r.total, r.p95.Round(time.Millisecond), limit,
+			r.p99.Round(time.Millisecond), r.rate, cfg.maxErrorRate)
+		if len(reasons) > 0 {
+			fmt.Fprintf(os.Stderr, " reasons=%s", strings.Join(reasons, "; "))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+	return ok
 }
 
 func join(lines []string) string {

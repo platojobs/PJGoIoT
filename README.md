@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.8.0**（数据保留、token 过期、容量保护与压测）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.9.0**（真实存储联调、CI 压测门槛、Grafana/SLO 与 `route` 指标标签）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -529,6 +529,99 @@ go run ./cmd/loadgen -base-url https://localhost -duration 30s -warmup 3s
 > 说明：`cmd/loadgen` 的 push 场景按 worker 分配独立设备集合，模拟 50 个客户端各自推送；
 > 若让 50 个并发反复写同一批 100 行，测到的是行锁排队而非服务容量，故不作为容量结论。
 
+### 真实存储联调（v0.9.0）
+
+客户端仓库此前都跑 `STORE=fixture`，覆盖不到真实 SQL、迁移、事务与超时。v0.9.0 提供一条命令
+起「真实 Postgres + API」的本机栈，供 Android / iOS e2e 指向：
+
+```bash
+bash scripts/stack-for-e2e.sh        # 等价 make e2e-stack
+# stdout 最后一行：BASE_URL=http://127.0.0.1:63450
+bash scripts/seed-for-e2e.sh         # 幂等写入 1 台真实型号设备 + 24 条读数
+bash scripts/stack-for-e2e.sh --status
+bash scripts/stack-for-e2e.sh --stop # 等价 make e2e-stop
+```
+
+脚本行为：启动前用 connect+bind 预检端口，被占用时打印「端口 X 已被占用，自动换端口重试」
+并重试（最多 3 次）；Docker 起独立 Postgres、迁移到 `version=8`、等 readiness、把
+`DATABASE_URL/API_PID/BASE_URL` 写入 `.e2e/stack.env`；任一步失败自动清理并以非 0 退出。
+stdout 只有 `BASE_URL=...`，人类日志走 stderr。可用 `E2E_PG_PORT` / `E2E_API_PORT`
+强制首次尝试某端口来验证换端口路径（实测：65021/65022 被占用后自动切到 51660/51671）。
+
+seed 只用迁移 seed 里**真实存在**的型号：公共设备 `aa:bb:cc:00:00:02` →
+`ESP32-C3-DevKitM-1`（Espressif / `environmental_sensor`），24 条读数覆盖
+`temperature_celsius` / `relative_humidity` / `pressure_hpa`，并校验 5 个 device_types、
+固件 `ESP-IDF v5.2.2` 与配件 `USB-C 数据线`。重复执行不会新增用户/设备/读数（同 token、
+设备 UPSERT、读数 `ON CONFLICT DO NOTHING`）。
+
+本轮实测（真实 Postgres 容器 + 本机 API 进程）：
+
+```text
+== seed 第 1 次 ==
+push 结果: applied=1 skippedReadings=0 conflicts=0
+校验通过: user_devices=1 readings=24 metrics=pressure_hpa,relative_humidity,temperature_celsius device_types=5 firmware=ESP-IDF v5.2.2 accessory=USB-C 数据线 public_model=ESP32-C3-DevKitM-1
+
+== seed 第 2 次（幂等） ==
+复用已有 seed token（user=900e7f4a-01d8-4acb-8e99-017724fa9cd5）
+push 结果: applied=1 skippedReadings=24 conflicts=0
+校验通过: user_devices=1 readings=24 ...
+
+== curl 全链路 ==
+1) 匿名登录: {"userId":"164bd689-6f3e-487d-aa65-ddac2dda57ba","expiresAt":"2027-05-04T05:20:30.367973Z","hasToken":true}
+2) push: {"applied":1,"skippedReadings":0,"conflicts":0,"serverSeq":[2]}
+3) changes: {"changes":1,"nextCursor":2,"entities":["user_device"]}
+4) series: {"metric":"temperature_celsius","bucket":"1d","buckets":2,"firstBucket":{"start":"2026-11-04T00:00:00Z","end":"2026-11-05T00:00:00Z","count":2,"min":21.5,"max":22.5,"avg":22,"last":22.5}}
+5) metrics: {"items":[{"metric":"temperature_celsius","unit":"celsius","count":8}]}
+6) export: {"user":"164bd689-6f3e-487d-aa65-ddac2dda57ba","devices":1,"readings":8,"hasMore":false}
+7) 注销 DELETE /me: HTTP 204
+8) 注销后访问: HTTP 401 {"error":{"code":"UNAUTHORIZED","message":"token 无效、已过期或已吊销"}}
+```
+
+客户端操作说明、需要清理的 token/游标/本地库，以及 fixture 与 postgres 的差异清单见
+[`docs/e2e-with-postgres.md`](docs/e2e-with-postgres.md)。
+
+### 压测门槛与阈值（v0.9.0）
+
+`cmd/loadgen -smoke` 是 CI 的短跑模式：每场景 10s（2s 预热）、低并发，跑完按阈值断言，
+**任一场景错误率 > 0 或 p95 超阈值即非 0 退出**，CI job 直接变红（没有 `|| true`）。
+
+| 场景 | 并发 | 阈值（CI 断言） | 本轮 smoke 实测 p95 | 取值依据 |
+| --- | --- | --- | --- | --- |
+| `GET /my/devices` | 20 | **< 400 ms** | **28 ms**（20 421 请求，2 040.7 RPS） | v0.8.0 100 并发 p95 215 ms 的约 1.9x，覆盖共享 runner 抖动 |
+| `GET /readings/series`（1d/90 天） | 10 | **< 400 ms** | **15 ms**（14 207 请求，1 420.2 RPS） | v0.8.0 50 并发 p95 127 ms 的约 3.1x，兼顾 CI 机器更慢 |
+| `POST /sync/push`（100 设备+200 读数/批） | 5 | **< 4 000 ms** | **417 ms**（165 请求，16.2 RPS） | v0.8.0 50 并发 p95 2 005 ms 的约 2x，保留写吞吐上限余量 |
+| 错误率（全部场景） | — | **0%** | 0.00% | 不是性能抖动，任何 5xx/超时都视为回归 |
+
+本地复跑（真实 Postgres 栈）：
+
+```bash
+bash scripts/stack-for-e2e.sh
+go run ./cmd/loadgen -base-url "$(grep BASE_URL .e2e/stack.env | cut -d= -f2-)" -smoke
+# 可覆盖默认阈值：-max-p95-devices 400ms -max-p95-series 400ms -max-p95-push 4s -max-error-rate 0
+```
+
+CI 中的 `perf-smoke` job 会起 postgres service + API（`RATE_LIMIT_PER_MINUTE=0`）后执行
+`go run ./cmd/loadgen -base-url http://127.0.0.1:18080 -smoke`；失败时额外打印 API 日志。
+排障步骤见 [`docs/runbook.md`](docs/runbook.md) §7.10。
+
+### SLO（v0.9.0）
+
+| 编号 | SLI | 目标 | 对应告警（alerts.yml） |
+| --- | --- | --- | --- |
+| SLO-1 可用性 | 1 - 5xx/全部请求 | **≥ 99.5%/月**（错误预算 216 分钟） | `ApiAvailabilityBudgetBurn`、`ApiHigh5xxRate`、`ApiHealthCheckFailing`、`ApiRequestRateDroppedToZero`、`ApiMetricsAbsent` |
+| SLO-2 设备列表延迟 | `GET /my/devices` p95 | **< 300 ms** | `ApiDevicesP95High` |
+| SLO-3 读数序列延迟 | `GET .../readings/series` p95 | **< 200 ms** | `ApiSeriesP95High` |
+
+- PromQL、错误预算算法、告警一一映射与限制见 [`docs/slo.md`](docs/slo.md)。
+- 面板：[`deploy/grafana/dashboard.json`](deploy/grafana/dashboard.json)（请求量、错误率、
+  p50/p95/p99、DB 错误、用户/设备/读数近似量、健康探针）。
+- v0.9.0 给 HTTP 指标新增 `route` 标签（`pjgoiot_http_requests_total{method,route,status}`、
+  直方图 `{method,route}`），中间件把 Gin 的通配路由还原成
+  `/my/devices`、`/my/devices/:platform/:externalId/readings/series` 等模板，基数固定，
+  SLO-2/3 才能按接口精确查询。
+- dashboard 的 JSON 结构与指标名由 `scripts/validate-dashboard.sh` 校验（JSON 可解析 +
+  每个 `pjgoiot_*` 指标必须在 Go 代码中存在），已接入 CI `lint-configs`。
+
 ### curl 示例
 
 ```bash
@@ -787,13 +880,21 @@ PJGoIoT/
 │   ├── cleanup/main.go           # 90 天读数清理（cron/CronJob/compose profile 调用）
 │   └── migrate/main.go           # 内嵌迁移执行器
 ├── db/
-│   ├── migrations/               # 000001 建表 … 000007 配对码（go:embed）
+│   ├── migrations/               # 000001 建表 … 000008 token 过期（go:embed）
 │   └── queries/                  # sqlc 查询：auth / metadata / sync
 ├── deploy/
 │   ├── Caddyfile                 # HTTPS 终止 / 反代 / 拒绝公网 /metrics
-│   ├── prometheus/               # alerts.yml（6 条规则）+ scrape.yml
+│   ├── grafana/dashboard.json    # 请求/错误/p50-p95-p99/DB/近似量/健康探针面板
+│   ├── prometheus/               # alerts.yml（9 条规则，含 3 条 SLO）+ scrape.yml
 │   └── scripts/                  # backup.sh / restore.sh（可执行、带校验和）
-├── docs/runbook.md               # 部署清单、升级/回滚、备份恢复演练、故障排查
+├── docs/
+│   ├── runbook.md                # 部署清单、升级/回滚、备份恢复演练、故障排查
+│   ├── e2e-with-postgres.md      # Android/iOS 真实存储联调与 fixture 差异
+│   └── slo.md                    # SLO、PromQL、错误预算与告警映射
+├── scripts/
+│   ├── stack-for-e2e.sh          # 起真实 Postgres + API（自动换端口、迁移、输出 BASE_URL）
+│   ├── seed-for-e2e.sh           # 幂等写入最小可核实数据
+│   └── validate-dashboard.sh     # dashboard JSON 结构与指标名校验
 ├── fixtures/                     # 无数据库模式的公共元数据
 ├── internal/
 │   ├── auth/token.go             # 不透明 token 生成与哈希
@@ -809,7 +910,7 @@ PJGoIoT/
 ├── .env.example                  # 部署环境变量样例（不含真实密码）
 ├── Makefile
 ├── sqlc.yaml
-└── .github/workflows/ci.yml      # build-test / docker-build / lint-configs
+└── .github/workflows/ci.yml      # build-test / perf-smoke / docker-build / lint-configs
 ```
 
 ## 环境变量
@@ -829,7 +930,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.8.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
+| `APP_VERSION` | `0.9.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 | `READING_RETENTION_DAYS` | `90` | **仅 cleanup 容器**：读数保留天数，映射到 `-retention-days` |
@@ -940,6 +1041,11 @@ seed 数据来源与边界：
 | v0.8.0 端到端（真实 compose 栈） | 通过：匿名 `expiresAt=2027-05-04`；push 3 台设备得 `serverSeq=[246402,246403,246404]`；`cursor=0` 返回 3 条；cleanup 输出 `readings=1628 / change_log=1 / idempotency=0 / tokens=0`；旧游标 → `410 RESYNC_REQUIRED`；新游标返回 2 条；`/my/devices` 仍 3 台；过期 token → 401；token 清理后库内 0 行 |
 | v0.8.0 压测 | 通过（真实 compose 栈，Docker Desktop VM 2 vCPU / 4 GB）：devices 100 并发 30s → 1 065.6 RPS、p50 75 / p95 215 / p99 395 ms、0% 错误；push 50 并发（100 设备+200 读数）→ 51.5 RPS、801 / 2 005 / 2 818 ms、0%；series 50 并发（1d/90 天）→ 802.2 RPS、55 / 127 / 183 ms、0%。详见「容量与压测结果」 |
 | v0.8.0 GitHub Actions | **通过**（run 41969477796，commit b879f72）：`构建与测试`（含 `TestCleanupAndRetentionLifecycle`、迁移测试）、`构建镜像`、`配置与脚本校验`（cleanup/loadgen 编译与 `-h`、脚本 `bash -n`）均 success；tag `v0.8.0` 指向 b879f72 |
+| v0.9.0 真实存储联调 | 通过（真实 Postgres 容器 + 本机 API）：栈自动选端口 65500/65504、迁移 `version=8 dirty=false`、readiness 通过；curl 全链路 匿名登录 → push → changes → series → metrics → export → 注销 204 → 再访问 401 |
+| v0.9.0 seed 幂等 | 通过：连续执行两次，第二次复用 token，`skippedReadings=24`，`user_devices=1` / `readings=24` 不变；真实型号 `ESP32-C3-DevKitM-1`、`ESP-IDF v5.2.2`、`USB-C 数据线` 均由迁移 seed 校验 |
+| v0.9.0 smoke 门槛 | 通过（真实 Postgres 栈，本机）：devices 20 并发 p95 28ms（阈值 400ms）、series 10 并发 p95 15ms（400ms）、push 5 并发 p95 417ms（4000ms），错误率 0%，`SMOKE PASS` |
+| v0.9.0 dashboard 校验 | 通过：`bash scripts/validate-dashboard.sh` → JSON 结构有效（9 面板），`probe_success` 豁免，其余 `pjgoiot_*` 指标均在 Go 代码中存在 |
+| v0.9.0 单元/集成测试 | 通过：`gofmt`/`go build`/`go vet`/`go test ./...` 全绿；真实 PostgreSQL 集成测试（`TEST_DATABASE_URL`）全绿；`TestMetricsEndpoint` 已断言 `route` 标签 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -958,6 +1064,8 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
 - 读数、`change_log`、幂等键与过期 token 的保留期删除均由 `cmd/cleanup` 负责，API 内不做后台定时清理；生产环境需自行配置 cron / systemd timer / CronJob，否则数据无限增长。
 - `change_log` 被清理后，落后超过保留期的客户端会收到 `410 RESYNC_REQUIRED`；客户端必须实现“清本地 + `cursor=0` 全量拉取”，否则会卡在 410。
+- `scripts/stack-for-e2e.sh` 绑定 `127.0.0.1`，覆盖 Android/iOS 模拟器；真机经局域网访问尚未验证。
+- `/metrics` 的 `route` 标签依赖 Gin 路由模板；若新增通配路由，需要同步扩展 `routeLabel`，否则会退化为通配模板（不影响正确性，只降低可分性）。
 - 读数查询要求设备已存在于 `user_devices`；隐式设备写入的读数在注册前不可查。
 - 读数支持单指标聚合（`min/max/avg/last`）、UTC 对齐的 `1m/1h/1d` 分桶序列，以及设备维度指标清单；跨指标合并统计按需再扩展。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。

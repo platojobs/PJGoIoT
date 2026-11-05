@@ -1,11 +1,11 @@
 GO ?= go
-APP_VERSION ?= 0.8.0
+APP_VERSION ?= 0.9.0
 DATABASE_URL ?= postgres://platojobs@127.0.0.1:5432/pjgoiot?sslmode=disable
 
-.PHONY: help dev dev-postgres test lint build migrate migrate-down migrate-version sqlc docker-build docker-up docker-down
+.PHONY: help dev dev-postgres test lint build migrate migrate-down migrate-version sqlc docker-build docker-up docker-down e2e-stack e2e-seed e2e-stop validate-dashboard
 
 help: ## 显示可用命令
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
 dev: ## fixture 模式启动 API（无需数据库）
 	STORE=fixture APP_VERSION=$(APP_VERSION) $(GO) run ./cmd/api
@@ -44,3 +44,15 @@ docker-up: ## 启动 Caddy + API + Postgres（见 docs/runbook.md）
 
 docker-down: ## 停止并清理容器
 	docker compose down
+
+e2e-stack: ## 启动真实 Postgres + API 联调栈（stdout 输出 BASE_URL）
+	bash scripts/stack-for-e2e.sh
+
+e2e-seed: ## 向 e2e 栈写入幂等的最小可核实数据
+	bash scripts/seed-for-e2e.sh
+
+e2e-stop: ## 停止并清理 e2e 栈
+	bash scripts/stack-for-e2e.sh --stop
+
+validate-dashboard: ## 校验 Grafana dashboard JSON 与引用的指标名
+	bash scripts/validate-dashboard.sh

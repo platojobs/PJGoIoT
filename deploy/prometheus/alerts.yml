@@ -30,6 +30,51 @@ groups:
           summary: "API P95 延迟超过 2 秒"
           description: "近 5 分钟 P95 延迟 {{ $value }}s，检查数据库慢查询、连接池与同步推送体积。"
 
+      # 以下三条与 docs/slo.md 的 3 条 SLO 一一对应：
+      # 可用性 99.5%/月（错误预算 0.5%），1% 错误率 ≈ 2x 燃烧率。
+      - alert: ApiAvailabilityBudgetBurn
+        expr: |
+          sum(rate(pjgoiot_http_requests_total{status=~"5.."}[1h]))
+            /
+          clamp_min(sum(rate(pjgoiot_http_requests_total[1h])), 0.001)
+            > 0.01
+        for: 10m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+          slo: availability
+        annotations:
+          summary: "可用性错误预算快速燃烧"
+          description: "近 1 小时 5xx 比例 {{ $value | humanizePercentage }}，超过 99.5% 可用性目标对应错误率（0.5%）的 2 倍，请按 docs/slo.md 处理。"
+
+      - alert: ApiDevicesP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(pjgoiot_http_request_duration_seconds_bucket{method="GET",route="/api/v1/my/devices"}[10m]))
+          ) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          service: pjgoiot-api
+          slo: devices-latency
+        annotations:
+          summary: "GET /my/devices p95 超过 300ms"
+          description: "近 10 分钟 p95 为 {{ $value }}s，超过 SLO（300ms）。先看 CI 压测门槛与 pg_stat_statements 慢查询。"
+
+      - alert: ApiSeriesP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(pjgoiot_http_request_duration_seconds_bucket{method="GET",route="/api/v1/my/devices/:platform/:externalId/readings/series"}[10m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: pjgoiot-api
+          slo: series-latency
+        annotations:
+          summary: "读数序列 p95 超过 200ms"
+          description: "近 10 分钟 p95 为 {{ $value }}s，超过 SLO（200ms）。检查 readings 索引与时间窗口大小。"
+
       - alert: ApiDBErrorsIncreasing
         expr: increase(pjgoiot_db_errors_total[10m]) > 0
         for: 5m

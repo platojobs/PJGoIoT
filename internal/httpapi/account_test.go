@@ -307,7 +307,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
-		"pjgoiot_http_requests_total{method=\"GET\",status=\"200\"}",
+		"pjgoiot_http_requests_total{method=\"GET\",route=\"/api/v1/health\",status=\"200\"}",
 		"pjgoiot_http_request_duration_seconds_bucket",
 		"pjgoiot_http_request_duration_seconds_sum",
 		"pjgoiot_http_request_duration_seconds_count",
