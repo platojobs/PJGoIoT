@@ -246,7 +246,7 @@ done
 # 数据库中的权威 seq 列表。
 : >"$TMP/db-seqs"
 psql_q "SELECT seq FROM change_log WHERE user_id = '$USER_ID' ORDER BY seq" >"$TMP/db-seqs"
-APPLIED_IDS="$(python3 - "$TMP/devices" "$TMP/push-" "$TMP/applied-ids" <<'PY'
+python3 - "$TMP/devices" "$TMP/push-" "$TMP/applied-ids" <<'PY'
 import json
 import sys
 
@@ -260,8 +260,6 @@ with open(sys.argv[3], "w") as out:
         for item in data.get("applied") or []:
             out.write("%s\n" % item.get("id", dev_id))
 PY
-cat "$TMP/applied-ids"
-)"
 
 if python3 - "$TMP/seqs" "$TMP/db-seqs" "$TMP/applied-ids" <<'PY'
 import sys
