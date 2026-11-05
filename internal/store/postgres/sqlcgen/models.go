@@ -75,6 +75,24 @@ type PublicDevice struct {
 	UpdatedAt       time.Time
 }
 
+// 设备测量读数；按 id 幂等写入，服务端保留 90 天
+type Reading struct {
+	ID         uuid.UUID
+	UserID     uuid.UUID
+	Platform   string
+	ExternalID string
+	// 指标名，小写 snake_case，1-32 字符
+	Metric string
+	Value  float64
+	// 单位，最长 16 字符，允许空串（无量纲）
+	Unit string
+	// 客户端测量时间（RFC3339）；超前服务端 5 分钟以上会被拒绝
+	RecordedAt time.Time
+	// 写入时解析到的设备型号；无法关联时为 NULL
+	DeviceType sql.NullString
+	CreatedAt  time.Time
+}
+
 type Token struct {
 	ID        uuid.UUID
 	UserID    uuid.UUID

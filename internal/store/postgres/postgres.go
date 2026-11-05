@@ -344,7 +344,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if existing != nil && keyHolder != nil && existing.ID != keyHolder.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: "key_taken", Server: *keyHolder, Client: dev,
+				Reason: "key_taken", Server: keyHolder, Client: &dev,
 			})
 			continue
 		}
@@ -353,7 +353,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if !decision.Apply && !decision.Noop {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: decision.Reason, Server: *existing, Client: dev,
+				Reason: decision.Reason, Server: existing, Client: &dev,
 			})
 			continue
 		}
@@ -441,6 +441,12 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
 			Status: "applied", ServerSeq: seq,
 		})
+	}
+
+	if len(req.Readings) > 0 {
+		if err := pushReadingsTx(ctx, tx, uid, req.Readings, now, &result, q); err != nil {
+			return model.PushResult{}, false, err
+		}
 	}
 
 	next, err := q.GetMaxSeqForUser(ctx, uid)

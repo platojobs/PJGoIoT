@@ -176,11 +176,16 @@ func (s *Server) handleMyDeviceRoute(c *gin.Context) {
 		return
 	}
 	parts := strings.Split(rest, "/")
-	switch len(parts) {
-	case 1:
+	// /my/devices/{mac}、/my/devices/{platform}/{externalId} 以及读数子路径共用同一 catch-all。
+	switch {
+	case len(parts) == 1:
 		s.respondMyDeviceByMAC(c, parts[0])
-	case 2:
+	case len(parts) == 2:
 		s.respondMyDeviceByKey(c, parts[0], parts[1])
+	case len(parts) == 3 && parts[2] == "readings":
+		s.handleReadingsList(c, parts[0], parts[1])
+	case len(parts) == 4 && parts[2] == "readings" && parts[3] == "summary":
+		s.handleReadingsSummary(c, parts[0], parts[1])
 	default:
 		fail(c, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 	}

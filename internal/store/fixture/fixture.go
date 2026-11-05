@@ -39,6 +39,19 @@ type changeRecord struct {
 type userData struct {
 	byID  map[string]*model.UserDevice
 	byKey map[string]*model.UserDevice // key: platform|externalId
+
+	readings map[string]*readingRecord // key: reading id
+}
+
+// readingRecord 是内存版读数，字段与 readings 表一一对应。
+type readingRecord struct {
+	platform   string
+	externalID string
+	metric     string
+	value      float64
+	unit       string
+	recordedAt time.Time
+	deviceType string
 }
 
 // deviceKey 返回内存索引使用的复合键。
@@ -206,7 +219,11 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	userID := uuid.NewString()
-	s.users[userID] = &userData{byID: map[string]*model.UserDevice{}, byKey: map[string]*model.UserDevice{}}
+	s.users[userID] = &userData{
+		byID:     map[string]*model.UserDevice{},
+		byKey:    map[string]*model.UserDevice{},
+		readings: map[string]*readingRecord{},
+	}
 	s.tokens[tokenHash] = userID
 	return userID, nil
 }
@@ -411,9 +428,10 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		existingByID := data.byID[dev.ID]
 		keyHolder := data.byKey[key]
 		if existingByID != nil && keyHolder != nil && keyHolder.ID != existingByID.ID {
+			server := s.enrichUserDevice(*keyHolder)
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: "key_taken", Server: s.enrichUserDevice(*keyHolder), Client: dev,
+				Reason: "key_taken", Server: &server, Client: &dev,
 			})
 			continue
 		}
@@ -431,9 +449,10 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
+			server := s.enrichUserDevice(*existing)
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
-				Reason: decision.Reason, Server: s.enrichUserDevice(*existing), Client: dev,
+				Reason: decision.Reason, Server: &server, Client: &dev,
 			})
 			continue
 		}
@@ -495,6 +514,12 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
 			Status: "applied", ServerSeq: seq,
 		})
+	}
+
+	if len(req.Readings) > 0 {
+		if err := s.pushReadingsLocked(data, req.Readings, now, &result); err != nil {
+			return model.PushResult{}, false, err
+		}
 	}
 
 	result.NextCursor = s.maxSeqLocked(userID)

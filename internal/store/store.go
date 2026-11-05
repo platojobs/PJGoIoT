@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/platojobs/PJGoIoT/internal/model"
 )
@@ -16,6 +17,8 @@ var (
 	ErrUnauthorized = errors.New("未认证")
 	// ErrIdempotencyConflict 表示同一 Idempotency-Key 被用于不同的请求体。
 	ErrIdempotencyConflict = errors.New("Idempotency-Key 对应的请求体不一致")
+	// ErrBadCursor 表示分页游标无法解析，HTTP 层映射为 400。
+	ErrBadCursor = errors.New("游标不合法")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -65,4 +68,12 @@ type Store interface {
 	Push(ctx context.Context, userID string, req model.PushRequest, opts PushOptions) (result model.PushResult, replayed bool, err error)
 	// Changes 返回用户自 cursor 之后的增量变更，limit 为本次上限。
 	Changes(ctx context.Context, userID string, cursor int64, limit int) (model.ChangesPage, error)
+
+	// ListReadings 返回某设备在时间窗口内的读数，按 recordedAt 倒序游标分页。
+	// 设备不存在、已删除或不属于该用户时返回 ErrNotFound。
+	ListReadings(ctx context.Context, userID string, platform string, externalID string, q model.ReadingsQuery) (model.ReadingsPage, error)
+	// ReadingsSummary 聚合某设备在 [from, to] 内的读数；无数据时 count 为 0、数值为 nil。
+	ReadingsSummary(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time) (model.ReadingsSummary, error)
+	// CleanupReadings 删除 recorded_at 早于 before 的读数，返回删除条数。
+	CleanupReadings(ctx context.Context, before time.Time) (int64, error)
 }

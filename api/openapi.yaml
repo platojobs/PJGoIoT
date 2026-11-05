@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.3.3
+  version: 0.4.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -17,6 +17,8 @@ info:
       `mac` 仅作为可选元数据，不再参与唯一约束。
     - 公共设备查询的 MAC 规范化为小写冒号分隔的 6 字节形式。
     - 所有时间字段为 RFC 3339（UTC）。
+    - 自 `0.4.0` 起支持设备测量读数（readings）：随 `/sync/push` 批量写入、按设备唯一键分页查询与聚合，
+      服务端保留 90 天。读数按客户端生成的 `id` 幂等，不要求设备已存在于 `user_devices`。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -48,7 +50,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.3.3"
+                version: "0.4.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -327,6 +329,146 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /my/devices/{platform}/{externalId}/readings:
+    get:
+      tags: [user]
+      operationId: listDeviceReadings
+      summary: 查询某设备的测量读数
+      description: |
+        按 `recordedAt` **倒序**返回，使用不透明游标分页：
+
+        - `limit` 取 1–500，默认 100；`hasMore=true` 时用 `nextCursor` 拉取下一页；
+        - `nextCursor` 为空串表示没有更多；
+        - `metric` 可选，用于按指标过滤（必须是小写 snake_case）；
+        - `from` / `to` 可选，RFC3339，闭区间过滤 `recordedAt`；
+        - 越权、设备已删除或设备不存在统一返回 404；
+        - 隐式设备（只在 push 中提交过读数、未在 `user_devices` 注册）在注册前查询返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
+        - name: metric
+          in: query
+          required: false
+          description: 指标名，小写 snake_case，1–32 字符
+          schema:
+            type: string
+            example: temperature_celsius
+        - name: from
+          in: query
+          required: false
+          description: 起始时间（含），RFC3339
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: 结束时间（含），RFC3339
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页返回的 `nextCursor`
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadingsPage"
+              example:
+                items:
+                  - id: "22222222-2222-4222-8222-222222222222"
+                    metric: temperature_celsius
+                    value: 21.5
+                    unit: celsius
+                    recordedAt: "2026-11-05T00:00:00Z"
+                  - id: "33333333-3333-4333-8333-333333333333"
+                    metric: temperature_celsius
+                    value: 21.2
+                    unit: celsius
+                    recordedAt: "2026-11-04T23:55:00Z"
+                nextCursor: ""
+                hasMore: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /my/devices/{platform}/{externalId}/readings/summary:
+    get:
+      tags: [user]
+      operationId: getDeviceReadingsSummary
+      summary: 某设备指定指标的读数聚合
+      description: |
+        返回最近 `hours` 小时（默认 24，范围 1–2160）内单个指标的统计值。
+
+        - `metric` **必填**；缺失返回 400（聚合结果只对应一个单位）；
+        - `windowStart = now - hours`，`windowEnd = now`，闭区间；
+        - 无数据时 `count: 0`，`min`/`max`/`avg`/`last` 均为 `null`，`unit` 为空串；
+        - 有数据时 `unit` 取窗口内最新一条读数的单位，`last` 为窗口内 `recordedAt` 最新的值；
+        - 越权、设备已删除或设备不存在统一返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
+        - name: metric
+          in: query
+          required: true
+          description: 指标名，小写 snake_case，1–32 字符
+          schema:
+            type: string
+            example: temperature_celsius
+        - name: hours
+          in: query
+          required: false
+          description: 聚合窗口小时数，1–2160（90 天，与服务端保留期一致）
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2160
+            default: 24
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadingsSummary"
+              example:
+                metric: temperature_celsius
+                unit: celsius
+                count: 3
+                min: 21.2
+                max: 21.5
+                avg: 21.36
+                last: 21.5
+                windowStart: "2026-11-04T01:00:00Z"
+                windowEnd: "2026-11-05T01:00:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /sync/changes:
     get:
       tags: [sync]
@@ -393,6 +535,16 @@ paths:
         - 显式非空值：覆盖原值；
         - `alias` 与 `advertisedName` 独立：上报广播名不会覆盖用户别名，反之亦然。
           客户端扫描时应只上报 `advertisedName`，只有用户编辑别名时才上报 `alias`。
+
+        读数（自 `0.4.0`）：
+        - `readings` 可选，单批最多 500 条；`devices` 与 `readings` 至少提供一个（都为空返回 400）；
+        - 读数按客户端生成的 `id` 幂等：重复 id 不报错，计入 `skippedReadings`；
+          同 id 但内容不同时不覆盖，计入 `skippedReadings` 并在 `conflicts` 里追加
+          `{entity: "reading", reason: "duplicate_id", reading: {...}}`；
+        - 读数**不要求**设备已存在于 `user_devices`：未注册设备按「隐式设备」接受写入，
+          注册后即可通过 `/my/devices/{platform}/{externalId}/readings` 查询；
+        - `readings` 缺失时行为与旧客户端完全一致，`appliedReadings` / `skippedReadings` 恒为 0；
+        - 读数不受字段级 LWW 影响，一经写入不可修改（只有 90 天保留期清理）。
       security:
         - bearerAuth: []
       parameters:
@@ -433,6 +585,15 @@ paths:
                   alias: "iOS 连接的开发板"
                   updatedAt: "2026-11-05T00:00:00Z"
                   deleted: false
+              readings:
+                - id: "44444444-4444-4444-8444-444444444444"
+                  platform: android
+                  externalId: "AA:BB:CC:00:00:01"
+                  metric: temperature_celsius
+                  value: 21.5
+                  unit: celsius
+                  recordedAt: "2026-11-05T00:00:00Z"
+                  deviceType: nordic_uart
       responses:
         "200":
           description: 处理完成（可能包含 conflicts）
@@ -916,17 +1077,64 @@ components:
 
     PushRequest:
       type: object
-      required: [devices]
+      description: |
+        `devices` 与 `readings` 均为可选，但至少提供一个；两者都缺失或都为空数组返回 400。
       properties:
         clientId:
           type: string
           maxLength: 128
         devices:
           type: array
-          minItems: 1
           maxItems: 100
           items:
             $ref: "#/components/schemas/PushDevice"
+        readings:
+          type: array
+          maxItems: 500
+          description: |
+            可选（自 `0.4.0`）。按 `id` 幂等批量写入，不需要设备已注册。
+          items:
+            $ref: "#/components/schemas/PushReading"
+
+    PushReading:
+      type: object
+      required: [id, platform, externalId, metric, value, unit, recordedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端生成的读数 id；服务端按它幂等，全局唯一
+        platform:
+          type: string
+          enum: [android, ios]
+        externalId:
+          type: string
+          maxLength: 128
+          description: 设备唯一键。Android 为 MAC（规范化为大写）；iOS 为 UUID
+        metric:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: "^[a-z][a-z0-9_]*$"
+          description: 指标名，小写 snake_case（小写字母开头，只含小写字母、数字与下划线）
+        value:
+          type: number
+          format: double
+          description: 测量值；必须是有限浮点数（NaN/Inf 返回 400）
+        unit:
+          type: string
+          maxLength: 16
+          description: 单位，1–16 字符；空串表示无量纲
+        recordedAt:
+          type: string
+          format: date-time
+          description: 测量时间（RFC3339）；超前服务端 5 分钟以上返回 400 BAD_REQUEST
+        deviceType:
+          type: string
+          maxLength: 64
+          description: |
+            可选设备型号。缺省时服务端尝试按 MAC（Android）或已注册设备推导，
+            仍无法关联则为 null，不影响写入。
 
     AppliedChange:
       type: object
@@ -952,7 +1160,11 @@ components:
 
     Conflict:
       type: object
-      required: [id, platform, externalId, reason, server, client]
+      required: [id, platform, externalId, reason]
+      description: |
+        设备冲突（`entity` 省略）：`server` 与 `client` 为设备对象。
+        读数冲突：`entity: "reading"`、`reason: "duplicate_id"`，提供 `reading`，
+        不提供 `server`/`client`。
       properties:
         id:
           type: string
@@ -964,18 +1176,26 @@ components:
           type: string
         mac:
           type: string
+        entity:
+          type: string
+          enum: [reading]
+          description: 仅读数冲突出现；缺省表示 user_device 冲突（兼容旧客户端）
         reason:
           type: string
-          enum: [server_newer, clock_clamped, key_taken]
-          description: key_taken 表示 (platform, externalId) 已被同用户的其他设备占用
+          enum: [server_newer, clock_clamped, key_taken, duplicate_id]
+          description: |
+            key_taken 表示 (platform, externalId) 已被同用户的其他设备占用；
+            duplicate_id 表示读数 id 已存在且内容不同（一次性读数不可修改）。
         server:
           $ref: "#/components/schemas/UserDevice"
         client:
           $ref: "#/components/schemas/PushDevice"
+        reading:
+          $ref: "#/components/schemas/Reading"
 
     PushResult:
       type: object
-      required: [applied, conflicts, nextCursor]
+      required: [applied, conflicts, nextCursor, appliedReadings, skippedReadings]
       properties:
         applied:
           type: array
@@ -988,6 +1208,12 @@ components:
         nextCursor:
           type: integer
           format: int64
+        appliedReadings:
+          type: integer
+          description: 本次实际写入的读数条数（自 `0.4.0`）；未提交 readings 时为 0
+        skippedReadings:
+          type: integer
+          description: 按 id 幂等跳过的读数条数（自 `0.4.0`）；未提交 readings 时为 0
 
     Change:
       type: object
@@ -1026,3 +1252,76 @@ components:
           format: int64
         hasMore:
           type: boolean
+
+    Reading:
+      type: object
+      required: [id, metric, value, unit, recordedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        metric:
+          type: string
+          example: temperature_celsius
+        value:
+          type: number
+          format: double
+        unit:
+          type: string
+          description: 单位；空串表示无量纲
+        recordedAt:
+          type: string
+          format: date-time
+
+    ReadingsPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      description: 按 `recordedAt` 倒序；`nextCursor` 为空串表示没有更多。
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Reading"
+        nextCursor:
+          type: string
+          description: 不透明游标，直接回传即可
+        hasMore:
+          type: boolean
+
+    ReadingsSummary:
+      type: object
+      required: [metric, unit, count, min, max, avg, last, windowStart, windowEnd]
+      properties:
+        metric:
+          type: string
+        unit:
+          type: string
+          description: 窗口内最新读数的单位；无数据时为空串
+        count:
+          type: integer
+          format: int64
+        min:
+          type: number
+          format: double
+          nullable: true
+        max:
+          type: number
+          format: double
+          nullable: true
+        avg:
+          type: number
+          format: double
+          nullable: true
+        last:
+          type: number
+          format: double
+          nullable: true
+          description: 窗口内 `recordedAt` 最新的值；无数据时为 null
+        windowStart:
+          type: string
+          format: date-time
+          description: now - hours
+        windowEnd:
+          type: string
+          format: date-time
+          description: now

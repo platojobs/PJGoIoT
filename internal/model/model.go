@@ -136,10 +136,64 @@ func (d PushDevice) ResolvePresence(existing *UserDevice) (alias, advertisedName
 	return alias, advertisedName, group
 }
 
+// PushReading 是客户端在一次 push 中提交的单条测量读数。
+// 读取到的设备可以不在 user_devices 中（「隐式设备」），服务端只按设备唯一键归档。
+type PushReading struct {
+	ID         string    `json:"id"`
+	Platform   string    `json:"platform"`
+	ExternalID string    `json:"externalId"`
+	Metric     string    `json:"metric"`
+	Value      float64   `json:"value"`
+	Unit       string    `json:"unit"`
+	RecordedAt time.Time `json:"recordedAt"`
+	DeviceType string    `json:"deviceType,omitempty"`
+}
+
+// Reading 是读数查询接口返回的一条记录（只含客户端需要的字段）。
+type Reading struct {
+	ID         string    `json:"id"`
+	Metric     string    `json:"metric"`
+	Value      float64   `json:"value"`
+	Unit       string    `json:"unit"`
+	RecordedAt time.Time `json:"recordedAt"`
+}
+
+// ReadingsPage 是 GET /my/devices/{platform}/{externalId}/readings 的响应体。
+// 按 recordedAt 倒序；nextCursor 为空串表示没有更多。
+type ReadingsPage struct {
+	Items      []Reading `json:"items"`
+	NextCursor string    `json:"nextCursor"`
+	HasMore    bool      `json:"hasMore"`
+}
+
+// ReadingsSummary 是读数聚合结果；无数据时 count 为 0，数值字段为 null。
+type ReadingsSummary struct {
+	Metric      string    `json:"metric"`
+	Unit        string    `json:"unit"`
+	Count       int64     `json:"count"`
+	Min         *float64  `json:"min"`
+	Max         *float64  `json:"max"`
+	Avg         *float64  `json:"avg"`
+	Last        *float64  `json:"last"`
+	WindowStart time.Time `json:"windowStart"`
+	WindowEnd   time.Time `json:"windowEnd"`
+}
+
+// ReadingsQuery 是读数列表的过滤与分页参数。
+type ReadingsQuery struct {
+	Metric string
+	From   *time.Time
+	To     *time.Time
+	Limit  int
+	Cursor string
+}
+
 // PushRequest 是 POST /sync/push 的请求体。
+// Readings 自 v0.4.0 起可选；缺失时行为与旧客户端完全一致。
 type PushRequest struct {
-	ClientID string       `json:"clientId"`
-	Devices  []PushDevice `json:"devices"`
+	ClientID string        `json:"clientId"`
+	Devices  []PushDevice  `json:"devices"`
+	Readings []PushReading `json:"readings"`
 }
 
 // AppliedChange 表示一条被服务端接受的变更。
@@ -152,22 +206,30 @@ type AppliedChange struct {
 	ServerSeq  int64  `json:"serverSeq"`
 }
 
-// Conflict 表示 LWW 判定服务端获胜、客户端数据未被写入。
+// Conflict 表示一条未被写入的客户端数据。
+//
+// 设备冲突的 entity 字段省略（兼容旧客户端），server/client 为设备对象；
+// 读数冲突的 entity 为 "reading"，reason 为 "duplicate_id"，reading 为客户端提交的读数。
 type Conflict struct {
-	ID         string     `json:"id"`
-	Platform   string     `json:"platform"`
-	ExternalID string     `json:"externalId"`
-	MAC        string     `json:"mac,omitempty"`
-	Reason     string     `json:"reason"`
-	Server     UserDevice `json:"server"`
-	Client     PushDevice `json:"client"`
+	ID         string      `json:"id"`
+	Platform   string      `json:"platform"`
+	ExternalID string      `json:"externalId"`
+	MAC        string      `json:"mac,omitempty"`
+	Entity     string      `json:"entity,omitempty"`
+	Reason     string      `json:"reason"`
+	Server     *UserDevice `json:"server,omitempty"`
+	Client     *PushDevice `json:"client,omitempty"`
+	Reading    *Reading    `json:"reading,omitempty"`
 }
 
 // PushResult 是 POST /sync/push 的响应体。
+// appliedReadings / skippedReadings 自 v0.4.0 起新增；请求未带 readings 时恒为 0。
 type PushResult struct {
-	Applied    []AppliedChange `json:"applied"`
-	Conflicts  []Conflict      `json:"conflicts"`
-	NextCursor int64           `json:"nextCursor"`
+	Applied         []AppliedChange `json:"applied"`
+	Conflicts       []Conflict      `json:"conflicts"`
+	NextCursor      int64           `json:"nextCursor"`
+	AppliedReadings int             `json:"appliedReadings"`
+	SkippedReadings int             `json:"skippedReadings"`
 }
 
 // Change 是增量变更日志中的一条记录。

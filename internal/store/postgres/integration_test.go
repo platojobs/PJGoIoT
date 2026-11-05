@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -121,7 +122,7 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Conflicts) != 1 || res.Conflicts[0].Server.Alias != "设备 A" {
+		if len(res.Conflicts) != 1 || res.Conflicts[0].Server == nil || res.Conflicts[0].Server.Alias != "设备 A" {
 			t.Fatalf("冲突处理异常: %+v", res.Conflicts)
 		}
 	})
@@ -431,6 +432,172 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		}
 		if got.Group != "" || got.Alias != "用户改名" || got.AdvertisedName != "PJ-Sensor-3" {
 			t.Fatalf("缺省字段未保持或分组复活: %+v", got)
+		}
+	})
+	t.Run("读数链路", func(t *testing.T) {
+		const external = "AA:BB:CC:00:00:09"
+		ctx := context.Background()
+		base := time.Now().UTC().Add(-time.Hour)
+
+		// 设备与首批读数同批写入，验证读数按 id 幂等。
+		readings := make([]model.PushReading, 0, 5)
+		for i := 0; i < 5; i++ {
+			readings = append(readings, model.PushReading{
+				ID: uuid.NewString(), Platform: "android", ExternalID: external,
+				Metric: "temperature_celsius", Value: float64(10 + i), Unit: "celsius",
+				RecordedAt: base.Add(time.Duration(i) * time.Minute),
+			})
+		}
+		batch := model.PushRequest{
+			ClientID: "readings-it",
+			Devices: []model.PushDevice{{
+				ID: uuid.NewString(), MAC: external, Rules: []byte(`{}`), ScanRecords: []byte(`[]`), UpdatedAt: now,
+			}},
+			Readings: readings,
+		}
+		res, _, err := st.Push(ctx, userB, batch, store.PushOptions{})
+		if err != nil {
+			t.Fatalf("读数 push 失败: %v", err)
+		}
+		if res.AppliedReadings != 5 || res.SkippedReadings != 0 || len(res.Conflicts) != 0 {
+			t.Fatalf("首次读数 applied=%d skipped=%d conflicts=%d", res.AppliedReadings, res.SkippedReadings, len(res.Conflicts))
+		}
+
+		// 完全重复：skipped，无冲突。
+		dup, _, err := st.Push(ctx, userB, model.PushRequest{Readings: readings}, store.PushOptions{})
+		if err != nil {
+			t.Fatalf("重复 push 失败: %v", err)
+		}
+		if dup.AppliedReadings != 0 || dup.SkippedReadings != 5 || len(dup.Conflicts) != 0 {
+			t.Fatalf("重复读数 applied=%d skipped=%d conflicts=%d", dup.AppliedReadings, dup.SkippedReadings, len(dup.Conflicts))
+		}
+
+		// 同 id 不同内容：skipped + conflict。
+		changed := readings[1]
+		changed.Value = 99
+		conflictRes, _, err := st.Push(ctx, userB, model.PushRequest{Readings: []model.PushReading{changed}}, store.PushOptions{})
+		if err != nil {
+			t.Fatalf("冲突 push 失败: %v", err)
+		}
+		if conflictRes.SkippedReadings != 1 || len(conflictRes.Conflicts) != 1 {
+			t.Fatalf("冲突读数 skipped=%d conflicts=%d", conflictRes.SkippedReadings, len(conflictRes.Conflicts))
+		}
+		c := conflictRes.Conflicts[0]
+		if c.Entity != "reading" || c.Reason != "duplicate_id" || c.Reading == nil || c.Reading.Value != 99 {
+			t.Fatalf("冲突内容异常: %+v", c)
+		}
+
+		// 校验：NaN / Inf / 未来时间 / 非法 metric 在存储层同样被拒绝。
+		bad := []model.PushReading{
+			{ID: uuid.NewString(), Platform: "android", ExternalID: external, Metric: "nan_metric", Value: math.NaN(), Unit: "", RecordedAt: base},
+			{ID: uuid.NewString(), Platform: "android", ExternalID: external, Metric: "inf_metric", Value: math.Inf(1), Unit: "", RecordedAt: base},
+			{ID: uuid.NewString(), Platform: "android", ExternalID: external, Metric: "future_metric", Value: 1, Unit: "", RecordedAt: time.Now().UTC().Add(10 * time.Minute)},
+			{ID: uuid.NewString(), Platform: "android", ExternalID: external, Metric: "Temperature", Value: 1, Unit: "", RecordedAt: base},
+		}
+		for i, r := range bad {
+			if _, _, err := st.Push(ctx, userB, model.PushRequest{Readings: []model.PushReading{r}}, store.PushOptions{}); err == nil {
+				t.Fatalf("非法读数 %d 未被拒绝", i)
+			}
+		}
+
+		// 倒序游标分页。
+		page1, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Limit: 2})
+		if err != nil {
+			t.Fatalf("第一页失败: %v", err)
+		}
+		if len(page1.Items) != 2 || !page1.HasMore || page1.NextCursor == "" {
+			t.Fatalf("第一页 items=%d hasMore=%v cursor=%q", len(page1.Items), page1.HasMore, page1.NextCursor)
+		}
+		if page1.Items[0].Value != 14 || page1.Items[1].Value != 13 {
+			t.Fatalf("未按 recordedAt 倒序: %+v", page1.Items)
+		}
+		page2, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Limit: 2, Cursor: page1.NextCursor})
+		if err != nil {
+			t.Fatalf("第二页失败: %v", err)
+		}
+		if len(page2.Items) != 2 || !page2.HasMore || page2.Items[0].Value != 12 || page2.Items[1].Value != 11 {
+			t.Fatalf("第二页异常: %+v hasMore=%v", page2.Items, page2.HasMore)
+		}
+		page3, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Limit: 2, Cursor: page2.NextCursor})
+		if err != nil {
+			t.Fatalf("第三页失败: %v", err)
+		}
+		if len(page3.Items) != 1 || page3.HasMore || page3.NextCursor != "" || page3.Items[0].Value != 10 {
+			t.Fatalf("第三页异常: %+v hasMore=%v cursor=%q", page3.Items, page3.HasMore, page3.NextCursor)
+		}
+		if _, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Cursor: "not-a-cursor"}); !errors.Is(err, store.ErrBadCursor) {
+			t.Fatalf("非法游标 err=%v", err)
+		}
+		filtered, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Metric: "relative_humidity", Limit: 10})
+		if err != nil {
+			t.Fatalf("metric 过滤失败: %v", err)
+		}
+		if len(filtered.Items) != 0 {
+			t.Fatalf("metric 过滤结果=%+v", filtered.Items)
+		}
+
+		// 跨用户与不存在设备统一 404。
+		if _, err := st.ListReadings(ctx, userA, "android", external, model.ReadingsQuery{Limit: 10}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("跨用户 err=%v", err)
+		}
+		if _, err := st.ListReadings(ctx, userB, "android", "AA:BB:CC:00:00:0A", model.ReadingsQuery{Limit: 10}); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("不存在设备 err=%v", err)
+		}
+		if _, err := st.ReadingsSummary(ctx, userA, "android", external, "temperature_celsius", base, time.Now().UTC()); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("跨用户 summary err=%v", err)
+		}
+
+		// 聚合：10+11+12+13+14。
+		summary, err := st.ReadingsSummary(ctx, userB, "android", external, "temperature_celsius", base.Add(-time.Minute), time.Now().UTC())
+		if err != nil {
+			t.Fatalf("聚合失败: %v", err)
+		}
+		if summary.Count != 5 || summary.Min == nil || *summary.Min != 10 ||
+			summary.Max == nil || *summary.Max != 14 || summary.Avg == nil || *summary.Avg != 12 ||
+			summary.Last == nil || *summary.Last != 14 || summary.Unit != "celsius" {
+			t.Fatalf("聚合结果异常: %+v", summary)
+		}
+		empty, err := st.ReadingsSummary(ctx, userB, "android", external, "relative_humidity", base.Add(-time.Minute), time.Now().UTC())
+		if err != nil {
+			t.Fatalf("无数据聚合失败: %v", err)
+		}
+		if empty.Count != 0 || empty.Min != nil || empty.Max != nil || empty.Avg != nil || empty.Last != nil {
+			t.Fatalf("无数据聚合异常: %+v", empty)
+		}
+
+		// 数据库 CHECK 兜底：绕过应用层直接写入 NaN 必须失败。
+		if _, err := cleanupDB.Exec(`
+			INSERT INTO readings (id, user_id, platform, external_id, metric, value, unit, recorded_at)
+			VALUES ($1, $2, 'android', $3, 'db_nan_metric', 'NaN'::double precision, '', $4)`,
+			uuid.NewString(), userB, external, base); err == nil {
+			t.Fatalf("数据库 CHECK 未拒绝 NaN")
+		}
+
+		// 90 天清理：直接插入一条 91 天前的读数，清理后仅旧数据被删。
+		legacyID := uuid.NewString()
+		if _, err := cleanupDB.Exec(`
+			INSERT INTO readings (id, user_id, platform, external_id, metric, value, unit, recorded_at)
+			VALUES ($1, $2, 'android', $3, 'legacy_metric', 1, '', $4)`,
+			legacyID, userB, external, time.Now().UTC().Add(-91*24*time.Hour)); err != nil {
+			t.Fatalf("插入历史读数失败: %v", err)
+		}
+		deleted, err := st.CleanupReadings(ctx, time.Now().UTC().Add(-90*24*time.Hour))
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if deleted < 1 {
+			t.Fatalf("清理条数=%d", deleted)
+		}
+		legacy, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Metric: "legacy_metric", Limit: 10})
+		if err != nil {
+			t.Fatalf("清理后查询失败: %v", err)
+		}
+		if len(legacy.Items) != 0 {
+			t.Fatalf("历史读数未被清理: %+v", legacy.Items)
+		}
+		kept, err := st.ListReadings(ctx, userB, "android", external, model.ReadingsQuery{Limit: 10})
+		if err != nil || len(kept.Items) != 5 {
+			t.Fatalf("清理误删近期数据: len=%d err=%v", len(kept.Items), err)
 		}
 	})
 }

@@ -20,6 +20,13 @@ const (
 	maxGroupLength          = 64
 	maxClientIDLength       = 128
 	maxIdempotencyKey       = 128
+	// maxPushReadings 与 validate.MaxReadingsPerPush 保持一致。
+	maxPushReadings = 500
+	// defaultReadingsLimit 是读数列表的默认页大小。
+	defaultReadingsLimit = 100
+	// maxSummaryHours / defaultSummaryHours 限定聚合窗口。
+	defaultSummaryHours = 24
+	maxSummaryHours     = 2160 // 90 天，与服务端保留期一致
 )
 
 // macURIParam 用 ShouldBindUri 读取路径参数。
@@ -38,10 +45,39 @@ type changesQuery struct {
 	Limit  *int   `form:"limit" binding:"omitempty,min=1,max=500"`
 }
 
+// readingsQuery 是读数列表的查询参数。
+type readingsQuery struct {
+	Metric string `form:"metric"`
+	From   string `form:"from"`
+	To     string `form:"to"`
+	Limit  *int   `form:"limit" binding:"omitempty,min=1,max=500"`
+	Cursor string `form:"cursor"`
+}
+
+// readingsSummaryQuery 是读数聚合的查询参数。
+type readingsSummaryQuery struct {
+	Metric string `form:"metric"`
+	Hours  *int   `form:"hours" binding:"omitempty,min=1,max=2160"`
+}
+
 // pushPayload 是 POST /sync/push 的请求 DTO，利用 validator 标签做基础校验。
+// devices 与 readings 至少有一个非空，两者都缺省或都为空时返回 400。
 type pushPayload struct {
-	ClientID string              `json:"clientId" binding:"max=128"`
-	Devices  []pushDevicePayload `json:"devices" binding:"required,min=1,max=100,dive"`
+	ClientID string               `json:"clientId" binding:"max=128"`
+	Devices  []pushDevicePayload  `json:"devices" binding:"max=100,dive"`
+	Readings []pushReadingPayload `json:"readings" binding:"max=500,dive"`
+}
+
+// pushReadingPayload 是 readings 数组中单条读数的 DTO。
+type pushReadingPayload struct {
+	ID         string    `json:"id" binding:"required,uuid"`
+	Platform   string    `json:"platform" binding:"omitempty,oneof=android ios"`
+	ExternalID string    `json:"externalId" binding:"max=128"`
+	Metric     string    `json:"metric" binding:"required,max=32"`
+	Value      float64   `json:"value"`
+	Unit       string    `json:"unit" binding:"max=16"`
+	RecordedAt time.Time `json:"recordedAt" binding:"required"`
+	DeviceType string    `json:"deviceType" binding:"omitempty,max=64"`
 }
 
 type pushDevicePayload struct {
@@ -78,6 +114,18 @@ func (p pushPayload) toModel() model.PushRequest {
 			Deleted:        d.Deleted,
 		})
 	}
+	for _, r := range p.Readings {
+		req.Readings = append(req.Readings, model.PushReading{
+			ID:         r.ID,
+			Platform:   r.Platform,
+			ExternalID: r.ExternalID,
+			Metric:     r.Metric,
+			Value:      r.Value,
+			Unit:       r.Unit,
+			RecordedAt: r.RecordedAt,
+			DeviceType: r.DeviceType,
+		})
+	}
 	return req
 }
 
@@ -89,11 +137,14 @@ func normalizePush(req *model.PushRequest) error {
 	if len(req.ClientID) > maxClientIDLength {
 		return fmt.Errorf("clientId 长度不能超过 %d", maxClientIDLength)
 	}
-	if len(req.Devices) == 0 {
-		return fmt.Errorf("devices 不能为空")
+	if len(req.Devices) == 0 && len(req.Readings) == 0 {
+		return fmt.Errorf("devices 与 readings 不能同时为空")
 	}
 	if len(req.Devices) > maxPushDevices {
 		return fmt.Errorf("单次最多提交 %d 台设备", maxPushDevices)
+	}
+	if len(req.Readings) > maxPushReadings {
+		return fmt.Errorf("单次最多提交 %d 条读数", maxPushReadings)
 	}
 
 	seenID := make(map[string]struct{}, len(req.Devices))
@@ -165,6 +216,42 @@ func normalizePush(req *model.PushRequest) error {
 			return fmt.Errorf("devices[%d].scanRecords 必须是 JSON 数组", i)
 		}
 		dev.ScanRecords = records
+	}
+
+	return normalizeReadings(req)
+}
+
+// normalizeReadings 校验并规范化 readings 数组。
+//
+// 重复 id 不在此报错：服务端按 id 幂等处理，重复的计入 skippedReadings，
+// 内容不一致的额外计入 conflicts（entity=reading, reason=duplicate_id）。
+func normalizeReadings(req *model.PushRequest) error {
+	now := time.Now().UTC()
+	for i := range req.Readings {
+		r := &req.Readings[i]
+		if _, err := uuid.Parse(r.ID); err != nil {
+			return fmt.Errorf("readings[%d].id 必须是 UUID", i)
+		}
+		platform, externalID, _, err := validate.ResolveDeviceKey(r.Platform, r.ExternalID, "")
+		if err != nil {
+			return fmt.Errorf("readings[%d] 设备键非法: %s", i, err)
+		}
+		r.Platform, r.ExternalID = platform, externalID
+
+		if r.Metric, err = validate.NormalizeMetric(r.Metric); err != nil {
+			return fmt.Errorf("readings[%d].metric: %s", i, err)
+		}
+		if err := validate.CheckFiniteValue(r.Value); err != nil {
+			return fmt.Errorf("readings[%d].value: %s", i, err)
+		}
+		if r.Unit, err = validate.NormalizeUnit(r.Unit); err != nil {
+			return fmt.Errorf("readings[%d].unit: %s", i, err)
+		}
+		if err := validate.CheckRecordedAt(r.RecordedAt, now); err != nil {
+			return fmt.Errorf("readings[%d].recordedAt: %s", i, err)
+		}
+		r.RecordedAt = r.RecordedAt.UTC().Truncate(time.Microsecond)
+		r.DeviceType = strings.ToLower(strings.TrimSpace(r.DeviceType))
 	}
 	return nil
 }

@@ -178,4 +178,36 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if got.DeviceType == nil || *got.DeviceType != "nordic_uart" {
 		t.Fatalf("迁移后旧设备型号异常: %+v", got.DeviceType)
 	}
+
+	// 000006：readings 表存在；down 可回滚且不影响设备表，随后可再次 up。
+	var hasReadings bool
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables WHERE table_name = 'readings'
+	)`).Scan(&hasReadings); err != nil {
+		t.Fatalf("查询 readings 表失败: %v", err)
+	}
+	if !hasReadings {
+		t.Fatalf("迁移到最新版本后缺少 readings 表")
+	}
+	if err := m.Migrate(5); err != nil {
+		t.Fatalf("回滚 000006 失败: %v", err)
+	}
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables WHERE table_name = 'readings'
+	)`).Scan(&hasReadings); err != nil {
+		t.Fatalf("回滚后查询 readings 表失败: %v", err)
+	}
+	if hasReadings {
+		t.Fatalf("回滚 000006 后 readings 表仍存在")
+	}
+	var deviceCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM user_devices WHERE user_id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚后查询设备失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000006 破坏了设备数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚后重新迁移失败: %v", err)
+	}
 }

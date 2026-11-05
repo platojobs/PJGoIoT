@@ -6,7 +6,7 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.3.3**（在 v0.3.2 字段扩展上明确分组清除与别名/广播名语义）
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，当前版本 **v0.4.0**（新增设备测量读数 readings 链路：批量写入、分页查询、聚合与 90 天保留）
 
 ## 快速开始
 
@@ -67,8 +67,10 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/my/devices` | Bearer | 200 | 当前用户未删除设备列表 |
 | GET | `/my/devices/{mac}` | Bearer | 200 | 按 MAC 元数据查单台设备（仅 Android；iOS 用下一行接口） |
 | GET | `/my/devices/{platform}/{externalId}` | Bearer | 200 | 按设备唯一键查单台设备，iOS 无需 MAC |
+| GET | `/my/devices/{platform}/{externalId}/readings` | Bearer | 200 | 读数列表，`recordedAt` 倒序游标分页，`{items,nextCursor,hasMore}` |
+| GET | `/my/devices/{platform}/{externalId}/readings/summary` | Bearer | 200 | 单指标聚合，`{metric,unit,count,min,max,avg,last,windowStart,windowEnd}` |
 | GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}` |
-| POST | `/sync/push` | Bearer | 200 | 批量写入，`{applied,conflicts,nextCursor}` |
+| POST | `/sync/push` | Bearer | 200 | 批量写入设备与读数，`{applied,conflicts,nextCursor,appliedReadings,skippedReadings}` |
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -107,6 +109,97 @@ make dev-postgres   # Postgres 模式启动 API
 - `alias`：用户设置的别名，只在用户编辑时上报，服务端不会被广播名覆盖；
 - `advertisedName`：设备广播名（BLE Local Name），客户端扫描时可覆盖上报，不会改动 `alias`；
 - `UserDevice` 同时返回两者（`advertisedName` 为 v0.3.3 新增字段）。
+
+### 读数链路（v0.4.0）
+
+设备测量数据通过 `readings` 表持久化，App 不再只有本地缓存。
+
+#### 表结构
+
+`readings`（迁移 `000006_readings`）：
+
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | `uuid` | 主键，客户端生成；服务端按它幂等 |
+| `user_id` | `uuid` | 归属用户，`ON DELETE CASCADE` |
+| `platform` | `text` | `android` / `ios` |
+| `external_id` | `text` | 设备唯一键（Android 大写 MAC，iOS UUID） |
+| `metric` | `text` | 指标名，小写 snake_case，1–32 字符 |
+| `value` | `double precision` | 测量值；CHECK 拒绝 NaN / ±Inf |
+| `unit` | `text` | 单位，0–16 字符，空串表示无量纲 |
+| `recorded_at` | `timestamptz` | 客户端测量时间 |
+| `device_type` | `text` nullable | 写入时解析到的型号，可空 |
+| `created_at` | `timestamptz` | 服务端写入时间 |
+
+索引：`readings_user_device_metric_time_idx (user_id, platform, external_id, metric, recorded_at DESC)`。
+down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
+
+#### 写入：`POST /sync/push`
+
+请求体新增可选 `readings` 数组（≤500 条/批），元素：
+
+```json
+{"id":"<uuid>","platform":"android","externalId":"AA:BB:CC:00:00:01",
+ "metric":"temperature_celsius","value":21.5,"unit":"celsius",
+ "recordedAt":"2026-11-05T00:00:00Z","deviceType":"nordic_uart"}
+```
+
+响应新增 `appliedReadings`（实际写入条数）与 `skippedReadings`（按 id 跳过条数）。
+未提交 `readings` 时两字段恒为 0，其余字段与旧版本完全一致。
+
+幂等与冲突：
+
+| 情况 | 结果 |
+| --- | --- |
+| `id` 不存在 | 写入，`appliedReadings++` |
+| `id` 已存在且内容一致 | 不写入，`skippedReadings++`，**不产生冲突** |
+| `id` 已存在但内容不同 | 不写入，`skippedReadings++`，追加冲突 `{entity:"reading", reason:"duplicate_id", reading:{...}}` |
+| 同批内重复 `id` | 按上述规则逐条判定 |
+
+读数写入后不可变（不参与字段级 LWW），只能被 90 天保留策略清理。
+
+校验规则（HTTP 与存储层共用 `internal/validate/reading.go`）：
+
+| 字段 | 规则 | 违反时 |
+| --- | --- | --- |
+| `id` | UUID | 400 |
+| `platform` / `externalId` | 沿用设备唯一键规则（`android` + MAC，`ios` + UUID） | 400 / `INVALID_MAC` |
+| `metric` | 小写 snake_case，`^[a-z][a-z0-9_]*$`，1–32 字符 | 400 `BAD_REQUEST` |
+| `value` | 有限浮点数；NaN / ±Inf 拒绝 | 400（JSON 解析失败为 `INVALID_JSON`/`BAD_REQUEST`；数据库 CHECK 兜底） |
+| `unit` | 0–16 字符（允许空串） | 400 `BAD_REQUEST` |
+| `recordedAt` | RFC3339；超前服务端 > 5 分钟拒绝 | 400 `BAD_REQUEST` |
+| 批量 | `readings` ≤ 500，`devices` ≤ 100，两者不能同时为空 | 400 `BAD_REQUEST` |
+
+**隐式设备**：读数引用的设备不要求在 `user_devices` 中存在。未注册设备按「隐式设备」接受写入
+（便于先采数据、后补设备信息）；但在设备注册（或被 `/sync/push` 写入）之前，
+`GET .../readings` 与 `.../summary` 仍按设备不存在返回 404。
+
+#### 查询：`GET /my/devices/{platform}/{externalId}/readings`
+
+查询参数：`metric`（可选）、`from` / `to`（RFC3339，闭区间）、`limit`（1–500，默认 100）、`cursor`。
+
+- 按 `recordedAt` **倒序**，同一时间按 `id` 倒序稳定排序；
+- `nextCursor` 为不透明游标，`hasMore=false` 时为空串；
+- 越权、设备已删除、设备不存在一律 404；非法游标/时间/limit 返回 400。
+
+#### 聚合：`GET .../readings/summary?metric=&hours=24`
+
+- `metric` 必填（缺失 400）；`hours` 默认 24，范围 1–2160（90 天）；
+- 窗口为 `[now-hours, now]`，返回 `windowStart` / `windowEnd`；
+- 无数据时 `count:0`，`min`/`max`/`avg`/`last` 均为 `null`，`unit` 为空串；
+- 有数据时 `unit` 取窗口内最新一条的单位，`last` 为 `recordedAt` 最新的值。
+
+#### 保留策略（90 天）
+
+服务端只保留 90 天读数。清理命令：
+
+```bash
+DATABASE_URL='postgres://...' go run ./cmd/cleanup                 # 默认删除 90 天前的数据
+DATABASE_URL='postgres://...' go run ./cmd/cleanup -retention-days 90 -dry-run
+```
+
+建议通过 cron / Kubernetes CronJob / 云定时任务每天执行一次。清理逻辑为
+`DELETE FROM readings WHERE recorded_at < now - retention`，不影响设备与变更日志。
 
 ### curl 示例
 
@@ -186,6 +279,35 @@ curl -s -X POST $BASE/sync/push \
 # 7. 拉取增量变更
 curl -s "$BASE/sync/changes?cursor=0&limit=50" -H "Authorization: Bearer $TOKEN"
 
+# 7b. 推送读数（与设备同批或只推读数均可；按 id 幂等）
+curl -s -X POST $BASE/sync/push \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: readings-1" \
+  -d '{
+    "clientId": "android-demo",
+    "readings": [{
+      "id": "44444444-4444-4444-8444-444444444444",
+      "platform": "android",
+      "externalId": "AA:BB:CC:00:00:01",
+      "metric": "temperature_celsius",
+      "value": 21.5,
+      "unit": "celsius",
+      "recordedAt": "2026-11-05T01:00:00Z"
+    }]
+  }'
+
+# 7c. 查询读数（recordedAt 倒序，limit 1–500，默认 100）
+curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings?metric=temperature_celsius&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 7d. 聚合最近 24 小时（metric 必填；无数据时数值字段为 null）
+curl -s "$BASE/my/devices/android/AA:BB:CC:00:00:01/readings/summary?metric=temperature_celsius&hours=24" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 7e. 清理 90 天前读数（也可用 -dry-run 先看时间边界）
+# DATABASE_URL='postgres://...' go run ./cmd/cleanup -retention-days 90
+
 # 8. 删除设备（只写 tombstone，不物理删除）
 curl -s -X POST $BASE/sync/push \
   -H "Authorization: Bearer $TOKEN" \
@@ -221,7 +343,7 @@ PostgreSQL
 数据分两层：
 
 - **公共元数据**（全局共享，按 MAC 或 type 查询）：`device_types`、`gatt_services`、`public_devices`、`firmwares`、`accessories`。
-- **用户私有数据**（按 `user_id` 隔离）：`user_devices`、`change_log`、`idempotency_keys`、`tokens`。
+- **用户私有数据**（按 `user_id` 隔离）：`user_devices`、`readings`、`change_log`、`idempotency_keys`、`tokens`。
 
 设备唯一键：
 
@@ -245,6 +367,8 @@ PostgreSQL
 - 设备详情不再必须依赖 MAC：公共元数据用 `/device-types/{type}`，用户私有数据用 `/my/devices/{platform}/{externalId}`。
 - v0.3.2 起 `UserDevice` 直接返回 `deviceType` / `vendor` / `firmwareVersion` / `compatibility`，iOS/Android 详情页无需自行拼装公共元数据；缺失时为 `null`。
 - v0.3.3 起 `UserDevice` 增加 `advertisedName`；分组删除请上报 `"group": ""`，不要在本地省略该字段。
+- v0.4.0 起读数走 `POST /sync/push` 的 `readings`（按 `id` 幂等）与 `/my/devices/{platform}/{externalId}/readings[/summary]`；
+  读数不要求在 `user_devices` 中先注册，但查询以设备存在为前提。
 - `401` 语义见下节；iOS 端已确认不在 401 后自动匿名重登。
 - 字段命名以 `api/openapi.yaml` 为准；若与 iOS 端 `docs/consistency.md` 有出入，需同步修改两份文档并在此处记录。
 
@@ -303,6 +427,7 @@ PJGoIoT/
 ├── api/openapi.yaml              # 对外契约
 ├── cmd/
 │   ├── api/main.go               # API 启动、优雅关闭、-healthcheck
+│   ├── cleanup/main.go           # 90 天读数清理（cron/CronJob 调用）
 │   └── migrate/main.go           # 内嵌迁移执行器
 ├── db/
 │   ├── migrations/               # 000001 建表、000002 seed（go:embed）
@@ -335,7 +460,7 @@ PJGoIoT/
 | `RATE_LIMIT_BURST` | `40` | 每 IP 令牌桶容量 |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.3.3` | 健康接口与日志中展示的版本 |
+| `APP_VERSION` | `0.4.0` | 健康接口与日志中展示的版本 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -369,6 +494,11 @@ go run ./cmd/migrate -direction up -steps 1   # 只前进一步
   - `user_devices` 新增 `advertised_name text NOT NULL DEFAULT ''`，旧记录默认空串，`alias` 原值保留；
   - 分组清除不需要改表：既有 `group` 列已为 `NOT NULL DEFAULT ''`，空串即表示未分组；
   - 通过 `COMMENT ON COLUMN` 固化三列语义；down 迁移只删除 `advertised_name`。
+- `000006_readings`：新增设备读数表：
+  - 主键 `id uuid`（客户端生成，服务端按 id 幂等）；列 `user_id, platform, external_id, metric, value, unit, recorded_at, device_type, created_at`；
+  - 索引 `readings_user_device_metric_time_idx (user_id, platform, external_id, metric, recorded_at DESC)`；
+  - `value` 有 CHECK 约束拒绝 NaN / ±Inf；`device_type` 可空；
+  - down 迁移 `DROP TABLE readings`，不触碰其他表（已在迁移测试中验证 up → down → up）。
 
 seed 数据来源与边界：
 
@@ -383,10 +513,10 @@ seed 数据来源与边界：
 
 测试覆盖：
 
-- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然。
+- `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然；v0.4.0 新增 `TestReadingsPushIdempotency`（重复 id 计 skipped、同 id 不同内容计 `duplicate_id` 冲突且原值不变）、`TestReadingsPushOptional`（无 readings 时计数为 0、隐式设备写入与注册后可查）、`TestReadingsValidation`（metric/unit/value/recordedAt/批量上限/非法 externalId）、`TestReadingsListPagination`（倒序、游标翻页、metric 与时间过滤、非法参数、跨用户 404）、`TestReadingsSummary`（聚合值、无数据 null、hours 校验、跨用户 404）。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType`、`alias`、`advertisedName`、`group` 仅在客户端上报时参与内容比较（缺失保持原值不产生冲突）。
-- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）。
-- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=5，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值与旧数据可读。
+- `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）；v0.4.0 新增集成子测试「读数链路」：批量写入与计数、重复 id 幂等、同 id 不同内容冲突、NaN/Inf/未来时间/非法 metric 拒绝、数据库 CHECK 拒绝 NaN、倒序游标分页、非法游标、metric 过滤、跨用户与不存在设备 404、summary 聚合与无数据、90 天清理（历史数据被删且近期数据保留）。
+- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=6，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引；随后回滚到 version=5 验证 `readings` 表被删除且设备数据完好，再 up 回到 version=6。
 
 本机实际执行结果（2026-11-05）：
 
@@ -394,12 +524,14 @@ seed 数据来源与边界：
 | --- | --- |
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
-| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok） |
-| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=5；含旧数据与字段回填） |
+| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok；`-v` 统计 23 个顶层测试、121 个含子测试用例，0 失败） |
+| `TEST_DATABASE_URL=... go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices' -v` | 通过（本机真实 PostgreSQL，迁移到 version=6；含旧数据、字段回填、读数链路与 down 回滚） |
 | v0.3.2 字段测试 | 通过：`TestDeviceMetadataEnrichment`（列表/单查 200 字段、catalog 固件配件完整性、未注册型号与无 MAC 降级 null）、`TestDeviceTypeComparison`、集成测试「公共元数据补全与缺失降级」 |
 | v0.3.3 语义测试 | 通过：`TestPresenceSemantics`（`"group": ""` 清除、缺失保持、清空后拉回为空、广播名与别名互不覆盖）、`TestPresenceOnlyComparison`、集成测试「可缺省字段语义与广播名隔离」、迁移测试 `advertised_name` 默认空串 |
-| 真实库迁移 | 通过：`cmd/migrate up` → version=5 dirty=false；`firmwares.vendor` / `accessories.vendor` 按预期回填，AA 电池厂商为空；`user_devices.advertised_name` 已新增且默认空串 |
+| v0.4.0 读数测试 | 通过：`TestReadingsPushIdempotency`、`TestReadingsPushOptional`、`TestReadingsValidation`、`TestReadingsListPagination`、`TestReadingsSummary`、集成子测试「读数链路」（含数据库 CHECK 拒绝 NaN、90 天清理）、迁移测试 up→down→up |
+| 真实库迁移 | 通过：`cmd/migrate up` → version=6 dirty=false；`readings` 表、索引与 CHECK 约束按预期创建；历史 000003~000005 回填保持正确（`advertised_name` 默认空串、AA 电池厂商为空） |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
+| v0.4.0 读数 HTTP 验证 | 通过（真实 PostgreSQL + `cmd/api`）：push `appliedReadings=2`；重复 id 不同值返回 `skippedReadings=1` 与 `entity=reading/reason=duplicate_id` 冲突且原值不变；列表倒序；summary `count/min/max/avg/last` 正确；无数据时数值为 `null`；未来时间 400 `BAD_REQUEST`；NaN 400；未知设备与跨用户 404 |
 | fixture 模式新增接口验证 | 通过：`/device-types/{type}/catalog` 200 且含固件/配件、未知类型 404；`/my/devices/android/{mac}` 与 `/my/devices/ios/{uuid}` 200；非法 platform 400；旧 `/my/devices/{mac}` 兼容 |
 | fixture 字段补全验证 | 通过：`/my/devices` 中 Android 设备返回 `nordic_uart / Nordic Semiconductor / nRF Connect SDK v2.9.0` 与 UART 兼容性；iOS 上报 `environmental_sensor` 返回厂商与温度/湿度/气压兼容性、`firmwareVersion=null`；未注册型号仅回显 `deviceType`，其余为 `null`；catalog 固件/配件均带 `vendor` 与 `compatibility` |
 | fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
@@ -420,6 +552,9 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
 - token 无刷新与过期时间，仅支持吊销；如需长效会话可增加滚动续期，但必须保持「401 不自动重登」的契约。
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
+- 读数保留 90 天由 `cmd/cleanup` 负责，服务内不做后台定时清理；生产环境需自行配置 cron / CronJob。
+- 读数查询要求设备已存在于 `user_devices`；隐式设备写入的读数在注册前不可查。
+- 读数目前只支持单指标聚合（min/max/avg/last），跨指标或按天分桶聚合按需再扩展。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
 - fixture 模式的用户与设备数据在重启后丢失，仅用于本地联调与测试。
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。
