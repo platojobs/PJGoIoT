@@ -238,7 +238,8 @@ func (s *Server) respondMyDeviceByKey(c *gin.Context, rawPlatform string, rawExt
 // storeFailure 把存储错误交给统一错误中间件：
 // ErrNotFound/ErrUnauthorized 分别映射 404/401，其余记录日志后返回 500。
 func (s *Server) storeFailure(c *gin.Context, operation string, err error) {
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrUnauthorized) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrUnauthorized) ||
+		errors.Is(err, store.ErrTimeout) || errors.Is(err, store.ErrCursorExpired) {
 		c.Error(err)
 		c.Abort()
 		return

@@ -33,8 +33,8 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 	}
 	delete(s.users, userID)
 
-	for hash, uid := range s.tokens {
-		if uid == userID {
+	for hash, rec := range s.tokens {
+		if rec.userID == userID {
 			delete(s.tokens, hash)
 		}
 	}
@@ -176,7 +176,7 @@ func (s *Store) CreatePairingCode(ctx context.Context, userID string, codeHash s
 }
 
 // ClaimPairingCode 实现 store.Store。
-func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration) (string, error) {
+func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration, tokenExpiresAt time.Time) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -195,7 +195,7 @@ func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash
 	}
 
 	delete(s.pairingCodes, codeHash)
-	s.tokens[tokenHash] = rec.userID
+	s.tokens[tokenHash] = tokenRecord{userID: rec.userID, expiresAt: tokenExpiresAt.UTC()}
 	return rec.userID, nil
 }
 
@@ -222,6 +222,51 @@ func (s *Store) CleanupPairingCodes(ctx context.Context, before time.Time) (int6
 	for hash, rec := range s.pairingCodes {
 		if rec.expiresAt.Before(before) {
 			delete(s.pairingCodes, hash)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CleanupChangeLog 实现 store.Store：删除 serverTS 早于 before 的变更。
+func (s *Store) CleanupChangeLog(ctx context.Context, before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.changes[:0]
+	var n int64
+	for _, rec := range s.changes {
+		if rec.serverTS.Before(before) {
+			n++
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	s.changes = kept
+	return n, nil
+}
+
+// CleanupIdempotencyKeys 实现 store.Store：删除 createdAt 早于 before 的幂等键。
+func (s *Store) CleanupIdempotencyKeys(ctx context.Context, before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	for key, rec := range s.idempotency {
+		if rec.CreatedAt.Before(before) {
+			delete(s.idempotency, key)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CleanupTokens 实现 store.Store：删除 expiresAt 早于 before 的 token。
+func (s *Store) CleanupTokens(ctx context.Context, before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	for hash, rec := range s.tokens {
+		if rec.expiresAt.Before(before) {
+			delete(s.tokens, hash)
 			n++
 		}
 	}

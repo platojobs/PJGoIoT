@@ -47,16 +47,16 @@ func TestPostgresStoreIntegration(t *testing.T) {
 
 	hashA := hashOf("token-a-" + uuid.NewString())
 	hashB := hashOf("token-b-" + uuid.NewString())
-	userA, err := st.CreateUserWithToken(context.Background(), hashA)
+	userA, err := st.CreateUserWithToken(context.Background(), hashA, time.Now().UTC().Add(180*24*time.Hour))
 	if err != nil {
 		t.Fatalf("创建用户 A 失败: %v", err)
 	}
-	userB, err := st.CreateUserWithToken(context.Background(), hashB)
+	userB, err := st.CreateUserWithToken(context.Background(), hashB, time.Now().UTC().Add(180*24*time.Hour))
 	if err != nil {
 		t.Fatalf("创建用户 B 失败: %v", err)
 	}
 	hashC := hashOf("token-c-" + uuid.NewString())
-	userC, err := st.CreateUserWithToken(context.Background(), hashC)
+	userC, err := st.CreateUserWithToken(context.Background(), hashC, time.Now().UTC().Add(180*24*time.Hour))
 	if err != nil {
 		t.Fatalf("创建用户 C 失败: %v", err)
 	}

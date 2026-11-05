@@ -56,7 +56,7 @@ jobs:
         run: go run ./cmd/migrate -direction up
 
       - name: Postgres 集成测试
-        run: go test ./internal/store/postgres -run TestPostgresStoreIntegration -v
+        run: go test ./internal/store/postgres -run 'TestPostgres|TestCleanupAndRetentionLifecycle|TestMigrationBackfillsLegacyDevices' -v
 
   docker-build:
     name: 构建镜像
@@ -75,6 +75,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 清理与压测工具静态校验（不实际压测）
+        run: |
+          set -euo pipefail
+          go build -o /tmp/cleanup ./cmd/cleanup
+          go build -o /tmp/loadgen ./cmd/loadgen
+          go vet ./cmd/cleanup ./cmd/loadgen
+          /tmp/loadgen -h >/dev/null
+          /tmp/cleanup -h >/dev/null
+          echo "cleanup/loadgen 编译与 flag 解析 ok"
 
       - name: 校验 YAML 与编排关键约束
         run: |

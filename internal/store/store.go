@@ -19,6 +19,10 @@ var (
 	ErrIdempotencyConflict = errors.New("Idempotency-Key 对应的请求体不一致")
 	// ErrBadCursor 表示分页游标无法解析，HTTP 层映射为 400。
 	ErrBadCursor = errors.New("游标不合法")
+	// ErrCursorExpired 表示同步游标早于 change_log 保留边界，HTTP 层映射为 410 RESYNC_REQUIRED。
+	ErrCursorExpired = errors.New("同步游标已过期")
+	// ErrTimeout 表示数据库查询超过服务端超时预算，HTTP 层映射为 503 TIMEOUT。
+	ErrTimeout = errors.New("数据库查询超时")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -49,8 +53,8 @@ type Store interface {
 	// ListAccessories 返回指定设备类型的配件列表。
 	ListAccessories(ctx context.Context, deviceType string) ([]model.Accessory, error)
 
-	// CreateUserWithToken 创建匿名用户并写入 token 哈希，返回用户 id。
-	CreateUserWithToken(ctx context.Context, tokenHash string) (userID string, err error)
+	// CreateUserWithToken 创建匿名用户并写入 token 哈希与过期时间，返回用户 id。
+	CreateUserWithToken(ctx context.Context, tokenHash string, expiresAt time.Time) (userID string, err error)
 	// UserIDByTokenHash 解析 token 哈希；已吊销视为未认证。
 	UserIDByTokenHash(ctx context.Context, tokenHash string) (userID string, err error)
 	// RevokeToken 吊销 token，重复吊销不报错。
@@ -65,7 +69,7 @@ type Store interface {
 	CreatePairingCode(ctx context.Context, userID string, codeHash string, expiresAt time.Time) error
 	// ClaimPairingCode 校验配对码并在同一事务内签发新 token，返回配对用户 id。
 	// 过期、已用过、不存在统一返回 ErrNotFound；失败尝试按码计数，满 5 次作废。
-	ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration) (userID string, err error)
+	ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration, tokenExpiresAt time.Time) (userID string, err error)
 	// CleanupPairingCodes 删除 expiresAt 早于 before 的配对码（含失败尝试记录）。
 	CleanupPairingCodes(ctx context.Context, before time.Time) (int64, error)
 
@@ -84,6 +88,7 @@ type Store interface {
 	// Push 执行一次同步写入；replayed 表示命中幂等缓存并直接返回历史响应。
 	Push(ctx context.Context, userID string, req model.PushRequest, opts PushOptions) (result model.PushResult, replayed bool, err error)
 	// Changes 返回用户自 cursor 之后的增量变更，limit 为本次上限。
+	// 若 cursor 早于 change_log 的最老保留 seq（存在缺口），返回 ErrCursorExpired。
 	Changes(ctx context.Context, userID string, cursor int64, limit int) (model.ChangesPage, error)
 
 	// ListReadings 返回某设备在时间窗口内的读数，按 recordedAt 倒序游标分页。
@@ -97,6 +102,12 @@ type Store interface {
 	ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error)
 	// CleanupReadings 删除 recorded_at 早于 before 的读数，返回删除条数。
 	CleanupReadings(ctx context.Context, before time.Time) (int64, error)
+	// CleanupChangeLog 删除 server_ts 早于 before 的变更日志，返回删除条数。
+	CleanupChangeLog(ctx context.Context, before time.Time) (int64, error)
+	// CleanupIdempotencyKeys 删除 created_at 早于 before 的幂等键，返回删除条数。
+	CleanupIdempotencyKeys(ctx context.Context, before time.Time) (int64, error)
+	// CleanupTokens 删除 expires_at 早于 before 的 token，返回删除条数。
+	CleanupTokens(ctx context.Context, before time.Time) (int64, error)
 
 	// ListUserDevicesForExport 返回用户全部设备（含已删除的 tombstone），按 updated_at 倒序。
 	ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error)

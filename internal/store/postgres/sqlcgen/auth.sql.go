@@ -7,21 +7,23 @@ package sqlcgen
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 const createToken = `-- name: CreateToken :exec
-INSERT INTO tokens (user_id, token_hash) VALUES ($1, $2)
+INSERT INTO tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)
 `
 
 type CreateTokenParams struct {
 	UserID    uuid.UUID
 	TokenHash string
+	ExpiresAt time.Time
 }
 
 func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) error {
-	_, err := q.db.ExecContext(ctx, createToken, arg.UserID, arg.TokenHash)
+	_, err := q.db.ExecContext(ctx, createToken, arg.UserID, arg.TokenHash, arg.ExpiresAt)
 	return err
 }
 
@@ -39,7 +41,7 @@ func (q *Queries) CreateUser(ctx context.Context) (uuid.UUID, error) {
 const getUserIDByTokenHash = `-- name: GetUserIDByTokenHash :one
 SELECT user_id
 FROM tokens
-WHERE token_hash = $1 AND revoked_at IS NULL
+WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
 `
 
 func (q *Queries) GetUserIDByTokenHash(ctx context.Context, tokenHash string) (uuid.UUID, error) {

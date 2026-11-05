@@ -24,6 +24,13 @@ import (
 type idempotencyRecord struct {
 	RequestHash string
 	Response    model.PushResult
+	CreatedAt   time.Time
+}
+
+// tokenRecord 是内存版 token，与 tokens 表一一对应。
+type tokenRecord struct {
+	userID    string
+	expiresAt time.Time
 }
 
 type changeRecord struct {
@@ -80,7 +87,7 @@ type Store struct {
 	firmwares     []model.Firmware
 	accessories   []model.Accessory
 
-	tokens map[string]string // tokenHash -> userID
+	tokens map[string]tokenRecord // tokenHash -> tokenRecord
 	users  map[string]*userData
 
 	changes     []changeRecord
@@ -95,7 +102,7 @@ func New(dir string) (*Store, error) {
 	s := &Store{
 		publicDevices: map[string]model.PublicDevice{},
 		deviceTypeSet: map[string]struct{}{},
-		tokens:        map[string]string{},
+		tokens:        map[string]tokenRecord{},
 		users:         map[string]*userData{},
 		changes:       []changeRecord{},
 		nextSeq:       1,
@@ -230,7 +237,7 @@ func (s *Store) ListAccessories(ctx context.Context, deviceType string) ([]model
 }
 
 // CreateUserWithToken 实现 store.Store。
-func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (string, error) {
+func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expiresAt time.Time) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	userID := uuid.NewString()
@@ -241,7 +248,7 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (stri
 		kind:      "anonymous",
 		createdAt: time.Now().UTC(),
 	}
-	s.tokens[tokenHash] = userID
+	s.tokens[tokenHash] = tokenRecord{userID: userID, expiresAt: expiresAt.UTC()}
 	return userID, nil
 }
 
@@ -249,21 +256,22 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string) (stri
 func (s *Store) UserIDByTokenHash(ctx context.Context, tokenHash string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	userID, ok := s.tokens[tokenHash]
-	if !ok {
+	rec, ok := s.tokens[tokenHash]
+	if !ok || !rec.expiresAt.After(time.Now().UTC()) {
 		return "", store.ErrUnauthorized
 	}
-	return userID, nil
+	return rec.userID, nil
 }
 
 // RevokeToken 实现 store.Store。
 func (s *Store) RevokeToken(ctx context.Context, tokenHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	userID, ok := s.tokens[tokenHash]
+	rec, ok := s.tokens[tokenHash]
 	if !ok {
 		return store.ErrUnauthorized
 	}
+	userID := rec.userID
 	delete(s.tokens, tokenHash)
 	delete(s.users, userID)
 	for i := range s.changes {
@@ -544,6 +552,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		s.idempotency[userID+"|"+opts.IdempotencyKey] = idempotencyRecord{
 			RequestHash: opts.RequestHash,
 			Response:    cloneResult(result),
+			CreatedAt:   now,
 		}
 	}
 	return result, false, nil
@@ -555,6 +564,17 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	defer s.mu.RUnlock()
 
 	page := model.ChangesPage{Changes: []model.Change{}}
+	var minSeq int64
+	for _, rec := range s.changes {
+		if rec.userID == userID && (minSeq == 0 || rec.seq < minSeq) {
+			minSeq = rec.seq
+		}
+	}
+	// 与 postgres 语义一致：cursor 早于最老保留 seq 减一表示中间存在被清理的变更。
+	// cursor=0 表示客户端从未同步过，从头拉取剩余变更不构成数据缺口。
+	if cursor > 0 && minSeq > 0 && cursor < minSeq-1 {
+		return model.ChangesPage{}, store.ErrCursorExpired
+	}
 	count := 0
 	lastSeq := cursor
 	for _, rec := range s.changes {

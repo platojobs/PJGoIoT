@@ -2,7 +2,7 @@
 # 产物包含 api 与 migrate 两个二进制，便于 docker-compose 中先迁移后启动。
 FROM golang:1.22-alpine AS build
 
-ARG APP_VERSION=0.7.1
+ARG APP_VERSION=0.8.0
 WORKDIR /src
 
 # 先复制依赖清单，充分利用 Docker 层缓存。
@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./c
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-ARG APP_VERSION=0.7.1
+ARG APP_VERSION=0.8.0
 
 COPY --from=build /out/api /api
 COPY --from=build /out/migrate /migrate

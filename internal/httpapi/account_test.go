@@ -26,8 +26,9 @@ type pairingCodeResp struct {
 }
 
 type claimResp struct {
-	UserID string `json:"userId"`
-	Token  string `json:"token"`
+	UserID    string    `json:"userId"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 type exportReading struct {
@@ -115,6 +116,9 @@ func TestPairingCodeFlow(t *testing.T) {
 	if claimed.Token == "" || claimed.Token == userA.Token {
 		t.Fatalf("应签发新 token: %q", claimed.Token)
 	}
+	if d := time.Until(claimed.ExpiresAt); d < 179*24*time.Hour || d > 181*24*time.Hour {
+		t.Fatalf("claim expiresAt 异常: %v", d)
+	}
 	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", claimed.Token, nil); rec.Code != http.StatusOK {
 		t.Fatalf("新 token 不可用: %d %s", rec.Code, rec.Body.String())
 	}
@@ -166,7 +170,7 @@ func TestPairingCodeExpired(t *testing.T) {
 	}
 	h := newHandlerWithStore(t, config.Config{Version: "test"}, st)
 
-	uid, err := st.CreateUserWithToken(context.Background(), "hash-expired")
+	uid, err := st.CreateUserWithToken(context.Background(), "hash-expired", time.Now().UTC().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}

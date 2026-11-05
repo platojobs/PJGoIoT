@@ -170,7 +170,7 @@ func (s *Server) requireAuth() gin.HandlerFunc {
 		userID, err := s.store.UserIDByTokenHash(c.Request.Context(), auth.Hash(token))
 		if err != nil {
 			if errors.Is(err, store.ErrUnauthorized) {
-				fail(c, http.StatusUnauthorized, CodeUnauthorized, "token 无效或已吊销")
+				fail(c, http.StatusUnauthorized, CodeUnauthorized, "token 无效、已过期或已吊销")
 				return
 			}
 			s.log.Error("解析 token 失败", "error", err, "request_id", c.GetString(ctxKeyRequestID))

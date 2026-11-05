@@ -85,6 +85,12 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO users (id) VALUES ($1)`, userID); err != nil {
 		t.Fatalf("写入旧用户失败: %v", err)
 	}
+	// 旧 token 没有 expires_at，000008 需要按 created_at + 180 天回填。
+	legacyCreatedAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := db.Exec(`INSERT INTO tokens (user_id, token_hash, created_at) VALUES ($1, 'legacy-token', $2)`,
+		userID, legacyCreatedAt); err != nil {
+		t.Fatalf("写入旧 token 失败: %v", err)
+	}
 	if _, err := db.Exec(`
 		INSERT INTO user_devices (user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, server_seq)
 		VALUES ($1, $2, 'legacy-client', $3, '旧设备', '默认', '{}'::jsonb, '[]'::jsonb, $4, 7)`,
@@ -244,5 +250,48 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	}
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("回滚 000007 后重新迁移失败: %v", err)
+	}
+
+	// 000008：旧 token 回填 expires_at = created_at + 180 天，索引存在；down 删除列不影响用户数据。
+	var expiresAt time.Time
+	if err := db.QueryRow(`SELECT expires_at FROM tokens WHERE token_hash = 'legacy-token'`).
+		Scan(&expiresAt); err != nil {
+		t.Fatalf("读取 token 过期时间失败: %v", err)
+	}
+	if want := legacyCreatedAt.Add(180 * 24 * time.Hour); !expiresAt.Equal(want) {
+		t.Fatalf("token expires_at 回填异常: got=%s want=%s", expiresAt, want)
+	}
+	for _, idx := range []string{"tokens_expires_at_idx", "change_log_server_ts_idx", "idempotency_keys_created_at_idx"} {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1
+		)`, idx).Scan(&exists); err != nil {
+			t.Fatalf("查询索引 %s 失败: %v", idx, err)
+		}
+		if !exists {
+			t.Fatalf("000008 迁移后缺少索引 %s", idx)
+		}
+	}
+	if err := m.Migrate(7); err != nil {
+		t.Fatalf("回滚 000008 失败: %v", err)
+	}
+	var hasExpiresAt bool
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_name = 'tokens' AND column_name = 'expires_at'
+	)`).Scan(&hasExpiresAt); err != nil {
+		t.Fatalf("回滚后查询 tokens.expires_at 失败: %v", err)
+	}
+	if hasExpiresAt {
+		t.Fatalf("回滚 000008 后 tokens.expires_at 仍存在")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚 000008 后查询用户失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000008 破坏了用户数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚 000008 后重新迁移失败: %v", err)
 	}
 }

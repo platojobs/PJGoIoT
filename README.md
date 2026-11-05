@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.6.0**（业务接口未在 v0.7.x 变更）；服务版本 **v0.7.1**（部署编排实测修复、本地栈自检）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号：v0.7.0 增加运维形态与 `/healthz`（基础设施探针，不写入业务契约），v0.7.1 修复部署实测发现的问题并补齐自检步骤，均不改业务契约，因此契约保持 0.6.0，避免“发版号 = 契约号”的误解。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.8.0**（数据保留、token 过期、容量保护与压测）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -389,23 +389,145 @@ DATABASE_URL='postgres://...' \
 - 告警规则：[deploy/prometheus/alerts.yml](deploy/prometheus/alerts.yml)（6 条：5xx 比例、P95、DB 错误、readiness、请求量为 0、指标缺失）
 - 说明：健康告警依赖 blackbox-exporter；`/metrics` 指标与标签含义见上一节。
 
-#### 保留策略（90 天）
+#### 保留策略（可配置）
 
-服务端只保留 90 天读数。清理命令（**API 不会自动执行清理**，必须另行调度）：
+API 不自动清理；必须通过 `cmd/cleanup` 定期调度。v0.8.0 起一次清理四类数据：
+
+| 数据 | 默认保留 | 参数 / 环境变量 |
+| --- | --- | --- |
+| `readings` | 90 天 | `-retention-days`（`READING_RETENTION_DAYS` 仅 compose 使用） |
+| `change_log` | 90 天 | `-change-log-retention-days` / `CHANGE_LOG_RETENTION_DAYS` |
+| `idempotency_keys` | 7 天 | `-idempotency-retention-days` / `IDEMPOTENCY_RETENTION_DAYS` |
+| 过期 token | 立即删除 | 固定按 `expires_at < now` |
+| 过期配对码 | 立即删除 | 固定按 `expires_at < now` |
 
 ```bash
 # 方式一：compose 的 maintenance profile（推荐，复用镜像与数据库网络）
 docker compose --profile maintenance run --rm cleanup
 
 # 方式二：宿主机直接跑（需 Go 或已构建的 /cleanup 二进制）
-DATABASE_URL='postgres://...' go run ./cmd/cleanup                 # 默认删除 90 天前的数据
-DATABASE_URL='postgres://...' go run ./cmd/cleanup -retention-days 90 -dry-run
+DATABASE_URL='postgres://...' go run ./cmd/cleanup                 # 默认 90/90/7 天 + 过期 token/配对码
+DATABASE_URL='postgres://...' go run ./cmd/cleanup -dry-run        # 只打印时间边界
+DATABASE_URL='postgres://...' go run ./cmd/cleanup \
+  -retention-days 90 -change-log-retention-days 90 -idempotency-retention-days 7
 ```
 
 调度示例（systemd timer / cron / Kubernetes CronJob）见
 [`docs/runbook.md` §6](docs/runbook.md)；未配置调度时数据不会被清理。
-清理逻辑为 `DELETE FROM readings WHERE recorded_at < now - retention`，同时清理过期配对码，
-不影响设备与变更日志。
+每条 SQL 都带 30s 操作超时（`-operation-timeout`），避免大表清理卡住调度。
+清理不影响 `user_devices`；`change_log` 被清理后旧游标会返回 410（见下一节）。
+
+### 数据保留与游标失效（v0.8.0）
+
+`GET /sync/changes?cursor=<n>` 的契约：
+
+- `cursor=0` 表示客户端从未同步过，服务端从最老保留行开始返回，**永远不会**因保留期返回 410。
+- 若 `cursor > 0` 且早于该用户当前最老保留 `seq` 减一，说明中间的行已被清理；此时返回：
+
+```http
+HTTP/1.1 410 Gone
+Content-Type: application/json
+
+{"error":{"code":"RESYNC_REQUIRED","message":"游标已过期，请全量重新同步"}}
+```
+
+- 客户端收到 410 必须**清空本地同步状态**，再以 `cursor=0` 全量拉取（或按设备重建），不能继续使用旧游标。
+- 不允许静默返回空页：否则客户端会认为“没有新变更”并永久丢失被清理区间内的数据。
+- 清理后 `change_log` 行数下降，`user_devices` / `readings` 不受影响。
+
+端到端复现（本地栈）：
+
+```bash
+# 1) 匿名登录，push 3 台设备，记下 applied[].serverSeq = s1,s2,s3
+# 2) 把 s1 的 server_ts 改成 100 天前
+docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+  -c "UPDATE change_log SET server_ts = now() - interval '100 days' WHERE user_id='<uid>' AND seq=<s1>;"
+# 3) 按 90 天保留清理
+docker compose --profile maintenance run --rm cleanup
+# 4) 旧游标 -> 410 RESYNC_REQUIRED；新游标 s1 -> 200 且剩 2 条
+curl -sk "https://localhost/api/v1/sync/changes?cursor=$((s1-1))" -H "Authorization: Bearer $TOKEN"
+curl -sk "https://localhost/api/v1/sync/changes?cursor=$s1"     -H "Authorization: Bearer $TOKEN"
+```
+
+本轮实测：旧游标得到 `410 / RESYNC_REQUIRED / 游标已过期，请全量重新同步`，新游标
+返回 2 条，`change_log` 从 3 行降到 2 行，`user_devices` 保持 3 台。
+
+**幂等键清理语义**（二选一，本轮选“按新请求处理”）：
+
+- `idempotency_keys` 超过 7 天后被删除；同一 `Idempotency-Key` 再次到达时视为**全新请求**，
+  不会返回 `409 IDEMPOTENCY_CONFLICT`，也不会命中旧响应缓存（响应中 `replayed=false`）。
+- 由于设备写入本身是 LWW + 复合键幂等，重放同一设备数据不会产生重复设备；
+  只有“清理后首次用同一 key 提交不同请求体”才会重新计算，而不复用旧缓存。
+
+### token 生命周期（v0.8.0）
+
+- 服务端签发 token 时写入 `tokens.expires_at`，默认 **180 天**，可用 `TOKEN_TTL_DAYS` 配置。
+- `/auth/anonymous` 与 `/auth/pairing-code/claim` 的响应新增 `expiresAt`（RFC3339）：
+  客户端应持久化并在过期前重新登录/配对；字段只加不删。
+- 每次鉴权除校验哈希与吊销状态外，还会校验 `expires_at > now()`；过期后统一
+  `401 {"error":{"code":"UNAUTHORIZED","message":"token 无效、已过期或已吊销"}}`。
+- 401 语义不变：客户端**不得**静默调用 `/auth/anonymous` 换新账号（会造成 userId 漂移）。
+- `cmd/cleanup` 按 `expires_at < now()` 物理删除过期 token 行；删除后行数下降，
+  该 token 仍是 401（不存在等价于无效）。
+
+边界行为：`expires_at` 恰好等于当前时刻视为已过期（SQL 用 `expires_at > now()`）；
+库内 `expires_at` 与响应 `expiresAt` 一致（集成测试逐值比较到微秒）。
+
+### 容量与压测结果（v0.8.0）
+
+**机器规格**（本机实测，2026-11-05）：
+
+- 宿主：macOS / Apple Silicon arm64，10 vCPU，32 GB RAM
+- Docker Desktop VM：**2 vCPU / 4 GB**（`docker info` 报告 `NCPU=2`）
+- 栈：`docker compose`（Caddy TLS → API → PostgreSQL 16），全部容器化
+- 压测客户端：`cmd/loadgen` 在宿主机运行；`RATE_LIMIT_PER_MINUTE=0`（压测期间关闭限流，
+  否则默认 120/min 会让结果全是 429）
+- 数据规模：设备 100/用户、读数 2 000 条/用户（覆盖 90 天）、每批 push 100 设备 + 200 读数
+
+命令：
+
+```bash
+RATE_LIMIT_PER_MINUTE=0 docker compose up -d api
+go run ./cmd/loadgen -base-url https://localhost -duration 30s -warmup 3s
+# 单场景：-scenario devices|push|series
+```
+
+真实结果（30s/场景，错误率按 HTTP >=400 或网络超时计）：
+
+| 场景 | 并发 | 请求数 | RPS | p50 | p95 | p99 | 错误率 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `GET /my/devices` | 100 | 32 042 | 1 065.6 | 75 ms | 215 ms | 395 ms | 0.00% |
+| `POST /sync/push`（100 设备 + 200 读数/批） | 50 | 1 598 | 51.5 | 801 ms | 2 005 ms | 2 818 ms | 0.00% |
+| `GET /readings/series`（1d 桶，90 天） | 50 | 24 103 | 802.2 | 55 ms | 127 ms | 183 ms | 0.00% |
+
+**p95 超过 200 ms 的定位（不是“写完文档就结束”）**：
+
+- `GET /my/devices`：最初 100 并发 p95 为 220 ms。排查发现 `ListUserDevices` 对每台设备
+  额外查询公共设备与设备类型（N+1，100 台 = 200 条 SQL）。改为**单条 LEFT JOIN**
+  （`user_devices ⟕ public_devices ⟕ device_types`）后，`EXPLAIN (ANALYZE, BUFFERS)`
+  实测执行 **0.25 ms**（100 行，走 `user_devices_user_id_updated_at_idx`）。
+  剩余 p95 215 ms 是 **2 vCPU Docker VM 在 1 065 RPS 下的 CPU 饱和排队**：绕过 Caddy
+  直连 API 复测 p95 为 256 ms（不降反升），说明瓶颈不在反向代理，也不在 SQL。
+  50 并发时 p95 为 171 ms（<200 ms），可据此按机器规格推算容量。
+- `POST /sync/push`：最初 50 并发 p50 4.9 s、p95 10 s（27 个客户端超时）。
+  根因是每批约 900 条 SQL（逐设备查公共设备/型号/存在性/seq/变更日志 + 逐条读数插入），
+  且为保持 LWW 对 100 台设备整批 `FOR UPDATE`，50 个并发事务在同一批行上排队。
+  修正：
+  1. 公共设备与设备类型改为每批 2 条批量查询；
+  2. 已存设备改为每批 1 条 `IN (...)` 查询（去掉整批 `FOR UPDATE`，避免锁队列）；
+  3. 变更 seq 用 `generate_series` 一次分配；
+  4. 设备写入改为 `INSERT ... ON CONFLICT` / 单条 `UPDATE ... FROM (VALUES ...)` 批量执行；
+  5. `change_log` 改为单条多行 INSERT；
+  6. 读数改为单条多行 `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`，仅冲突时才回查比较。
+  每批 SQL 从约 900 条降到约 7 条，p95 从 10 s 降到 2.0 s、错误率 0%。
+  仍有 p95 2 s 属于**写吞吐上限**：50 并发 × 每批约 400 行写 = 约 20 000 行/秒，
+  已超出 2 vCPU/4 GB 本地 VM 的 PostgreSQL 写入能力；再压只能加 CPU 或分库，
+  不是索引/查询写法问题（批量 UPDATE/INSERT 均已 EXPLAIN 验证走主键/唯一键）。
+- `GET /readings/series`：单条聚合 SQL（`readings_user_platform_external_metric_recorded_idx`），
+  p95 127 ms，未触发 200 ms 阈值。
+
+> 说明：`cmd/loadgen` 的 push 场景按 worker 分配独立设备集合，模拟 50 个客户端各自推送；
+> 若让 50 个并发反复写同一批 100 行，测到的是行锁排队而非服务容量，故不作为容量结论。
 
 ### curl 示例
 
@@ -706,9 +828,15 @@ PJGoIoT/
 | `RUN_MIGRATIONS_ON_BOOT` | `true` | postgres 模式下启动时执行迁移；失败进程非零退出（fixture 模式忽略） |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.7.1` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.6.0 不是同一个号 |
+| `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
+| `APP_VERSION` | `0.8.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
+| `READING_RETENTION_DAYS` | `90` | **仅 cleanup 容器**：读数保留天数，映射到 `-retention-days` |
+| `CHANGE_LOG_RETENTION_DAYS` | `90` | **仅 cleanup 容器/命令**：变更日志保留天数 |
+| `IDEMPOTENCY_RETENTION_DAYS` | `7` | **仅 cleanup 容器/命令**：幂等键保留天数 |
+
+> 清理工具不在 API 进程中运行，API 侧无需配置以上三个保留期变量。
 
 ## 迁移与 seed
 
@@ -750,6 +878,12 @@ go run ./cmd/migrate -direction up -steps 1   # 只前进一步
   - `user_id IS NULL` 的行用于记录错误尝试，累计 5 次即删除；
   - 索引 `(user_id)` 与 `(expires_at)`，支持新码使旧码失效与 TTL 清理；
   - down 迁移 `DROP TABLE pairing_codes`，不影响用户与其他数据（迁移测试验证 up → down → up）。
+- `000008_token_expiry`：v0.8.0 数据生命周期：
+  - `tokens` 新增 `expires_at timestamptz NOT NULL DEFAULT (now() + interval '180 days')`，
+    旧行回填 `created_at + interval '180 days'`；索引 `tokens_expires_at_idx (expires_at)` 供清理使用；
+  - 新增 `change_log_server_ts_idx (server_ts)` 与 `idempotency_keys_created_at_idx (created_at)`，
+    支撑按保留期的时间范围删除；
+  - 只加列/索引，不加默认过期行为之外的语义；down 迁移按逆序删除索引与列，不影响其余数据。
 
 seed 数据来源与边界：
 
@@ -767,7 +901,7 @@ seed 数据来源与边界：
 - `internal/httpapi`：httptest + Gin 表驱动；健康、公共设备、设备类型/详情/固件/配件/聚合、401/404、非法 MAC、CORS 预检、注销、push 参数校验（platform / externalId / 平台规则 / deviceType / alias / advertisedName / group）、幂等重放、幂等键冲突、LWW 冲突、tombstone、changes 分页、跨用户越权 404、同用户 Android 与 iOS 双记录互不覆盖、按复合键单查（200/400/404、大小写规范化、删除后 404、跨用户 404、旧 MAC 路径兼容）、401 响应不下发新 token、限流；v0.3.2 新增 `TestDeviceMetadataEnrichment`：`UserDevice` 的 `deviceType`/`vendor`/`firmwareVersion`/`compatibility` 200 用例、catalog 固件与配件字段完整性、未注册型号与无 MAC 时降级为 `null` 且不返回 500；v0.3.3 新增 `TestPresenceSemantics`：`"group": ""` 显式清除、字段缺失保持原值、清空后再次同步不会让分组复活、上报 `advertisedName` 不改变 `alias` 且反之亦然；v0.4.0 新增 `TestReadingsPushIdempotency`（重复 id 计 skipped、同 id 不同内容计 `duplicate_id` 冲突且原值不变）、`TestReadingsPushOptional`（无 readings 时计数为 0、隐式设备写入与注册后可查）、`TestReadingsValidation`（metric/unit/value/recordedAt/批量上限/非法 externalId）、`TestReadingsListPagination`（倒序、游标翻页、metric 与时间过滤、非法参数、跨用户 404）、`TestReadingsSummary`（聚合值、无数据 null、hours 校验、跨用户 404）；v0.5.0 新增 `TestReadingsSeries`（1h/1d 的 UTC 对齐与跨整点/跨日边界、桶内 min/max/avg/last、空区间 `buckets: []`、8 类非法参数含「桶数超 500 提示更粗 bucket」、跨用户与不存在设备 404、unit 取窗口最新）、`TestReadingsMetrics`（排序与计数、多单位取最新、空数组、跨用户 404）；v0.6.0 新增 `TestPairingCodeFlow`（生成/字符集/TTL、新码使旧码失效、claim 换新 token 且原 token 保留、重放 404、跨用户、错误体不泄露账号）、`TestPairingCodeExpired`（过期统一 404）、`TestExportContentAndPagination`（内容与库内一致、升序、limit 分页与 nextCursor 连续性、非法 cursor/limit、Content-Disposition）、`TestDeleteMeIdempotent`（204、之后 401、重复调用 401、不影响其他用户）、`TestMetricsEndpoint`（文本可解析且含请求数/直方图/DB 错误/近似计数）、`TestMetricsBypassesRateLimit`（限流触发后 `/metrics` 仍 200）、`TestRequestIDAndLogs`（透传/生成 UUID、日志字段齐全且不含 token）；v0.7.0 新增 `TestHealthzLiveness`（`/healthz` 200、字段完整、不受限流影响，与 readiness 区分）。
 - `internal/lww`：时钟兜底、服务端获胜、内容相同 noop 等判定；`deviceType`、`alias`、`advertisedName`、`group` 仅在客户端上报时参与内容比较（缺失保持原值不产生冲突）。
 - `internal/store/postgres`：`TEST_DATABASE_URL` 存在时运行真实数据库集成测试，覆盖 token 创建/校验/吊销、幂等重放与冲突、LWW、tombstone、分页、跨用户隔离、Android/iOS 复合键隔离、`GetUserDeviceByKey` 跨用户 404，公共元数据补全与缺失降级（`deviceType` 由 MAC 推导、按型号回退厂商/兼容性、未注册型号返回 null），以及可缺省字段语义（别名与广播名隔离、`group: ""` 清除后缺省同步不复活）；v0.4.0 新增集成子测试「读数链路」：批量写入与计数、重复 id 幂等、同 id 不同内容冲突、NaN/Inf/未来时间/非法 metric 拒绝、数据库 CHECK 拒绝 NaN、倒序游标分页、非法游标、metric 过滤、跨用户与不存在设备 404、summary 聚合与无数据、90 天清理（历史数据被删且近期数据保留）；v0.5.0 新增集成子测试「读数分桶序列与指标清单」：1h 跨整点与 1d UTC 零点对齐、桶内 min/max/avg/last、分桶计数合计与原始条数一致、空区间 `[]`、非法 bucket / 超 90 天 / 超 500 桶、跨用户与不存在设备 404、指标清单排序与计数、空设备空数组；v0.6.0 新增 `TestPostgresAccountIntegration`：配对码新码失效旧码、claim 签发新 token 且原 token 保留、重放/过期 404、错 5 次作废（库内行删除）、跨用户配对、TTL 清理、导出含 tombstone 与升序分页（条数与库内 `COUNT` 一致、字段一致、非法游标）、`pg_class.reltuples` 近似计数、注销级联（`users/tokens/user_devices/change_log/idempotency_keys/readings/pairing_codes` 全部为 0）与重复注销 401。
-- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=7，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引、000007 的 `pairing_codes` 表；随后回滚到 version=6 验证 `pairing_codes` 被删除且用户数据完好，再回滚到 version=5 验证 `readings` 表被删除且设备数据完好，最后 up 回到 version=7。
+- `internal/store/postgres/migration_test.go`：临时数据库上先迁移到 version=2，写入旧 `(user_id, mac)` 记录与旧 change_log，再迁移到最新 version=8，验证 000003 的键回填、000004 的 `device_type`/厂商回填、000005 的 `advertised_name` 默认值、000006 的 `readings` 表与索引、000007 的 `pairing_codes` 表、000008 的 `tokens.expires_at` 回填与三个新索引；随后回滚到 version=6 验证 `pairing_codes` 被删除且用户数据完好，再回滚到 version=5 验证 `readings` 表被删除且设备数据完好，最后 up 回到 version=8。
 
 本机实际执行结果（2026-11-05）：
 
@@ -775,14 +909,14 @@ seed 数据来源与边界：
 | --- | --- |
 | `go build ./...` | 通过 |
 | `go vet ./...` | 通过 |
-| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok；`-v` 统计 33 个顶层测试、152 个含子测试用例，0 失败） |
-| `TEST_DATABASE_URL=... go test ./internal/store/postgres -v` | 通过（本机真实 PostgreSQL，迁移到 version=7；含旧数据回填、sync 链路、读数、分桶序列与指标清单、配对码/导出/注销/近似计数、down 回滚） |
+| `go test ./...` | 通过（`internal/httpapi`、`internal/lww`、`internal/store/postgres` 均 ok；`-v` 统计 40 个顶层测试，0 失败；需数据库的集成用例由下一行单独执行） |
+| `TEST_DATABASE_URL=... go test ./internal/store/postgres -v` | 通过（本机真实 PostgreSQL，迁移到 version=8；含旧数据回填、sync 链路、读数、分桶序列与指标清单、配对码/导出/注销/近似计数、保留期清理与游标失效、down 回滚） |
 | v0.3.2 字段测试 | 通过：`TestDeviceMetadataEnrichment`（列表/单查 200 字段、catalog 固件配件完整性、未注册型号与无 MAC 降级 null）、`TestDeviceTypeComparison`、集成测试「公共元数据补全与缺失降级」 |
 | v0.3.3 语义测试 | 通过：`TestPresenceSemantics`（`"group": ""` 清除、缺失保持、清空后拉回为空、广播名与别名互不覆盖）、`TestPresenceOnlyComparison`、集成测试「可缺省字段语义与广播名隔离」、迁移测试 `advertised_name` 默认空串 |
 | v0.4.0 读数测试 | 通过：`TestReadingsPushIdempotency`、`TestReadingsPushOptional`、`TestReadingsValidation`、`TestReadingsListPagination`、`TestReadingsSummary`、集成子测试「读数链路」（含数据库 CHECK 拒绝 NaN、90 天清理）、迁移测试 up→down→up |
 | v0.5.0 分桶与指标清单测试 | 通过：`TestReadingsSeries`（UTC 对齐、跨整点/跨日、桶内聚合、空区间、非法参数、404）、`TestReadingsMetrics`（排序/计数/单位取最新/空数组/404）、集成子测试「读数分桶序列与指标清单」（真实 Postgres） |
 | v0.6.0 配对/合规/可观测性测试 | 通过：`TestPairingCodeFlow`、`TestPairingCodeExpired`、`TestExportContentAndPagination`、`TestDeleteMeIdempotent`、`TestMetricsEndpoint`、`TestMetricsBypassesRateLimit`、`TestRequestIDAndLogs`；集成子测试「新码使旧码失效」「claim 签发新 token 且保留原 token」「重放返回 404」「过期码返回 404」「错 5 次作废」「跨用户配对」「TTL 清理」「导出设备含 tombstone」「导出读数分页与内容」「非法游标」「近似计数可读」「注销级联与幂等」 |
-| 真实库迁移 | 通过：`cmd/migrate up` → version=7 dirty=false；`pairing_codes` 表与两个索引按预期创建；迁移测试验证 000007 up → down → up 且用户数据不受影响 |
+| 真实库迁移 | 通过：`cmd/migrate up` → version=8 dirty=false；`tokens.expires_at` 与 `change_log_server_ts_idx` / `idempotency_keys_created_at_idx` / `tokens_expires_at_idx` 按预期创建；迁移测试验证 000007/000008 up → down → up 且用户数据不受影响 |
 | Postgres 模式 HTTP 验证 | 通过：health、匿名登录、公共设备、类型/详情/固件/配件、my/devices、push、幂等重放、409、LWW 冲突、key_taken、tombstone 404、跨用户 404、注销后 401、Android/iOS 双记录、旧客户端 mac-only 兼容、同复合键换 id 不重复 |
 | v0.4.0 读数 HTTP 验证 | 通过（真实 PostgreSQL + `cmd/api`）：push `appliedReadings=2`；重复 id 不同值返回 `skippedReadings=1` 与 `entity=reading/reason=duplicate_id` 冲突且原值不变；列表倒序；summary `count/min/max/avg/last` 正确；无数据时数值为 `null`；未来时间 400 `BAD_REQUEST`；NaN 400；未知设备与跨用户 404 |
 | fixture 模式新增接口验证 | 通过：`/device-types/{type}/catalog` 200 且含固件/配件、未知类型 404；`/my/devices/android/{mac}` 与 `/my/devices/ios/{uuid}` 200；非法 platform 400；旧 `/my/devices/{mac}` 兼容 |
@@ -801,10 +935,14 @@ seed 数据来源与边界：
 | v0.7.1 PromQL 语义校验 | **已验证**：`docker run --entrypoint /bin/promtool prom/prometheus:latest check rules /cfg/alerts.yml` → `SUCCESS: 6 rules found`；`check config /cfg/scrape.yml` → `SUCCESS: ... valid prometheus config file syntax` |
 | v0.7.1 docker 模式备份/恢复 | **已验证**：`BACKUP_MODE=docker backup.sh` → `pjgoiot-20261105T031905Z.dump.gz`（8 193 bytes）+ SHA-256；`RESTORE_MODE=docker restore.sh --confirm` → 校验 `OK`、`version=7 dirty=f`、行数 `1/1/0/1/0`；恢复后 API `healthy` 且原设备仍可查 |
 | v0.7.1 GitHub Actions | **通过**（run 41962617787，commit ef0c7af）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success |
-| v0.7.0 GitHub Actions（历史） | 通过（run 41956560178，commit 06eb0d3）：三个 job 均 success；lint-configs 中 `promtool` 在 runner 不可用而跳过，本轮已用本地容器补做语义校验 |
+| v0.8.0 生命周期单元测试 | 通过：`TestAnonymousReturnsExpiresAt`（响应 `expiresAt` 约 180 天后）、`TestExpiredTokenReturns401`、`TestCursorExpiredReturns410`（`410 RESYNC_REQUIRED` + 指定 message）、`TestQueryTimeoutReturns503`（`503 TIMEOUT`）、`TestListLimitOutOfRange`（readings 501 / changes 501 / export 5001 → 400） |
+| v0.8.0 保留期集成测试 | 通过（真实 Postgres）：`TestCleanupAndRetentionLifecycle`——`expiresAt` 与库内一致到微秒；3 条 change_log 老化 1 条后 cleanup 删除 1 行；旧游标 `seq0-1` → `ErrCursorExpired`，新游标 `seq0` 返回剩余 2 条且 `nextCursor=seq2`；`user_devices=3` / `readings=1` 不受影响；幂等键清理后同 key 重放 `replayed=false`（不 409）；过期 token `ErrUnauthorized`，`CleanupTokens` 后行数 0 |
+| v0.8.0 端到端（真实 compose 栈） | 通过：匿名 `expiresAt=2027-05-04`；push 3 台设备得 `serverSeq=[246402,246403,246404]`；`cursor=0` 返回 3 条；cleanup 输出 `readings=1628 / change_log=1 / idempotency=0 / tokens=0`；旧游标 → `410 RESYNC_REQUIRED`；新游标返回 2 条；`/my/devices` 仍 3 台；过期 token → 401；token 清理后库内 0 行 |
+| v0.8.0 压测 | 通过（真实 compose 栈，Docker Desktop VM 2 vCPU / 4 GB）：devices 100 并发 30s → 1 065.6 RPS、p50 75 / p95 215 / p99 395 ms、0% 错误；push 50 并发（100 设备+200 读数）→ 51.5 RPS、801 / 2 005 / 2 818 ms、0%；series 50 并发（1d/90 天）→ 802.2 RPS、55 / 127 / 183 ms、0%。详见「容量与压测结果」 |
+| v0.8.0 GitHub Actions | **待补**：push tag 后回填 run 号 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
-| OpenAPI 静态校验 | 通过：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（10 条非阻断 warning，均为既有示例/描述风格提示）；配对码、导出、注销、`/metrics` 路径与全部 `$ref` 均可解析 |
+| OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
 
 集成测试运行方式：
 
@@ -816,9 +954,10 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 ## 已知限制与下一步
 
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
-- token 无刷新与过期时间，仅支持吊销；如需长效会话可增加滚动续期，但必须保持「401 不自动重登」的契约。
+- token 已有有效期（默认 180 天）但**没有刷新/滚动续期**；客户端应在 `expiresAt` 前重新登录或配对，且不得在 401 后静默换新匿名账号（会造成 userId 漂移）。
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
-- 读数保留 90 天由 `cmd/cleanup` 负责，服务内不做后台定时清理；生产环境需自行配置 cron / CronJob。
+- 读数、`change_log`、幂等键与过期 token 的保留期删除均由 `cmd/cleanup` 负责，API 内不做后台定时清理；生产环境需自行配置 cron / systemd timer / CronJob，否则数据无限增长。
+- `change_log` 被清理后，落后超过保留期的客户端会收到 `410 RESYNC_REQUIRED`；客户端必须实现“清本地 + `cursor=0` 全量拉取”，否则会卡在 410。
 - 读数查询要求设备已存在于 `user_devices`；隐式设备写入的读数在注册前不可查。
 - 读数支持单指标聚合（`min/max/avg/last`）、UTC 对齐的 `1m/1h/1d` 分桶序列，以及设备维度指标清单；跨指标合并统计按需再扩展。
 - 限流为单进程内存令牌桶，多实例部署时各实例独立计数；需要全局限流时再引入共享存储。
@@ -826,13 +965,13 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - 公共元数据列表未分页；当前数据量小，后续数据增长后再加分页。
 - 删除时 payload 采用本次 push 提交的字段；客户端删除前应提交完整业务字段，或仅依赖 `deletedAt`。
 - seed 只有开发板参考数据，尚未接入真实量产设备型号、固件发布列表与官方配件 SKU；需要厂商/产品提供可核实来源后再补。
-- 尚未做 Android 端到端联调与压测；可观测性已提供 `/metrics`（请求量/延迟/DB 错误/近似计数）与 `X-Request-Id`，Tracing 仍待接入。
+- 尚未做 Android 端到端联调；后端 HTTP 压测已完成（见「容量与压测结果」），但未覆盖 App 侧重试/弱网行为。可观测性已提供 `/metrics`（请求量/延迟/DB 错误/近似计数）与 `X-Request-Id`，Tracing 仍待接入。
 - 配对码为 8 位（约 40 bit 熵）且仅 10 分钟有效，配合每 IP 限流与错 5 次作废；如需更高强度可加长码或增加二次验证。
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值（依赖 autovacuum/ANALYZE），非精确行数；不应作为计费或审计依据。
 - 完整栈已在本地 `docker compose up` 实测（Caddy 自签 HTTPS、非 root、只读根文件系统、启动迁移、卷持久化、docker 模式备份恢复均通过）；**真实域名 / ACME 证书 / 云主机仍未验证**，仓库未开通任何云账号。
 - distroless 镜像没有 shell、`id`、`curl`，容器内排查请用 `docker top` / `docker inspect` / `docker compose exec api /api -healthcheck`；健康检查已使用二进制自带的 `-healthcheck`，无需额外工具。
 - 备份脚本默认 `host` 模式，需要本机有 `pg_dump`/`pg_restore`；容器内执行用 `BACKUP_MODE=docker`/`RESTORE_MODE=docker`，本轮已实测。
-- 告警规则已用容器内 `promtool check rules` + `check config` 做过语义校验；阈值仍需按真实流量基线调整，未做长时间压测与故障注入。
+- 告警规则已用容器内 `promtool check rules` + `check config` 做过语义校验；阈值仍需按真实流量基线调整。压测为 30s/场景的短时压测，未做数小时长稳压、故障注入与多实例集群验证。
 - systemd timer 仅提供示例，未在目标主机安装验证。
 
 ## 开发命令

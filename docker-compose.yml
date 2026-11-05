@@ -31,14 +31,14 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.7.1"
-    image: pjgoiot-api:0.7.1
+        APP_VERSION: "0.8.0"
+    image: pjgoiot-api:0.8.0
     restart: unless-stopped
     environment:
       STORE: postgres
       DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
       ADDR: ":8080"
-      APP_VERSION: "0.7.1"
+      APP_VERSION: "0.8.0"
       # 启动即迁移；迁移失败进程退出，不会以旧 schema 半可用运行。
       RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
       RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
@@ -47,6 +47,8 @@ services:
       PAIRING_CLAIM_BURST: "${PAIRING_CLAIM_BURST:-10}"
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # token 有效期（天）；过期后中间件返回 401，cleanup 负责删除。
+      TOKEN_TTL_DAYS: "${TOKEN_TTL_DAYS:-180}"
       # /metrics 仅在容器网络内可达；Caddy 显式拒绝公网访问该路径。
       METRICS_ENABLED: "${METRICS_ENABLED:-true}"
       # 健康检查走 readiness（含数据库 Ping）；镜像默认 liveness 为 /healthz。
@@ -88,20 +90,28 @@ services:
     networks:
       - edge
 
-  # 读数 90 天清理 + 过期配对码清理。默认不启动，按日执行：
+  # 读数 / change_log / 幂等键 / 过期 token 的定期清理。默认不启动，按日执行：
   #   docker compose --profile maintenance run --rm cleanup
   cleanup:
     profiles: ["maintenance"]
     build:
       context: .
       args:
-        APP_VERSION: "0.7.1"
-    image: pjgoiot-api:0.7.1
+        APP_VERSION: "0.8.0"
+    image: pjgoiot-api:0.8.0
     entrypoint: ["/cleanup"]
-    command: ["-retention-days", "${READING_RETENTION_DAYS:-90}"]
+    command:
+      - "-retention-days"
+      - "${READING_RETENTION_DAYS:-90}"
+      - "-change-log-retention-days"
+      - "${CHANGE_LOG_RETENTION_DAYS:-90}"
+      - "-idempotency-retention-days"
+      - "${IDEMPOTENCY_RETENTION_DAYS:-7}"
     environment:
       STORE: postgres
       DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
+      CHANGE_LOG_RETENTION_DAYS: "${CHANGE_LOG_RETENTION_DAYS:-90}"
+      IDEMPOTENCY_RETENTION_DAYS: "${IDEMPOTENCY_RETENTION_DAYS:-7}"
     depends_on:
       postgres:
         condition: service_healthy

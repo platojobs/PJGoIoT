@@ -24,9 +24,13 @@
 | Prometheus `promtool check rules` / `check config` | **已验证** | 容器内 `SUCCESS: 6 rules found`；config `valid prometheus config file syntax` |
 | shellcheck | **CI 通过** | 本机未安装；GitHub `lint-configs` 中 shellcheck 执行通过 |
 | shfmt | **未执行** | 本机与 CI runner 均无 `shfmt`；仅 `bash -n` |
+| v0.8.0 保留期清理（readings / change_log / 幂等键 / token / 配对码） | **已验证** | 真实 compose 栈执行 `cleanup`：`readings=1628 / change_log=1 / idempotency=0 / tokens=0`；集成测试 `TestCleanupAndRetentionLifecycle` |
+| v0.8.0 游标失效 410 | **已验证** | 旧游标 `seq0-1` → `410 RESYNC_REQUIRED`；新游标 `seq0` → 200 且剩 2 条；`/my/devices` 仍 3 台 |
+| v0.8.0 token 过期 | **已验证** | 过期 token → 401；`/auth/anonymous` 返回 `expiresAt` 且与库内一致；`CleanupTokens` 后行数 0 |
+| v0.8.0 压测（3 场景，30s） | **已验证** | 见 §9.7 与 README「容量与压测结果」；devices p95 215 ms、push p95 2 005 ms、series p95 127 ms，错误率均 0% |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
-| 长时间压测 / 故障注入 | **未验证** | 未做 |
+| 数小时长稳压 / 故障注入 / 多实例 | **未验证** | 仅做 30s/场景短时压测，未做故障注入与多实例限流 |
 
 ## 1. 部署前检查清单
 
@@ -37,7 +41,7 @@
 - [ ] 已确认备份目录权限：`umask 077`，仅运维账号可读。
 - [ ] 已阅读 §5 回滚风险：**迁移 down 可能丢列/丢数据**，生产优先用镜像回滚 + 前滚兼容。
 - [ ] 已配置监控抓取（内网 `api:8080/metrics`），并导入 `deploy/prometheus/alerts.yml`。
-- [ ] 已配置每日清理任务（§6），否则读数不会按 90 天保留策略删除。
+- [ ] 已配置每日清理任务（§6）：`readings`/`change_log` 90 天、幂等键 7 天、过期 token 与配对码；未配置则所有表无限增长。
 - [ ] 防火墙只开放 80/443；数据库端口绑定 `127.0.0.1:55432`，不得改为 `0.0.0.0`。
 
 ## 2. 首次部署
@@ -47,7 +51,8 @@
 cat > .env <<'EOF'
 DOMAIN=localhost
 POSTGRES_PASSWORD=change-me-strong-password
-APP_VERSION=0.7.1
+APP_VERSION=0.8.0
+TOKEN_TTL_DAYS=180
 METRICS_ENABLED=true
 RUN_MIGRATIONS_ON_BOOT=true
 EOF
@@ -87,8 +92,8 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 
 1. **备份**（必须先做）：`./deploy/scripts/backup.sh`
 2. **预检迁移**：只跑迁移、不启动服务：
-   `docker compose run --rm --no-deps --entrypoint /migrate api -direction up`（本轮已实测，输出 `迁移完成 version=7 dirty=false`）。
-3. **构建新镜像**：`APP_VERSION=0.7.x docker compose build api`
+   `docker compose run --rm --no-deps --entrypoint /migrate api -direction up`（本轮已实测，输出 `迁移完成 version=8 dirty=false`）。
+3. **构建新镜像**：`APP_VERSION=0.8.0 docker compose build api`
 4. **滚动替换**：`docker compose up -d api caddy`
 5. **验证**：
    - `docker compose exec api /api -healthcheck`
@@ -113,7 +118,7 @@ docker compose up -d --no-deps api
 docker compose exec api /api -healthcheck
 ```
 
-前提：**新版本迁移没有破坏旧代码依赖的列/语义**。本项目 000003–000007 迁移均为加列/加表，
+前提：**新版本迁移没有破坏旧代码依赖的列/语义**。本项目 000003–000008 迁移均为加列/加表/加索引，
 旧版本代码可继续读取；若未来出现删列/改类型迁移，必须评估后再回滚。
 
 ### 4.2 回滚迁移（高风险，谨慎）
@@ -126,6 +131,7 @@ docker compose run --rm --entrypoint /migrate api -direction down
 风险：
 
 - `000006` down 会 **DROP readings 表**，`000007` down 会 **DROP pairing_codes 表**——数据不可恢复；
+- `000008` down 会**删除 `tokens.expires_at` 列**，旧 token 从此不再有有效期校验；只回滚镜像时该列可以保留（旧代码忽略它）；
 - 回滚后旧镜像可能因缺少列而报错；
 - 若迁移处于 `dirty` 状态，**不要盲目 down**：先 `SELECT * FROM schema_migrations` 确认版本，
   修复失败语句或用备份恢复，再清理 dirty 标记。
@@ -181,16 +187,36 @@ RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoi
 演练验收：行数摘要与备份时点一致、`dirty=false`、API 指向临时库时 `/api/v1/health` 为 200。
 本轮已在真实 compose 栈上实测 docker 模式：备份 8 193 bytes，恢复后 `version=7 dirty=f`、行数 `1/1/0/1/0`，API 重新 `healthy` 且原设备仍可查。
 
-## 6. 清理任务（读数 90 天）
+## 6. 清理任务（保留期与游标失效）
 
-读数保留依赖 `cmd/cleanup`，**不是** API 自动执行。
+所有保留期删除都依赖 `cmd/cleanup`，**不是** API 自动执行。一次运行处理五类数据：
+
+| 数据 | 默认保留 | 参数 | 环境变量（compose） |
+| --- | --- | --- | --- |
+| `readings` | 90 天（按 `recorded_at`） | `-retention-days` | `READING_RETENTION_DAYS` |
+| `change_log` | 90 天（按 `server_ts`） | `-change-log-retention-days` | `CHANGE_LOG_RETENTION_DAYS` |
+| `idempotency_keys` | 7 天（按 `created_at`） | `-idempotency-retention-days` | `IDEMPOTENCY_RETENTION_DAYS` |
+| `tokens` | 过期即删（`expires_at < now()`） | 无 | 无 |
+| `pairing_codes` | 过期即删（`expires_at < now()`） | 无 | 无 |
+
+`-operation-timeout`（默认 30s）为每类操作单独的超时；`-dry-run` 只打印五个时间边界。
 
 ### 6.1 compose profile
 
 ```bash
+# 默认 90/90/7 天 + 过期 token/配对码
 docker compose --profile maintenance run --rm cleanup
-# 等价于 /cleanup -retention-days 90；同时清理过期配对码
+
+# 自定义保留期（也可写入 .env）
+CHANGE_LOG_RETENTION_DAYS=90 IDEMPOTENCY_RETENTION_DAYS=7 \
+  docker compose --profile maintenance run --rm cleanup
+
+# 只看会删什么（不删数据）
+docker compose --profile maintenance run --rm cleanup -dry-run
 ```
+
+> 生产上限建议：`change_log` 保留期**不要短于客户端最长离线时间**。客户端离线超过保留期后
+> 再同步会收到 `410 RESYNC_REQUIRED`（§7.6），必须全量重拉。
 
 ### 6.2 systemd timer 示例（未验证）
 
@@ -198,14 +224,17 @@ docker compose --profile maintenance run --rm cleanup
 
 ```ini
 [Unit]
-Description=PJGoIoT readings cleanup
+Description=PJGoIoT retention cleanup
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/pjgoiot
-ExecStart=/usr/bin/docker compose --profile maintenance run --rm cleanup
+# 加 flock 防止上一轮未结束时重入
+ExecStart=/usr/bin/flock -n /var/lock/pjgoiot-cleanup.lock \
+  /usr/bin/docker compose --profile maintenance run --rm cleanup
+TimeoutStartSec=10min
 ```
 
 `/etc/systemd/system/pjgoiot-cleanup.timer`：
@@ -223,6 +252,38 @@ WantedBy=timers.target
 ```
 
 启用：`systemctl enable --now pjgoiot-cleanup.timer`（本机未验证）。
+
+### 6.3 cron 示例（未验证）
+
+```cron
+15 3 * * * cd /opt/pjgoiot && docker compose --profile maintenance run --rm cleanup >> /var/log/pjgoiot-cleanup.log 2>&1
+```
+
+Kubernetes 用 `CronJob` 同镜像、`command: ["/cleanup"]`、`concurrencyPolicy: Forbid`。
+
+### 6.4 执行结果与核对
+
+正常输出（真实执行）：
+
+```text
+清理完成 readings_deleted=1628 readings_cutoff=... retention_days=90
+change_log_deleted=1 change_log_cutoff=... change_log_retention_days=90
+idempotency_keys_deleted=0 idempotency_cutoff=... idempotency_retention_days=7
+tokens_deleted=0 pairing_codes_deleted=0
+```
+
+核对 SQL：
+
+```sql
+-- 最老/最新 seq：判断客户端游标是否会过期
+SELECT min(seq), max(seq) FROM change_log;
+-- 清理后各类行数
+SELECT count(*) FROM change_log;
+SELECT count(*) FROM idempotency_keys;
+SELECT count(*) FROM tokens WHERE expires_at < now();
+-- 设备与读数不应被 cleanup 删除（读数仅按保留期删）
+SELECT count(*) FROM user_devices;
+```
 
 ## 7. 常见故障
 
@@ -257,6 +318,71 @@ WantedBy=timers.target
 - 本地 `localhost` 使用 Caddy 内部 CA，自签告警正常；
 - 生产需把 `deploy/Caddyfile` 的 `tls internal` 改为 `tls <邮箱>`，并确保 80/443 可达；本机未验证真实 ACME 签发。
 
+### 7.6 同步持续返回 `410 RESYNC_REQUIRED`（游标失效）
+
+现象：`GET /api/v1/sync/changes?cursor=N` 返回：
+
+```http
+HTTP/1.1 410 Gone
+{"error":{"code":"RESYNC_REQUIRED","message":"游标已过期，请全量重新同步"}}
+```
+
+含义：`change_log` 中该用户 `N` 之后、当前最老 `seq` 之前的行已被清理，继续增量同步会永久丢数据。
+
+排查顺序：
+
+1. 查该用户游标与全局最老 seq：
+   ```sql
+   SELECT min(seq), max(seq) FROM change_log;
+   -- 该用户最老保留行（user_id 已知时）
+   SELECT min(seq) FROM change_log WHERE user_id = '<uid>';
+   ```
+2. 若 `cursor < min(seq) - 1` 且 `cursor > 0`，410 是**预期**的；
+3. 对照 `cleanup` 日志的 `change_log_cutoff` 与 `-change-log-retention-days`，确认是否保留期太短；
+4. 确认客户端已按契约实现：收到 410 → **清空本地游标/缓存** → 重新 `cursor=0` 全量拉取 →
+   以响应的 `nextCursor` 继续增量。
+5. 若客户端发送的是 `cursor=0` 却仍收到 410，属于服务端缺陷（`cursor=0` 不应触发 410），
+   请保留请求 `X-Request-Id` 与服务端日志排查。
+
+处理建议：
+
+- **不要**通过调大保留期“修复”已经丢失的行——行已被物理删除，只能全量重拉；
+- 若大量客户端同时 410，评估把 `CHANGE_LOG_RETENTION_DAYS` 调到大于最长离线时间，并观察
+  `change_log` 表体积与清理耗时；
+- 410 不计入 5xx 告警，但客户端应上报“重新同步”事件，便于评估保留期参数。
+
+### 7.7 `503 TIMEOUT`（查询超时）
+
+现象：`{"error":{"code":"TIMEOUT","message":"数据库查询超时，请稍后重试"}}`。
+
+- 读数、变更与清理相关查询统一带 **3s** 查询超时；超时返回 503 而非挂住连接；
+- 排查：`pg_stat_activity` 是否有长事务/锁等待，`pg_stat_statements` 找最慢 SQL，
+  检查 `readings` / `change_log` 是否因未配置清理而异常膨胀；
+- 索引核对：`readings_user_device_metric_time_idx`、`change_log_server_ts_idx`、
+  `change_log_user_seq_idx`、`idempotency_keys_created_at_idx`、`tokens_expires_at_idx`；
+- 先执行一次 `cleanup`（可 `-dry-run` 确认边界），再观察 `/metrics` 的 DB 错误计数；
+- 客户端应退避重试，不要并发重试放大压力。
+
+### 7.8 401 `UNAUTHORIZED`（token 过期/吊销）
+
+现象：原本可用的 token 开始返回 401，响应体：
+
+```json
+{"error":{"code":"UNAUTHORIZED","message":"token 无效、已过期或已吊销"}}
+```
+
+- 查库：`SELECT user_id, created_at, expires_at, revoked_at FROM tokens WHERE token_hash = encode(digest('<token>','sha256'),'hex');`
+- `expires_at <= now()` → 已过期（默认 180 天，`TOKEN_TTL_DAYS` 可配）；`revoked_at` 非空 → 已注销；
+- 客户端应重新走 `/auth/anonymous` 或配对码领取，**不得**在 401 后静默换号导致 userId 漂移；
+- `cmd/cleanup` 删除过期 token 行后，旧 token 仍返回 401（不存在等价于无效）。
+
+### 7.9 列表接口 400（limit 越界）
+
+- `GET /my/devices/.../readings`：`limit` 上限 **500**；
+- `GET /export`：`limit` 上限 **5000**；
+- `GET /sync/changes`：已有限制（默认/上限见 openapi）；
+- 超出上限统一返回 `400 BAD_REQUEST`，不会静默截断；客户端应改为分页拉取。
+
 ## 8. 监控与告警
 
 - 抓取目标：`api:8080/metrics`（内网），样例见 `deploy/prometheus/scrape.yml`；
@@ -264,7 +390,7 @@ WantedBy=timers.target
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值，不应作为计费/审计依据；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.1）
+## 9. 本机实际验证记录（v0.7.1 / v0.8.0）
 
 ### 9.1 构建与启动
 
@@ -356,8 +482,48 @@ GitHub Actions（run 41962617787，commit ef0c7af）：`构建与测试`、`构�
 
 - 真实域名 / ACME 证书签发（未开通任何云账号）；
 - systemd timer / 真实 cron 安装；
-- 长时间压测、故障注入、多实例限流；
+- 数小时长稳压、故障注入、多实例限流；
 - `shfmt`（本机与 CI runner 均无）。
+
+### 9.7 v0.8.0 生命周期与压测（真实输出）
+
+```text
+# 匿名登录（响应含 expiresAt）
+POST /api/v1/auth/anonymous → 201
+  → expiresAt=2027-05-04T...Z（约 180 天后），库内 tokens.expires_at 一致
+
+# push 3 台设备
+POST /api/v1/sync/push → 200，serverSeq=[246402,246403,246404]
+GET /sync/changes?cursor=0 → 3 条
+
+# 把最早一条 change_log 老化 100 天，再按 90 天清理
+docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
+  -c "UPDATE change_log SET server_ts = now() - interval '100 days' WHERE seq = 246402;"
+docker compose --profile maintenance run --rm cleanup
+  → readings_deleted=1628 / change_log_deleted=1 / idempotency_keys_deleted=0
+  → tokens_deleted=0 / pairing_codes_deleted=0
+
+# 旧游标失效 / 新游标正常
+GET /sync/changes?cursor=246401 → 410 {"error":{"code":"RESYNC_REQUIRED",...}}
+GET /sync/changes?cursor=246402 → 200，剩 2 条
+GET /my/devices → 仍 3 台（cleanup 不影响 user_devices）
+
+# token 过期与清理
+把 tokens.expires_at 改为过去时间 → 任意鉴权接口 401
+docker compose --profile maintenance run --rm cleanup → tokens_deleted=1
+SELECT count(*) FROM tokens → 0
+```
+
+压测（`cmd/loadgen`，Docker Desktop VM 2 vCPU / 4 GB，30s/场景，`RATE_LIMIT_PER_MINUTE=0`）：
+
+| 场景 | 并发 | RPS | p50 | p95 | p99 | 错误率 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `GET /my/devices` | 100 | 1 065.6 | 75 ms | 215 ms | 395 ms | 0% |
+| `POST /sync/push`（100 设备+200 读数） | 50 | 51.5 | 801 ms | 2 005 ms | 2 818 ms | 0% |
+| `GET /readings/series`（1d，90 天） | 50 | 802.2 | 55 ms | 127 ms | 183 ms | 0% |
+
+p95 归因与修正见 README「容量与压测结果」：`/my/devices` 的 N+1 已合并为单条 JOIN（EXPLAIN 0.25 ms），
+push 从约 900 条 SQL/批降到约 7 条；剩余延迟是 2 vCPU 本地 VM 的 CPU/写吞吐上限，不是索引问题。
 
 ## 10. 本地栈自检步骤（可复现）
 
@@ -409,7 +575,25 @@ docker compose stop api
 RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
 docker compose start api
 
-# 10) 收尾（保留卷）
+# 10) v0.8.0 生命周期：清理与 410（先准备 3 台设备与 3 条 change_log）
+TOKEN=$(curl -k -sS -X POST https://localhost/api/v1/auth/anonymous | jq -r .token)
+docker compose --profile maintenance run --rm cleanup -dry-run          # 只看边界
+docker compose --profile maintenance run --rm cleanup                   # 实际清理
+docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+  "UPDATE change_log SET server_ts = now() - interval '100 days' WHERE seq = <最老 seq>;"
+docker compose --profile maintenance run --rm cleanup
+curl -k -sS -w '\nHTTP %{http_code}\n' \
+  "https://localhost/api/v1/sync/changes?cursor=$((<最老 seq>-1))" -H "Authorization: Bearer $TOKEN"  # 期望 410
+
+# 11) v0.8.0 压测（不进 CI；先关闭限流）
+RATE_LIMIT_PER_MINUTE=0 docker compose up -d api
+go run ./cmd/loadgen -base-url https://localhost -duration 30s -warmup 3s
+go run ./cmd/loadgen -base-url https://localhost -scenario devices -concurrency 100 -duration 30s
+go run ./cmd/loadgen -base-url https://localhost -scenario push    -concurrency 50  -duration 30s
+go run ./cmd/loadgen -base-url https://localhost -scenario series  -concurrency 50  -duration 30s
+RATE_LIMIT_PER_MINUTE=120 docker compose up -d api                     # 恢复默认限流
+
+# 12) 收尾（保留卷）
 docker compose down
 ```
 

@@ -25,8 +25,9 @@ type pairingClaimRequest struct {
 }
 
 type pairingClaimResponse struct {
-	UserID string `json:"userId"`
-	Token  string `json:"token"`
+	UserID    string    `json:"userId"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 // handleCreatePairingCode 为当前用户签发一次性配对码；同用户新码使旧码失效。
@@ -72,8 +73,10 @@ func (s *Server) handleClaimPairingCode(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
 		return
 	}
+	now := time.Now().UTC()
+	tokenExpiresAt := now.Add(s.cfg.TokenTTL())
 	userID, err := s.store.ClaimPairingCode(c.Request.Context(), auth.PairingCodeHash(normalized), hash,
-		time.Now().UTC(), pairingCodeTTL)
+		now, pairingCodeTTL, tokenExpiresAt)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			fail(c, http.StatusNotFound, CodeNotFound, "配对码无效或已过期")
@@ -83,7 +86,7 @@ func (s *Server) handleClaimPairingCode(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	c.JSON(http.StatusOK, pairingClaimResponse{UserID: userID, Token: token})
+	c.JSON(http.StatusOK, pairingClaimResponse{UserID: userID, Token: token, ExpiresAt: tokenExpiresAt})
 }
 
 // claimRateLimit 对配对码领取接口做独立的按 IP 限流，防止暴力枚举。

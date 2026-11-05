@@ -186,7 +186,7 @@ func (s *Store) CreatePairingCode(ctx context.Context, userID string, codeHash s
 //
 // 失败（不存在、过期、已用过、哈希不一致）统一返回 ErrNotFound，不区分原因。
 // 每次失败都对提交的码计数；同一码累计 5 次即删除作废。
-func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration) (string, error) {
+func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash string, now time.Time, ttl time.Duration, tokenExpiresAt time.Time) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("开启事务失败: %w", err)
@@ -249,7 +249,7 @@ func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tokens (user_id, token_hash) VALUES ($1, $2)`, owner.UUID, tokenHash); err != nil {
+		INSERT INTO tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`, owner.UUID, tokenHash, tokenExpiresAt.UTC()); err != nil {
 		return "", fmt.Errorf("签发 token 失败: %w", err)
 	}
 	// 一次性：用掉即删除，重放命中「不存在」分支并返回 404。
@@ -317,6 +317,45 @@ func (s *Store) CleanupPairingCodes(ctx context.Context, before time.Time) (int6
 	res, err := s.db.ExecContext(ctx, `DELETE FROM pairing_codes WHERE expires_at < $1`, before.UTC())
 	if err != nil {
 		return 0, fmt.Errorf("清理配对码失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果失败: %w", err)
+	}
+	return n, nil
+}
+
+// CleanupChangeLog 实现 store.Store。
+func (s *Store) CleanupChangeLog(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM change_log WHERE server_ts < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("清理变更日志失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果失败: %w", err)
+	}
+	return n, nil
+}
+
+// CleanupIdempotencyKeys 实现 store.Store。
+func (s *Store) CleanupIdempotencyKeys(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE created_at < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("清理幂等键失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果失败: %w", err)
+	}
+	return n, nil
+}
+
+// CleanupTokens 实现 store.Store。
+func (s *Store) CleanupTokens(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tokens WHERE expires_at < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("清理过期 token 失败: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {

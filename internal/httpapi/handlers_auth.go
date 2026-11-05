@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -9,8 +10,9 @@ import (
 )
 
 type anonymousResponse struct {
-	UserID string `json:"userId"`
-	Token  string `json:"token"`
+	UserID    string    `json:"userId"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 func (s *Server) handleAnonymous(c *gin.Context) {
@@ -20,13 +22,14 @@ func (s *Server) handleAnonymous(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
 		return
 	}
-	userID, err := s.store.CreateUserWithToken(c.Request.Context(), hash)
+	expiresAt := time.Now().UTC().Add(s.cfg.TokenTTL())
+	userID, err := s.store.CreateUserWithToken(c.Request.Context(), hash, expiresAt)
 	if err != nil {
 		s.log.Error("创建匿名用户失败", "error", err, "request_id", c.GetString(ctxKeyRequestID))
 		fail(c, http.StatusInternalServerError, CodeInternal, "服务内部错误")
 		return
 	}
-	c.JSON(http.StatusCreated, anonymousResponse{UserID: userID, Token: token})
+	c.JSON(http.StatusCreated, anonymousResponse{UserID: userID, Token: token, ExpiresAt: expiresAt})
 }
 
 // handleLogin 预留给后续账号体系统一登录，当前明确返回 501。

@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ const (
 	CodeNotImplemented      = "NOT_IMPLEMENTED"
 	CodeUnavailable         = "UNAVAILABLE"
 	CodeInternal            = "INTERNAL"
+	CodeResyncRequired      = "RESYNC_REQUIRED"
+	CodeTimeout             = "TIMEOUT"
 )
 
 type errorBody struct {
@@ -111,11 +114,16 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 		case errors.As(last, &valErr):
 			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "请求参数校验失败")
 		case errors.Is(last, store.ErrUnauthorized):
-			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "token 无效或已吊销")
+			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "token 无效、已过期或已吊销")
 		case errors.Is(last, store.ErrNotFound):
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
+		case errors.Is(last, store.ErrCursorExpired):
+			writeError(c.Writer, http.StatusGone, CodeResyncRequired, "游标已过期，请全量重新同步")
+		case errors.Is(last, store.ErrTimeout), errors.Is(last, context.DeadlineExceeded):
+			s.metrics.incDBErrors()
+			writeError(c.Writer, http.StatusServiceUnavailable, CodeTimeout, "数据库查询超时，请稍后重试")
 		default:
 			s.metrics.incDBErrors()
 			s.log.Error("请求处理失败",

@@ -39,11 +39,11 @@ func TestPostgresAccountIntegration(t *testing.T) {
 
 	hashA := hashOf("account-a-" + uuid.NewString())
 	hashB := hashOf("account-b-" + uuid.NewString())
-	userA, err := st.CreateUserWithToken(ctx, hashA)
+	userA, err := st.CreateUserWithToken(ctx, hashA, time.Now().UTC().Add(180*24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	userB, err := st.CreateUserWithToken(ctx, hashB)
+	userB, err := st.CreateUserWithToken(ctx, hashB, time.Now().UTC().Add(180*24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,14 +73,14 @@ func TestPostgresAccountIntegration(t *testing.T) {
 
 	t.Run("新码使旧码失效", func(t *testing.T) {
 		if _, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(codeA1),
-			hashOf("claim-old-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute); !errors.Is(err, store.ErrNotFound) {
+			hashOf("claim-old-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour)); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("旧码 err=%v", err)
 		}
 	})
 
 	t.Run("claim 签发新 token 且保留原 token", func(t *testing.T) {
 		newTokenHash := hashOf("claim-new-" + uuid.NewString())
-		got, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(codeA2), newTokenHash, time.Now().UTC(), 10*time.Minute)
+		got, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(codeA2), newTokenHash, time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour))
 		if err != nil {
 			t.Fatalf("claim: %v", err)
 		}
@@ -97,7 +97,7 @@ func TestPostgresAccountIntegration(t *testing.T) {
 
 	t.Run("重放返回 404", func(t *testing.T) {
 		if _, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(codeA2),
-			hashOf("claim-replay-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute); !errors.Is(err, store.ErrNotFound) {
+			hashOf("claim-replay-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour)); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("重放 err=%v", err)
 		}
 	})
@@ -108,7 +108,7 @@ func TestPostgresAccountIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(code),
-			hashOf("claim-expired-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute); !errors.Is(err, store.ErrNotFound) {
+			hashOf("claim-expired-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour)); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("过期 err=%v", err)
 		}
 	})
@@ -124,7 +124,7 @@ func TestPostgresAccountIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := 0; i < 5; i++ {
-			_, err := st.ClaimPairingCode(ctx, hash, hashOf("wrong-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute)
+			_, err := st.ClaimPairingCode(ctx, hash, hashOf("wrong-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour))
 			if !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("第 %d 次 err=%v", i+1, err)
 			}
@@ -144,7 +144,7 @@ func TestPostgresAccountIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := st.ClaimPairingCode(ctx, auth.PairingCodeHash(codeB),
-			hashOf("claim-b-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute)
+			hashOf("claim-b-"+uuid.NewString()), time.Now().UTC(), 10*time.Minute, time.Now().UTC().Add(180*24*time.Hour))
 		if err != nil || got != userB {
 			t.Fatalf("跨用户 claim uid=%s err=%v", got, err)
 		}

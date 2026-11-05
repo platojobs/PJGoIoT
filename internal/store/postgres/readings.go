@@ -31,25 +31,41 @@ type readingRow struct {
 
 // pushReadingsTx 在 push 事务内按 id 幂等写入读数。
 // 已存在同 id 且内容一致：计 skipped；内容不同：计 skipped 并追加 reading 冲突。
+// 插入使用一条多行 INSERT，仅在主键冲突时才逐条读取比较。
 func pushReadingsTx(ctx context.Context, tx *sql.Tx, uid uuid.UUID, readings []model.PushReading, now time.Time, result *model.PushResult, fallback *sqlcgen.Queries) error {
+	// 同一批读数通常来自少量设备，缓存型号推导结果避免逐条查询（N+1）。
+	typeCache := map[string]string{}
+	canonical := make([]model.PushReading, 0, len(readings))
+	deviceTypes := make([]string, 0, len(readings))
 	for i := range readings {
 		r := &readings[i]
-		canonical, err := normalizePushReading(r, now)
+		c, err := normalizePushReading(r, now)
 		if err != nil {
 			return fmt.Errorf("读数 %d 非法: %w", i, err)
 		}
 
-		deviceType := canonical.DeviceType
+		deviceType := c.DeviceType
 		if deviceType == "" {
-			deviceType = lookupReadingDeviceType(ctx, tx, fallback, uid, canonical.Platform, canonical.ExternalID)
+			key := c.Platform + "|" + c.ExternalID
+			cached, ok := typeCache[key]
+			if !ok {
+				cached = lookupReadingDeviceType(ctx, tx, fallback, uid, c.Platform, c.ExternalID)
+				typeCache[key] = cached
+			}
+			deviceType = cached
 		}
+		canonical = append(canonical, c)
+		deviceTypes = append(deviceTypes, deviceType)
+	}
 
-		readingID, _ := uuid.Parse(canonical.ID)
-		inserted, err := insertReading(ctx, tx, uid, readingID, canonical, deviceType)
-		if err != nil {
-			return err
-		}
-		if inserted {
+	inserted, err := insertReadingsBatch(ctx, tx, uid, canonical, deviceTypes)
+	if err != nil {
+		return err
+	}
+	for i := range canonical {
+		c := &canonical[i]
+		readingID, _ := uuid.Parse(c.ID)
+		if inserted[c.ID] {
 			result.AppliedReadings++
 			continue
 		}
@@ -60,18 +76,65 @@ func pushReadingsTx(ctx context.Context, tx *sql.Tx, uid uuid.UUID, readings []m
 			return err
 		}
 		result.SkippedReadings++
-		if existing == nil || !sameReadingContent(existing, canonical, deviceType) {
+		if existing == nil || !sameReadingContent(existing, *c, deviceTypes[i]) {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
-				ID: canonical.ID, Platform: canonical.Platform, ExternalID: canonical.ExternalID,
+				ID: c.ID, Platform: c.Platform, ExternalID: c.ExternalID,
 				Entity: "reading", Reason: "duplicate_id",
 				Reading: &model.Reading{
-					ID: canonical.ID, Metric: canonical.Metric, Value: canonical.Value,
-					Unit: canonical.Unit, RecordedAt: canonical.RecordedAt,
+					ID: c.ID, Metric: c.Metric, Value: c.Value,
+					Unit: c.Unit, RecordedAt: c.RecordedAt,
 				},
 			})
 		}
 	}
 	return nil
+}
+
+// insertReadingsBatch 批量插入读数，返回本次真正插入的 id 集合。
+func insertReadingsBatch(ctx context.Context, tx *sql.Tx, uid uuid.UUID, readings []model.PushReading, deviceTypes []string) (map[string]bool, error) {
+	inserted := map[string]bool{}
+	const chunk = 500
+	for start := 0; start < len(readings); start += chunk {
+		end := start + chunk
+		if end > len(readings) {
+			end = len(readings)
+		}
+		rows := make([][]any, 0, end-start)
+		for i := start; i < end; i++ {
+			id, err := uuid.Parse(readings[i].ID)
+			if err != nil {
+				return nil, fmt.Errorf("解析读数 id 失败: %w", err)
+			}
+			rows = append(rows, []any{
+				id, uid, readings[i].Platform, readings[i].ExternalID, readings[i].Metric,
+				readings[i].Value, readings[i].Unit, readings[i].RecordedAt, nullableString(deviceTypes[i]),
+			})
+		}
+		values, args := buildBatchValues(1, rows, []string{
+			"uuid", "uuid", "text", "text", "text", "double precision", "text", "timestamptz", "text",
+		})
+		query := fmt.Sprintf(`INSERT INTO readings
+			(id, user_id, platform, external_id, metric, value, unit, recorded_at, device_type)
+			VALUES %s ON CONFLICT (id) DO NOTHING RETURNING id`, values)
+		res, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("批量写入读数失败: %w", err)
+		}
+		for res.Next() {
+			var id uuid.UUID
+			if err := res.Scan(&id); err != nil {
+				res.Close()
+				return nil, fmt.Errorf("解析读数插入结果失败: %w", err)
+			}
+			inserted[id.String()] = true
+		}
+		if err := res.Err(); err != nil {
+			res.Close()
+			return nil, fmt.Errorf("遍历读数插入结果失败: %w", err)
+		}
+		res.Close()
+	}
+	return inserted, nil
 }
 
 // normalizePushReading 存储层再次规范化，避免绕过 HTTP 层写入非法读数。
@@ -179,6 +242,8 @@ func sameReadingContent(existing *readingRow, r model.PushReading, deviceType st
 
 // ListReadings 实现 store.Store。
 func (s *Store) ListReadings(ctx context.Context, userID string, platform string, externalID string, q model.ReadingsQuery) (model.ReadingsPage, error) {
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return model.ReadingsPage{}, fmt.Errorf("非法 user id: %w", err)
@@ -256,6 +321,8 @@ func (s *Store) ListReadings(ctx context.Context, userID string, platform string
 
 // ReadingsSummary 实现 store.Store。
 func (s *Store) ReadingsSummary(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time) (model.ReadingsSummary, error) {
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return model.ReadingsSummary{}, fmt.Errorf("非法 user id: %w", err)
@@ -323,6 +390,8 @@ var bucketIntervals = map[string]string{
 // 现有索引 (user_id, platform, external_id, metric, recorded_at DESC) 的列顺序与过滤条件完全匹配，
 // 无需新增覆盖索引。
 func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform string, externalID string, metric string, from time.Time, to time.Time, bucket string) (model.ReadingsSeries, error) {
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return model.ReadingsSeries{}, fmt.Errorf("非法 user id: %w", err)
@@ -393,6 +462,8 @@ func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform stri
 //
 // unit 取该指标最近一条读数的单位；排序按 lastAt 倒序，同一时间按 metric 升序保证稳定。
 func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform string, externalID string) (model.ReadingMetrics, error) {
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return model.ReadingMetrics{}, fmt.Errorf("非法 user id: %w", err)

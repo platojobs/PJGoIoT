@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.6.0
+  version: 0.7.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -58,7 +58,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.6.0"
+                version: "0.8.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -254,6 +254,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /me:
     delete:
@@ -469,6 +471,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices/{platform}/{externalId}:
     get:
@@ -580,6 +584,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices/{platform}/{externalId}/readings/summary:
     get:
@@ -638,6 +644,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices/{platform}/{externalId}/readings/series:
     get:
@@ -725,6 +733,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices/{platform}/{externalId}/readings/metrics:
     get:
@@ -779,6 +789,12 @@ paths:
         `change_log` 按 user_id 隔离，seq 单调递增。客户端保存 `nextCursor`，
         下次携带该值继续拉取。`limit` 默认 100，范围 1-500。
 
+        服务端只保留最近 90 天（`CHANGE_LOG_RETENTION_DAYS` 可配）的变更。
+        若客户端 `cursor` 早于当前仍保留的最老 `seq`（即中间存在已被清理的行），
+        本接口返回 **410 Gone** 且错误码为 `RESYNC_REQUIRED`，而不会静默返回空页。
+        客户端收到 410 后必须清空本地同步状态，以 `cursor=0` 全量重新拉取。
+        `cursor=0` 表示从未同步过，服务端总是从最老保留行开始返回，不会返回 410。
+
         每条变更的 `payload` 为 `UserDevice`，包含 `platform`、`externalId` 与可选 `mac`；
         `entityId` 为 `<userId>:<platform>:<externalId>` 派生的稳定字符串。
       security:
@@ -813,8 +829,10 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-
-  /sync/push:
+        "410":
+          $ref: "#/components/responses/CursorExpired"
+        "503":
+          $ref: "#/components/responses/Timeout"
     post:
       tags: [sync]
       operationId: pushSyncChanges
@@ -1035,7 +1053,7 @@ components:
               message: "请求参数校验失败"
     Unauthorized:
       description: |
-        token 缺失、无效或已吊销。这是明确的重新登录信号：
+        token 缺失、无效、已过期或已吊销。这是明确的重新登录信号：
         客户端应提示用户重新登录，不得自动调用 POST /auth/anonymous 静默新建匿名账号，
         否则 userId 会变化并导致设备列表与同步游标漂移。
         本响应只包含错误体，不会下发新 token。
@@ -1046,7 +1064,7 @@ components:
           example:
             error:
               code: UNAUTHORIZED
-              message: "token 无效或已吊销"
+              message: "token 无效、已过期或已吊销"
     NotFound:
       description: 资源不存在，或当前用户无权访问
       content:
@@ -1072,6 +1090,18 @@ components:
             error:
               code: RATE_LIMITED
               message: "请求过于频繁，请稍后再试"
+    CursorExpired:
+      description: |
+        同步游标已失效：客户端 cursor 早于服务端仍保留的最老 seq（中间有已被清理的变更）。
+        客户端必须清空本地同步状态并以 cursor=0 全量重新拉取；不可继续使用旧 cursor。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: RESYNC_REQUIRED
+              message: "游标已过期，请全量重新同步"
     ServiceUnavailable:
       description: 存储不可用
       content:
@@ -1082,6 +1112,16 @@ components:
             error:
               code: UNAVAILABLE
               message: "存储不可用"
+    Timeout:
+      description: 查询超过服务端 3 秒超时（如大窗口聚合）；客户端可重试或缩小窗口
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: TIMEOUT
+              message: "数据库查询超时，请稍后重试"
     InternalError:
       description: 服务内部错误
       content:
@@ -1119,6 +1159,8 @@ components:
                 - NOT_IMPLEMENTED
                 - UNAVAILABLE
                 - INTERNAL
+                - RESYNC_REQUIRED
+                - TIMEOUT
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -1143,7 +1185,7 @@ components:
 
     AnonymousResponse:
       type: object
-      required: [userId, token]
+      required: [userId, token, expiresAt]
       properties:
         userId:
           type: string
@@ -1151,6 +1193,10 @@ components:
         token:
           type: string
           description: 不透明 token，仅在创建时返回一次
+        expiresAt:
+          type: string
+          format: date-time
+          description: token 过期时间（默认创建后 180 天，服务端 TOKEN_TTL_DAYS 可配）；过期后请求返回 401
 
     GATTService:
       type: object
@@ -1790,7 +1836,7 @@ components:
 
     PairingClaimResponse:
       type: object
-      required: [userId, token]
+      required: [userId, token, expiresAt]
       description: 配对成功；token 为同一 userId 的新 token，原 token 仍然有效。
       properties:
         userId:
@@ -1799,6 +1845,10 @@ components:
         token:
           type: string
           description: 新的不透明 token，客户端应持久化并替换当前 token
+        expiresAt:
+          type: string
+          format: date-time
+          description: 新 token 的过期时间（默认 180 天，服务端 TOKEN_TTL_DAYS 可配）
 
     ExportUser:
       type: object

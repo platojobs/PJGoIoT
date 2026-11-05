@@ -25,6 +25,7 @@ type Config struct {
 	CORSAllowedOrigins  []string
 	LogLevel            slog.Level
 	ShutdownTimeout     time.Duration
+	TokenTTLDays        int
 	Version             string
 }
 
@@ -43,7 +44,8 @@ func Load() (Config, error) {
 		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
 		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
 		ShutdownTimeout:     10 * time.Second,
-		Version:             getEnv("APP_VERSION", "0.7.1"),
+		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
+		Version:             getEnv("APP_VERSION", "0.8.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")
@@ -72,7 +74,19 @@ func Load() (Config, error) {
 	if cfg.PairingClaimPerMin < 0 || cfg.PairingClaimBurst < 0 {
 		return Config{}, fmt.Errorf("配对码限流参数不能为负数")
 	}
+	if cfg.TokenTTLDays <= 0 {
+		return Config{}, fmt.Errorf("TOKEN_TTL_DAYS 必须大于 0，当前为 %d", cfg.TokenTTLDays)
+	}
 	return cfg, nil
+}
+
+// TokenTTL 返回 token 有效期；直接构造 Config 且未设置天数时回退到 180 天默认值。
+func (c Config) TokenTTL() time.Duration {
+	days := c.TokenTTLDays
+	if days <= 0 {
+		days = 180
+	}
+	return time.Duration(days) * 24 * time.Hour
 }
 
 func getEnv(key, fallback string) string {
