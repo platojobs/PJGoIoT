@@ -1392,6 +1392,7 @@ seed 数据来源与边界：
 | v0.16.0 契约一致性 | 通过：`TestOpenAPIFeedbackContract` 解析 `api/openapi.yaml`，比对 `FeedbackItem` 的 required/properties 与 `model.Feedback` 的 JSON 字段、kind/platform/status 枚举、错误码枚举与实现常量一致 |
 | v0.16.0 迁移 | 通过：`000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（回到 000012）→ up`，并断言 `feedback_user_created_idx` 与 `feedback_user_idem_idx` 存在、回滚不影响用户数据 |
 | v0.16.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 **0.12.0** |
+| v0.16.0 CI | 通过：GitHub Actions [run 42077337348](https://github.com/platojobs/PJGoIoT/actions/runs/42077337348) 四 job 全绿；日志确认 `TestPostgresFeedbackIntegration` 全部 PASS，`OpenAPI 契约校验` 读到 `version: 0.12.0`；`单元测试` 中 `internal/httpapi`（含契约一致性测试）为 ok |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |

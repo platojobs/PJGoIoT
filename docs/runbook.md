@@ -72,6 +72,7 @@
 | v0.16.0 契约一致性 | **已验证** | `TestOpenAPIFeedbackContract`：`FeedbackItem` 字段与 `model.Feedback` JSON 标签一致，kind/platform/status 枚举与实现一致，错误码枚举含 `FEEDBACK_RATE_LIMITED` |
 | v0.16.0 迁移 | **已验证** | `000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000012）→ up`，索引 `feedback_user_created_idx` / `feedback_user_idem_idx` 存在 |
 | v0.16.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 0.12.0 |
+| v0.16.0 CI | **已验证** | GitHub Actions [run 42077337348](https://github.com/platojobs/PJGoIoT/actions/runs/42077337348) 四 job 全绿；`TestPostgresFeedbackIntegration` 全部 PASS，OpenAPI lint 读到 `version: 0.12.0` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
