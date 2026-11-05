@@ -43,7 +43,7 @@ func Load() (Config, error) {
 		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
 		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
 		ShutdownTimeout:     10 * time.Second,
-		Version:             getEnv("APP_VERSION", "0.7.0"),
+		Version:             getEnv("APP_VERSION", "0.7.1"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")

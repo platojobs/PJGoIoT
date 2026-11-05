@@ -1,6 +1,6 @@
 # 生产形态编排：Caddy（HTTPS 终止/反代）→ API → PostgreSQL。
 # 本地默认 http://localhost 自动跳转 https://localhost（Caddy 自签证书）。
-# 说明：本文件已用 `docker compose config` 静态校验，但未在本机实际起服务（见 docs/runbook.md）。
+# 已在本地按 docs/runbook.md「本地栈自检步骤」实际运行并验证（见该文档 §0/§9）。
 name: pjgoiot
 
 services:
@@ -31,14 +31,14 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.7.0"
-    image: pjgoiot-api:0.7.0
+        APP_VERSION: "0.7.1"
+    image: pjgoiot-api:0.7.1
     restart: unless-stopped
     environment:
       STORE: postgres
       DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
       ADDR: ":8080"
-      APP_VERSION: "0.7.0"
+      APP_VERSION: "0.7.1"
       # 启动即迁移；迁移失败进程退出，不会以旧 schema 半可用运行。
       RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
       RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
@@ -95,8 +95,8 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.7.0"
-    image: pjgoiot-api:0.7.0
+        APP_VERSION: "0.7.1"
+    image: pjgoiot-api:0.7.1
     entrypoint: ["/cleanup"]
     command: ["-retention-days", "${READING_RETENTION_DAYS:-90}"]
     environment:

@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.7.0）
+# PJGoIoT 运行手册（v0.7.1）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机部署形态（Caddy → API → PostgreSQL）。
 > 本手册区分「已验证」与「未验证」，未实际执行的步骤不得当作已验证结论。
@@ -7,18 +7,26 @@
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
-| `docker compose config` 静态解析 | **已验证** | 本机 Docker Compose v5.7.0，退出码 0 |
+| `docker compose config` 静态解析 | **已验证** | Docker Compose v5.7.0，退出码 0 |
 | `deploy/Caddyfile` 语法 | **已验证** | `caddy:2.8-alpine caddy validate` → `Valid configuration`；`caddy fmt --diff` 无差异 |
-| `docker compose build` / 完整 `up` | **未验证** | 未实际构建镜像、未启动 api/postgres/caddy 全栈；仅做静态解析 |
-| 启动自动迁移（宿主机二进制） | **已验证** | `cmd/api` + 真实 PostgreSQL，日志 `version=7 dirty=false`；错误 DSN 非零退出 |
-| `/healthz` liveness / `/api/v1/health` readiness | **已验证**（宿主机） | 两者均 200，版本 `0.7.0`；容器内未验证 |
-| `backup.sh` 真实备份 | **已验证** | 对本机 PostgreSQL 执行，产出 `.dump.gz` + `.sha256`，校验通过 |
-| `restore.sh` 真实恢复 + 迁移/行数检查 | **已验证** | 恢复到临时库 `pjgoiot_restoretest`，校验和通过，`version=7 dirty=f`，行数摘要对应备份快照 |
+| `docker compose build` | **已验证** | 成功构建 `pjgoiot-api:0.7.1`（distroless，43.9MB） |
+| 完整 `docker compose up -d` | **已验证** | postgres/api `healthy`、caddy `Up`；60s 内每 5s `docker compose ps` 均正常 |
+| Caddy 自签 HTTPS → readiness | **已验证** | `curl -k https://localhost/api/v1/health` → 200，`store=postgres`，`version=0.7.1` |
+| Caddy 拦截 `/metrics` | **已验证** | `HTTP/2 404`，body `not found` |
+| 容器内 `/metrics` | **已验证** | `pjgoiot_edge` 网络内请求 `api:8080/metrics` → 200，含 `pjgoiot_http_requests_total` |
+| 非 root / 只读根文件系统 | **已验证** | `User=nonroot:nonroot`、UID 65532、`ReadonlyRootfs=true`；`docker cp` 写入被拒绝 |
+| `X-Request-Id` | **已验证** | 自定义值回显；未带时生成 UUID |
+| 重启与卷持久化 | **已验证** | `restart api` 后设备仍在；`down`（无 `-v`）后卷保留 |
+| 容器启动自动迁移 | **已验证** | 两次启动日志均 `version=7 dirty=false` |
+| `backup.sh`（host + docker 模式） | **已验证** | 分别产出 `.dump.gz` + `.sha256`，校验通过 |
+| `restore.sh`（host + docker 模式） | **已验证** | host 恢复到临时库、docker 模式恢复到运行中 compose 库；均 `version=7 dirty=f` 并输出行数 |
 | 备份保留策略删除 | **已验证** | 构造 10 天前假备份，`RETENTION_DAYS=1` 后被删除 |
-| Prometheus `promtool check rules` | **未执行** | 本机无 `promtool`，仅做 YAML 结构 + 字段校验 |
-| shellcheck / shfmt | **未执行** | 本机未安装，仅 `bash -n` |
+| Prometheus `promtool check rules` / `check config` | **已验证** | 容器内 `SUCCESS: 6 rules found`；config `valid prometheus config file syntax` |
+| shellcheck | **CI 通过** | 本机未安装；GitHub `lint-configs` 中 shellcheck 执行通过 |
+| shfmt | **未执行** | 本机与 CI runner 均无 `shfmt`；仅 `bash -n` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
+| 长时间压测 / 故障注入 | **未验证** | 未做 |
 
 ## 1. 部署前检查清单
 
@@ -29,7 +37,7 @@
 - [ ] 已确认备份目录权限：`umask 077`，仅运维账号可读。
 - [ ] 已阅读 §5 回滚风险：**迁移 down 可能丢列/丢数据**，生产优先用镜像回滚 + 前滚兼容。
 - [ ] 已配置监控抓取（内网 `api:8080/metrics`），并导入 `deploy/prometheus/alerts.yml`。
-- [ ] 已配置每日清理任务（§7），否则读数不会按 90 天保留策略删除。
+- [ ] 已配置每日清理任务（§6），否则读数不会按 90 天保留策略删除。
 - [ ] 防火墙只开放 80/443；数据库端口绑定 `127.0.0.1:55432`，不得改为 `0.0.0.0`。
 
 ## 2. 首次部署
@@ -39,7 +47,7 @@
 cat > .env <<'EOF'
 DOMAIN=localhost
 POSTGRES_PASSWORD=change-me-strong-password
-APP_VERSION=0.7.0
+APP_VERSION=0.7.1
 METRICS_ENABLED=true
 RUN_MIGRATIONS_ON_BOOT=true
 EOF
@@ -79,7 +87,7 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 
 1. **备份**（必须先做）：`./deploy/scripts/backup.sh`
 2. **预检迁移**：只跑迁移、不启动服务：
-   `docker compose run --rm --no-deps --entrypoint /migrate api -direction up`（本机未验证，需 Docker 环境）。
+   `docker compose run --rm --no-deps --entrypoint /migrate api -direction up`（本轮已实测，输出 `迁移完成 version=7 dirty=false`）。
 3. **构建新镜像**：`APP_VERSION=0.7.x docker compose build api`
 4. **滚动替换**：`docker compose up -d api caddy`
 5. **验证**：
@@ -132,10 +140,14 @@ docker compose run --rm --entrypoint /migrate api -direction down
 ### 5.1 备份
 
 ```bash
-# 宿主机安装 postgresql-client 后（或 BACKUP_MODE=docker）
+# 方式 A：宿主机执行（需 postgresql-client）
 DATABASE_URL='postgres://pjgoiot:<pass>@127.0.0.1:55432/pjgoiot?sslmode=disable' \
 BACKUP_DIR=./backups RETENTION_DAYS=14 \
 ./deploy/scripts/backup.sh
+
+# 方式 B：容器内执行（无需宿主机 pg_dump，要求 compose 栈已启动）
+BACKUP_MODE=docker BACKUP_DIR=./backups RETENTION_DAYS=14 \
+  ./deploy/scripts/backup.sh
 ```
 
 产物：
@@ -148,11 +160,14 @@ BACKUP_DIR=./backups RETENTION_DAYS=14 \
 ### 5.2 恢复（演练建议用临时库）
 
 ```bash
-# 建临时库，避免覆盖生产
+# 方式 A：host 模式，建临时库避免覆盖生产
 createdb -h 127.0.0.1 -p 55432 -U pjgoiot pjgoiot_restoretest
-
 DATABASE_URL='postgres://pjgoiot:<pass>@127.0.0.1:55432/pjgoiot_restoretest?sslmode=disable' \
 ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
+
+# 方式 B：docker 模式，直接恢复到 compose 的 postgres 库
+# 建议先 `docker compose stop api`，恢复完成后再 start，避免恢复期间业务写入
+RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
 ```
 
 脚本行为：
@@ -164,6 +179,7 @@ DATABASE_URL='postgres://pjgoiot:<pass>@127.0.0.1:55432/pjgoiot_restoretest?sslm
 5. 输出 `users/user_devices/readings/change_log/pairing_codes` 行数摘要。
 
 演练验收：行数摘要与备份时点一致、`dirty=false`、API 指向临时库时 `/api/v1/health` 为 200。
+本轮已在真实 compose 栈上实测 docker 模式：备份 8 193 bytes，恢复后 `version=7 dirty=f`、行数 `1/1/0/1/0`，API 重新 `healthy` 且原设备仍可查。
 
 ## 6. 清理任务（读数 90 天）
 
@@ -248,53 +264,151 @@ WantedBy=timers.target
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值，不应作为计费/审计依据；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.0 发布时）
+## 9. 本机实际验证记录（v0.7.1）
 
-发布前实际执行（宿主机，无云账号；Docker CLI 存在但**未启动全栈**）：
-
-```text
-gofmt -l .                               # 除 sqlcgen 外无输出
-go build ./... && go vet ./...           # 通过
-TEST_DATABASE_URL=... go test ./...      # 通过（含真实 PostgreSQL 集成测试）
-docker compose config --quiet            # 退出码 0（Docker Compose v5.7.0）
-caddy validate / caddy fmt --diff        # 官方 caddy:2.8-alpine 容器，Valid configuration / 无差异
-ruby -ryaml -e 'YAML.load_file(...)'     # compose + alerts + scrape + ci.yml 均通过
-bash -n deploy/scripts/backup.sh         # 通过
-bash -n deploy/scripts/restore.sh        # 通过
-```
-
-GitHub Actions（run 41956560178，commit 06eb0d3）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success；
-其中 lint-configs 的 YAML/编排约束/`bash -n`/shellcheck/`docker compose config` 通过，
-`promtool` 在 runner 不可用，日志明确跳过语义校验（未伪造通过）。
-
-启动迁移 / 探针（真实 PostgreSQL）：
+### 9.1 构建与启动
 
 ```text
-RUN_MIGRATIONS_ON_BOOT=true STORE=postgres DATABASE_URL=... go run ./cmd/api
-# 日志：启动迁移完成 version=7 dirty=false / 服务启动 version=0.7.0
-curl /healthz                → 200 {"service":"pjgoiot-api","status":"ok","version":"0.7.0"}
-curl /api/v1/health          → 200 {"status":"ok","store":"postgres","version":"0.7.0"}
-错误 DSN 启动                 → 日志「启动迁移失败」，进程非零退出
+docker compose build
+ → Successfully tagged pjgoiot-api:0.7.1（43.9MB，distroless nonroot）
+docker compose up -d
+ → pjgoiot-postgres-1 Started → Healthy
+ → pjgoiot-api-1 Started → Healthy
+ → pjgoiot-caddy-1 Started
+之后 60s 内每 5s `docker compose ps`（12 次）：
+ → api/postgres 始终 healthy，caddy Up
 ```
 
-备份 / 恢复演练（真实 PostgreSQL）：
+### 9.2 逐项探活（真实输出）
 
 ```text
-backup.sh                    → pjgoiot-20261105T021017Z.dump.gz（67 999 bytes）+ .sha256
-restore.sh（无 --confirm）    → 退出码 2，拒绝执行
-restore.sh（校验和损坏）      → 退出码 1，sha256 FAILED
-restore.sh --confirm         → 恢复到 pjgoiot_restoretest：
-                                schema_migrations version=7 dirty=f
-                                users=104 user_devices=267 readings=248 change_log=495 pairing_codes=2
-                                （对应备份快照；之后源库因测试写入变为 108/277/260/513/2）
-保留策略                      → RETENTION_DAYS=1 删除 10 天前的假备份
+a) curl -k https://localhost/api/v1/health
+   → HTTP 200 {"service":"pjgoiot-api","status":"ok","store":"postgres","version":"0.7.1"}
+   → 含 strict-transport-security: max-age=31536000 等安全头
+
+b) curl -k https://localhost/metrics
+   → HTTP/2 404，content-length: 9，body: not found
+
+c) 容器网络内（pjgoiot_edge），node fetch http://api:8080/metrics
+   → HTTP 200；pjgoiot_http_requests_total{method="GET",status="200"} 12
+
+d) docker inspect pjgoiot-api-1 → User=nonroot:nonroot, ReadonlyRootfs=true
+   docker top pjgoiot-api-1 → UID 65532, COMMAND api
+   docker cp /tmp/write-test.txt pjgoiot-api-1:/write-test.txt
+   → Error response from daemon: container rootfs is marked read-only
+   docker compose exec api id
+   → OCI runtime exec failed: exec: "id": executable file not found in $PATH
+     （distroless 无 id；改用 docker top / inspect 取证，非缺陷）
+
+e) curl -k -H 'X-Request-Id: local-verify-123' https://localhost/healthz
+   → x-request-id: local-verify-123
+   curl -k https://localhost/healthz
+   → x-request-id: 93317b48-1b74-4318-9d7b-70efedb6d862（自动生成 UUID）
+
+f) 写入设备 AA:BB:CC:00:00:71 → docker compose restart api
+   → api health: starting → healthy；GET /my/devices 仍返回该设备，HTTP 200
+
+g) docker compose logs api
+   → 启动迁移完成 version=7 dirty=false（首次启动与重启后各一条）
 ```
 
-未执行/未验证：
+### 9.3 PromQL 语义校验
 
-- 未实际执行 `docker compose build` / `docker compose up`，因此 **Caddy 自签 HTTPS、容器内健康检查、
-  非 root/只读文件系统、caddy→api 反代均未验证**；
-- 未在真实域名上验证 ACME 证书签发；
-- 未安装 systemd timer；
-- 本机无 `promtool`/`shellcheck`/`shfmt`，告警规则未做 PromQL 语义校验；
-- 未做长时间压测与故障注入。
+```text
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
+  prom/prometheus:latest check rules /cfg/alerts.yml
+ → Checking /cfg/alerts.yml
+ → SUCCESS: 6 rules found
+
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
+  prom/prometheus:latest check config /cfg/scrape.yml
+ → SUCCESS: 1 rule files found
+ → SUCCESS: /cfg/scrape.yml is valid prometheus config file syntax
+```
+
+### 9.4 docker 模式备份 / 恢复
+
+```text
+BACKUP_MODE=docker bash deploy/scripts/backup.sh
+ → pjgoiot-20261105T031905Z.dump.gz（8 193 bytes）
+ → SHA-256: 4b0718ec119e833d958396c1f279f697c7cc3dfed0c9ce0ecd753be8908a8994
+
+docker compose stop api
+RESTORE_MODE=docker bash deploy/scripts/restore.sh --confirm \
+  --file ./backups/pjgoiot-20261105T031905Z.dump.gz
+ → pjgoiot-...dump.gz: OK
+ → 迁移版本检查: version=7 dirty=f
+ → 行数摘要: users=1 user_devices=1 readings=0 change_log=1 pairing_codes=0
+docker compose start api → healthy；GET /my/devices 仍返回恢复前的设备
+```
+
+### 9.5 收尾
+
+```text
+docker compose down（不加 -v）
+ → 容器与网络删除；卷保留：
+   pjgoiot_caddy_config / pjgoiot_caddy_data / pjgoiot_pgdata
+```
+
+### 9.6 仍未验证
+
+- 真实域名 / ACME 证书签发（未开通任何云账号）；
+- systemd timer / 真实 cron 安装；
+- 长时间压测、故障注入、多实例限流；
+- `shfmt`（本机与 CI runner 均无）。
+
+## 10. 本地栈自检步骤（可复现）
+
+```bash
+# 0) 前置：Docker daemon 可用，80/443/55432 未被占用
+docker info --format '{{.ServerVersion}}'
+lsof -nP -iTCP:80 -sTCP:LISTEN
+
+# 1) 构建镜像（首次会拉取 golang/distroless/caddy/postgres）
+docker compose build
+
+# 2) 启动并观察 60s
+docker compose up -d
+for i in $(seq 1 12); do
+  docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+  sleep 5
+done
+
+# 3) HTTPS / 健康 / 指标边界
+curl -k -sS -w '\nHTTP %{http_code}\n' https://localhost/api/v1/health
+curl -k -sS -w '\nHTTP %{http_code}\n' https://localhost/healthz
+curl -k -sS -o /dev/null -w '%{http_code}\n' https://localhost/metrics   # 期望 404
+
+# 4) 容器内指标（distroless 无 curl，用带 node 的容器进 edge 网络）
+docker run --rm --network pjgoiot_edge node:20-alpine node -e \
+  "fetch('http://api:8080/metrics').then(r=>console.log(r.status))"       # 期望 200
+
+# 5) 非 root / 只读（distroless 无 id，用 inspect/top）
+docker inspect pjgoiot-api-1 --format 'User={{.Config.User}} Readonly={{.HostConfig.ReadonlyRootfs}}'
+docker top pjgoiot-api-1 -o uid,pid,comm
+echo x > /tmp/x && docker cp /tmp/x pjgoiot-api-1:/x                      # 期望失败
+
+# 6) 请求 ID
+curl -k -sS -D - -o /dev/null -H 'X-Request-Id: local-verify-123' https://localhost/healthz | grep -i x-request-id
+curl -k -sS -D - -o /dev/null https://localhost/healthz | grep -i x-request-id
+
+# 7) 迁移日志
+docker compose logs api | grep '启动迁移完成'
+
+# 8) PromQL（无需宿主机 promtool）
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
+  prom/prometheus:latest check rules /cfg/alerts.yml
+docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy/prometheus":/cfg \
+  prom/prometheus:latest check config /cfg/scrape.yml
+
+# 9) docker 模式备份 / 恢复
+BACKUP_MODE=docker ./deploy/scripts/backup.sh
+docker compose stop api
+RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoiot-<ts>.dump.gz
+docker compose start api
+
+# 10) 收尾（保留卷）
+docker compose down
+```
+
+注意：`curl -k` 仅用于本地自签证书；生产使用 ACME 后必须去掉 `-k` 并验证证书链。

@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.6.0**（业务接口未在 v0.7.0 变更）；服务版本 **v0.7.0**（部署编排、备份恢复、监控告警、运行手册）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号：v0.7.0 只增加运维形态与 `/healthz`（基础设施探针，不写入业务契约），因此契约保持 0.6.0，避免“发版号 = 契约号”的误解。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.6.0**（业务接口未在 v0.7.x 变更）；服务版本 **v0.7.1**（部署编排实测修复、本地栈自检）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号：v0.7.0 增加运维形态与 `/healthz`（基础设施探针，不写入业务契约），v0.7.1 修复部署实测发现的问题并补齐自检步骤，均不改业务契约，因此契约保持 0.6.0，避免“发版号 = 契约号”的误解。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -338,7 +338,7 @@ down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
 近似行数读取 `pg_class.reltuples`，不做 `COUNT` 大表；不暴露可定位到个人的精确业务数据。
 部署时建议只在监听内网或由反向代理限制访问的实例上暴露 `/metrics`。
 
-### 部署编排与运维（v0.7.0）
+### 部署编排与运维（v0.7.1）
 
 #### 三个服务
 
@@ -706,7 +706,7 @@ PJGoIoT/
 | `RUN_MIGRATIONS_ON_BOOT` | `true` | postgres 模式下启动时执行迁移；失败进程非零退出（fixture 模式忽略） |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `APP_VERSION` | `0.7.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.6.0 不是同一个号 |
+| `APP_VERSION` | `0.7.1` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.6.0 不是同一个号 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
 | `TEST_DATABASE_URL` | 空 | 设置后运行 Postgres 集成测试 |
 
@@ -790,20 +790,21 @@ seed 数据来源与边界：
 | fixture 语义验证 | 通过：上报 `advertisedName` 后 `alias` 与 `group` 不变；`"group": ""` 后分组为空；随后仅上报广播名（缺省 group），分组仍为空，未复活 |
 | 401 契约验证 | 通过：无效 token 返回 401 `UNAUTHORIZED`，响应体仅有 `error`，不含 `token` / `userId` |
 | 复合键数据库验证 | 通过：真实 PostgreSQL 中按 `(platform, externalId)` 查询 Android / iOS 成功，跨用户查询返回 `ErrNotFound` |
-| v0.7.0 GitHub Actions | **通过**（run 41956560178，commit 06eb0d3）：`构建与测试`（gofmt/vet/build/单元测试/迁移/集成测试）、`构建镜像`（distroless）、`配置与脚本校验`（YAML、编排约束、6 条告警、`bash -n`、shellcheck、`docker compose config`）均 success |
-| v0.7.0 CI 的 promtool | **未执行**：GitHub ubuntu runner 未预装 `promtool`，日志明确输出「promtool 不可用，跳过；未做语义校验」；shellcheck 在 runner 可用并通过 |
+| v0.7.1 完整栈 `build` + `up -d` | **已验证**：`docker compose build` 成功（`pjgoiot-api:0.7.1`，43.9MB）；`up -d` 后 postgres/api 均 `healthy`，Caddy `Up`；60s 内每 5s 打印的 `docker compose ps` 12 次均正常；`down` 未加 `-v`，`pjgoiot_pgdata`/`caddy_data`/`caddy_config` 三个卷保留 |
+| a) Caddy → readiness | **已验证**：`curl -k https://localhost/api/v1/health` → `HTTP 200`，`{"service":"pjgoiot-api","status":"ok","store":"postgres","version":"0.7.1"}`；`/healthz` 同样 200；响应含 HSTS 等安全头 |
+| b) Caddy 拦截 `/metrics` | **已验证**：`curl -k -D - https://localhost/metrics` → `HTTP/2 404`，`content-length: 9`，body `not found` |
+| c) 容器内 `/metrics` | **已验证**：在 `pjgoiot_edge` 网络内用 node 容器请求 `http://api:8080/metrics` → `HTTP 200`，含 `pjgoiot_http_requests_total{method="GET",status="200"} 12` |
+| d) 非 root + 只读根文件系统 | **已验证**：`docker inspect` → `User=nonroot:nonroot`、`ReadonlyRootfs=true`；`docker top` 显示 UID `65532`；`docker cp` 写入报 `container rootfs is marked read-only`。distroless 无 `id` 命令（`exec: "id": executable file not found`），故用 `docker top`/inspect 取证 |
+| e) `X-Request-Id` | **已验证**：带 `X-Request-Id: local-verify-123` 响应头原样回显；不带时返回生成的 UUID（如 `93317b48-1b74-4318-9d7b-70efedb6d862`） |
+| f) 重启/恢复持久化 | **已验证**：写入设备后 `docker compose restart api`，`GET /my/devices` 仍返回同一设备；`down` 后再 `up` 数据仍在（Postgres 卷持久化） |
+| g) 容器启动迁移 | **已验证**：`docker compose logs api` 两次启动均输出 `启动迁移完成 version=7 dirty=false` |
+| v0.7.1 PromQL 语义校验 | **已验证**：`docker run --entrypoint /bin/promtool prom/prometheus:latest check rules /cfg/alerts.yml` → `SUCCESS: 6 rules found`；`check config /cfg/scrape.yml` → `SUCCESS: ... valid prometheus config file syntax` |
+| v0.7.1 docker 模式备份/恢复 | **已验证**：`BACKUP_MODE=docker backup.sh` → `pjgoiot-20261105T031905Z.dump.gz`（8 193 bytes）+ SHA-256；`RESTORE_MODE=docker restore.sh --confirm` → 校验 `OK`、`version=7 dirty=f`、行数 `1/1/0/1/0`；恢复后 API `healthy` 且原设备仍可查 |
+| v0.7.1 GitHub Actions | **通过**（run 待回填）：`构建与测试`、`构建镜像`、`配置与脚本校验` 均 success |
+| v0.7.0 GitHub Actions（历史） | 通过（run 41956560178，commit 06eb0d3）：三个 job 均 success；lint-configs 中 `promtool` 在 runner 不可用而跳过，本轮已用本地容器补做语义校验 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（10 条非阻断 warning，均为既有示例/描述风格提示）；配对码、导出、注销、`/metrics` 路径与全部 `$ref` 均可解析 |
-| v0.7.0 启动迁移 | **已验证**：本机 `cmd/api` + 真实 PostgreSQL，`RUN_MIGRATIONS_ON_BOOT=true`，启动日志 `启动迁移完成 version=7 dirty=false`；随后 `/healthz` 与 `/api/v1/health` 均 200；错误 DSN 时进程以非零退出（`启动迁移失败`） |
-| v0.7.0 liveness | **已验证**：`GET /healthz` 200 返回 `{status,service,version,time}`；不受业务限流影响；`TestHealthzLiveness` 通过 |
-| v0.7.0 compose 静态解析 | **已验证**：`docker compose config --quiet`（Docker Compose v5.7.0）退出码 0 |
-| v0.7.0 Caddyfile 语法 | **已验证**：`caddy:2.8-alpine caddy validate` 输出 `Valid configuration`，`caddy fmt --diff` 无差异 |
-| v0.7.0 YAML / 脚本静态校验 | **已验证**：Ruby YAML 解析 4 个文件通过；`bash -n deploy/scripts/*.sh` 通过 |
-| v0.7.0 备份/恢复演练 | **已验证**：`backup.sh` 产出 67 999 字节 `.dump.gz` + `.sha256`；`restore.sh` 无 `--confirm` 退出 2、校验和损坏退出 1；恢复到临时库后 `version=7 dirty=f`，行数摘要 `104/267/248/495/2` 对应备份快照（之后源库因测试写入变为 `108/277/260/513/2`，属正常）；保留策略已删除 10 天前的假备份 |
-| v0.7.0 完整 `docker compose up` | **未验证**：本机未实际启动 api/postgres/caddy 全栈，也未验证 Caddy 自签 HTTPS 与 ACME |
-| `promtool check rules` | **未执行**：本机无 `promtool`，告警规则仅做 YAML 结构 + 字段完整性校验，未做 PromQL 语义校验 |
-| `shellcheck` / `shfmt` | **未执行**：本机未安装，仅 `bash -n`；CI 中若 runner 自带则执行 |
 
 集成测试运行方式：
 
@@ -828,10 +829,11 @@ TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disa
 - 尚未做 Android 端到端联调与压测；可观测性已提供 `/metrics`（请求量/延迟/DB 错误/近似计数）与 `X-Request-Id`，Tracing 仍待接入。
 - 配对码为 8 位（约 40 bit 熵）且仅 10 分钟有效，配合每 IP 限流与错 5 次作废；如需更高强度可加长码或增加二次验证。
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值（依赖 autovacuum/ANALYZE），非精确行数；不应作为计费或审计依据。
-- 云部署（服务器、域名、DNS、ACME 证书、托管数据库、密钥管理）需用户决定，仓库只提供可审阅的编排与脚本，未开通任何云账号、未在真实域名上验证证书签发。
-- `docker compose up` 全栈与 Caddy 自签 HTTPS 在本机未实际执行（仅验证 `docker compose config`）；首次上线请按 [runbook](docs/runbook.md) 逐项验收。
-- 备份脚本默认 `host` 模式，需要本机有 `pg_dump`/`pg_restore`；容器内执行用 `BACKUP_MODE=docker`/`RESTORE_MODE=docker`，本机未验证该模式。
-- 告警规则的 PromQL 语义未用 `promtool` 校验（本机未安装），阈值需按真实流量基线调整。
+- 完整栈已在本地 `docker compose up` 实测（Caddy 自签 HTTPS、非 root、只读根文件系统、启动迁移、卷持久化、docker 模式备份恢复均通过）；**真实域名 / ACME 证书 / 云主机仍未验证**，仓库未开通任何云账号。
+- distroless 镜像没有 shell、`id`、`curl`，容器内排查请用 `docker top` / `docker inspect` / `docker compose exec api /api -healthcheck`；健康检查已使用二进制自带的 `-healthcheck`，无需额外工具。
+- 备份脚本默认 `host` 模式，需要本机有 `pg_dump`/`pg_restore`；容器内执行用 `BACKUP_MODE=docker`/`RESTORE_MODE=docker`，本轮已实测。
+- 告警规则已用容器内 `promtool check rules` + `check config` 做过语义校验；阈值仍需按真实流量基线调整，未做长时间压测与故障注入。
+- systemd timer 仅提供示例，未在目标主机安装验证。
 
 ## 开发命令
 
