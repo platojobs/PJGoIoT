@@ -13,7 +13,7 @@
 | 启动自动迁移（宿主机二进制） | **已验证** | `cmd/api` + 真实 PostgreSQL，日志 `version=7 dirty=false`；错误 DSN 非零退出 |
 | `/healthz` liveness / `/api/v1/health` readiness | **已验证**（宿主机） | 两者均 200，版本 `0.7.0`；容器内未验证 |
 | `backup.sh` 真实备份 | **已验证** | 对本机 PostgreSQL 执行，产出 `.dump.gz` + `.sha256`，校验通过 |
-| `restore.sh` 真实恢复 + 迁移/行数检查 | **已验证** | 恢复到临时库 `pjgoiot_restoretest`，校验和与行数摘要一致 |
+| `restore.sh` 真实恢复 + 迁移/行数检查 | **已验证** | 恢复到临时库 `pjgoiot_restoretest`，校验和通过，`version=7 dirty=f`，行数摘要对应备份快照 |
 | 备份保留策略删除 | **已验证** | 构造 10 天前假备份，`RETENTION_DAYS=1` 后被删除 |
 | Prometheus `promtool check rules` | **未执行** | 本机无 `promtool`，仅做 YAML 结构 + 字段校验 |
 | shellcheck / shfmt | **未执行** | 本机未安装，仅 `bash -n` |
@@ -286,6 +286,7 @@ restore.sh（校验和损坏）      → 退出码 1，sha256 FAILED
 restore.sh --confirm         → 恢复到 pjgoiot_restoretest：
                                 schema_migrations version=7 dirty=f
                                 users=104 user_devices=267 readings=248 change_log=495 pairing_codes=2
+                                （对应备份快照；之后源库因测试写入变为 108/277/260/513/2）
 保留策略                      → RETENTION_DAYS=1 删除 10 天前的假备份
 ```
 

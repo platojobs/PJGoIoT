@@ -800,7 +800,7 @@ seed 数据来源与边界：
 | v0.7.0 compose 静态解析 | **已验证**：`docker compose config --quiet`（Docker Compose v5.7.0）退出码 0 |
 | v0.7.0 Caddyfile 语法 | **已验证**：`caddy:2.8-alpine caddy validate` 输出 `Valid configuration`，`caddy fmt --diff` 无差异 |
 | v0.7.0 YAML / 脚本静态校验 | **已验证**：Ruby YAML 解析 4 个文件通过；`bash -n deploy/scripts/*.sh` 通过 |
-| v0.7.0 备份/恢复演练 | **已验证**：`backup.sh` 产出 67 999 字节 `.dump.gz` + `.sha256`；`restore.sh` 无 `--confirm` 退出 2、校验和损坏退出 1；恢复到临时库后 `version=7 dirty=f`，行数摘要与源库一致；保留策略已删除 10 天前的假备份 |
+| v0.7.0 备份/恢复演练 | **已验证**：`backup.sh` 产出 67 999 字节 `.dump.gz` + `.sha256`；`restore.sh` 无 `--confirm` 退出 2、校验和损坏退出 1；恢复到临时库后 `version=7 dirty=f`，行数摘要 `104/267/248/495/2` 对应备份快照（之后源库因测试写入变为 `108/277/260/513/2`，属正常）；保留策略已删除 10 天前的假备份 |
 | v0.7.0 完整 `docker compose up` | **未验证**：本机未实际启动 api/postgres/caddy 全栈，也未验证 Caddy 自签 HTTPS 与 ACME |
 | `promtool check rules` | **未执行**：本机无 `promtool`，告警规则仅做 YAML 结构 + 字段完整性校验，未做 PromQL 语义校验 |
 | `shellcheck` / `shfmt` | **未执行**：本机未安装，仅 `bash -n`；CI 中若 runner 自带则执行 |
