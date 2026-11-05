@@ -12,36 +12,38 @@ import (
 
 // Config 是 API 服务的全部运行时配置。
 type Config struct {
-	Addr               string
-	StoreBackend       string // fixture 或 postgres
-	DatabaseURL        string
-	FixturesDir        string
-	RateLimitPerMin    int
-	RateLimitBurst     int
-	PairingClaimPerMin int
-	PairingClaimBurst  int
-	MetricsEnabled     bool
-	CORSAllowedOrigins []string
-	LogLevel           slog.Level
-	ShutdownTimeout    time.Duration
-	Version            string
+	Addr                string
+	StoreBackend        string // fixture 或 postgres
+	DatabaseURL         string
+	FixturesDir         string
+	RateLimitPerMin     int
+	RateLimitBurst      int
+	PairingClaimPerMin  int
+	PairingClaimBurst   int
+	MetricsEnabled      bool
+	RunMigrationsOnBoot bool
+	CORSAllowedOrigins  []string
+	LogLevel            slog.Level
+	ShutdownTimeout     time.Duration
+	Version             string
 }
 
 // Load 读取环境变量并返回配置。默认不连接数据库，直接使用 fixtures，便于快速启动。
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:               getEnv("ADDR", ":8080"),
-		StoreBackend:       strings.ToLower(getEnv("STORE", "")),
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		FixturesDir:        getEnv("FIXTURES_DIR", "./fixtures"),
-		RateLimitPerMin:    getEnvInt("RATE_LIMIT_PER_MINUTE", 120),
-		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 40),
-		PairingClaimPerMin: getEnvInt("PAIRING_CLAIM_RATE_PER_MINUTE", 20),
-		PairingClaimBurst:  getEnvInt("PAIRING_CLAIM_BURST", 10),
-		MetricsEnabled:     getEnvBool("METRICS_ENABLED", true),
-		LogLevel:           parseLogLevel(getEnv("LOG_LEVEL", "info")),
-		ShutdownTimeout:    10 * time.Second,
-		Version:            getEnv("APP_VERSION", "0.6.0"),
+		Addr:                getEnv("ADDR", ":8080"),
+		StoreBackend:        strings.ToLower(getEnv("STORE", "")),
+		DatabaseURL:         os.Getenv("DATABASE_URL"),
+		FixturesDir:         getEnv("FIXTURES_DIR", "./fixtures"),
+		RateLimitPerMin:     getEnvInt("RATE_LIMIT_PER_MINUTE", 120),
+		RateLimitBurst:      getEnvInt("RATE_LIMIT_BURST", 40),
+		PairingClaimPerMin:  getEnvInt("PAIRING_CLAIM_RATE_PER_MINUTE", 20),
+		PairingClaimBurst:   getEnvInt("PAIRING_CLAIM_BURST", 10),
+		MetricsEnabled:      getEnvBool("METRICS_ENABLED", true),
+		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
+		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
+		ShutdownTimeout:     10 * time.Second,
+		Version:             getEnv("APP_VERSION", "0.7.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")

@@ -90,7 +90,7 @@ func (s *Server) accessLog() gin.HandlerFunc {
 			s.log.Error("http request", attrs...)
 			return
 		}
-		if c.Request.URL.Path == "/api/v1/health" {
+		if c.Request.URL.Path == "/api/v1/health" || c.Request.URL.Path == "/healthz" {
 			s.log.Debug("http request", attrs...)
 			return
 		}
@@ -137,7 +137,7 @@ func (s *Server) rateLimit() gin.HandlerFunc {
 	}
 	return func(c *gin.Context) {
 		// 健康探针与指标端点不应被业务限流误伤。
-		if c.Request.URL.Path == "/api/v1/health" || c.Request.URL.Path == "/metrics" {
+		if c.Request.URL.Path == "/api/v1/health" || c.Request.URL.Path == "/healthz" || c.Request.URL.Path == "/metrics" {
 			c.Next()
 			return
 		}

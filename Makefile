@@ -1,5 +1,5 @@
 GO ?= go
-APP_VERSION ?= 0.6.0
+APP_VERSION ?= 0.7.0
 DATABASE_URL ?= postgres://platojobs@127.0.0.1:5432/pjgoiot?sslmode=disable
 
 .PHONY: help dev dev-postgres test lint build migrate migrate-down migrate-version sqlc docker-build docker-up docker-down
@@ -39,7 +39,7 @@ sqlc: ## 重新生成 sqlc 代码（需先安装 sqlc）
 docker-build: ## 构建 distroless 镜像
 	docker build --build-arg APP_VERSION=$(APP_VERSION) -t pjgoiot-api:$(APP_VERSION) .
 
-docker-up: ## 启动 Postgres + 迁移 + API
+docker-up: ## 启动 Caddy + API + Postgres（见 docs/runbook.md）
 	docker compose up --build
 
 docker-down: ## 停止并清理容器

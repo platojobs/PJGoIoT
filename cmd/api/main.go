@@ -17,6 +17,7 @@ import (
 
 	"github.com/platojobs/PJGoIoT/internal/config"
 	"github.com/platojobs/PJGoIoT/internal/httpapi"
+	migrateboot "github.com/platojobs/PJGoIoT/internal/migrate"
 	"github.com/platojobs/PJGoIoT/internal/store"
 	"github.com/platojobs/PJGoIoT/internal/store/fixture"
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
@@ -38,6 +39,24 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
+
+	// 启动迁移失败必须直接退出，不能以“半可用”状态对外提供服务。
+	if cfg.RunMigrationsOnBoot {
+		if cfg.StoreBackend != "postgres" {
+			logger.Warn("STORE 非 postgres，跳过启动迁移", "store", cfg.StoreBackend)
+		} else {
+			migrateCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			version, dirty, err := migrateboot.Up(migrateCtx, cfg.DatabaseURL)
+			cancel()
+			if err != nil {
+				logger.Error("启动迁移失败", "error", err)
+				os.Exit(1)
+			}
+			logger.Info("启动迁移完成", "version", version, "dirty", dirty)
+		}
+	} else {
+		logger.Info("已禁用启动迁移，需由外部任务保证数据库版本", "version", cfg.Version)
+	}
 
 	st, err := buildStore(cfg)
 	if err != nil {
@@ -110,7 +129,7 @@ func runHealthcheck() int {
 		if host == "" || strings.EqualFold(host, "0.0.0.0") {
 			host = "127.0.0.1"
 		}
-		addr = fmt.Sprintf("http://%s:%s/api/v1/health", host, port)
+		addr = fmt.Sprintf("http://%s:%s/healthz", host, port)
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}

@@ -329,6 +329,29 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestHealthzLiveness(t *testing.T) {
+	h := newHandler(t, 0)
+	rec := do(t, h, http.MethodGet, "/healthz", "", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/healthz status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Status  string `json:"status"`
+		Service string `json:"service"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析 /healthz 响应失败: %v", err)
+	}
+	if body.Status != "ok" || body.Service != "pjgoiot-api" {
+		t.Fatalf("liveness 响应不符合预期: %+v", body)
+	}
+	// 与 readiness 区分：/healthz 是根路径，/api/v1/health 才检查数据库。
+	if rec := do(t, h, http.MethodGet, "/healthz", "", "", nil); rec.Header().Get("X-Request-Id") == "" {
+		t.Fatal("liveness 响应缺少 X-Request-Id")
+	}
+}
+
 func TestMetricsBypassesRateLimit(t *testing.T) {
 	h := newHandler(t, 1)
 	if rec := do(t, h, http.MethodGet, "/api/v1/device-types", "", "", nil); rec.Code != http.StatusOK {
@@ -339,6 +362,9 @@ func TestMetricsBypassesRateLimit(t *testing.T) {
 	}
 	if rec := do(t, h, http.MethodGet, "/metrics", "", "", nil); rec.Code != http.StatusOK {
 		t.Fatalf("/metrics 被限流: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/healthz", "", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("/healthz 被限流: %d %s", rec.Code, rec.Body.String())
 	}
 }
 

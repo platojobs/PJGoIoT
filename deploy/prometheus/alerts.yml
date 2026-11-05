@@ -1,0 +1,71 @@
+# PJGoIoT Prometheus 告警规则样例。
+# 指标来自 `GET /metrics`（无需鉴权，建议仅内网抓取）。
+groups:
+  - name: pjgoiot-api
+    rules:
+      - alert: ApiHigh5xxRate
+        expr: |
+          sum(rate(pjgoiot_http_requests_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(pjgoiot_http_requests_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+        annotations:
+          summary: "API 5xx 比例超过 5%"
+          description: "近 5 分钟 5xx 请求占比 {{ $value | humanizePercentage }}，检查 API 日志中的 request_id 与 db_errors。"
+
+      - alert: ApiP95LatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(pjgoiot_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: pjgoiot-api
+        annotations:
+          summary: "API P95 延迟超过 2 秒"
+          description: "近 5 分钟 P95 延迟 {{ $value }}s，检查数据库慢查询、连接池与同步推送体积。"
+
+      - alert: ApiDBErrorsIncreasing
+        expr: increase(pjgoiot_db_errors_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+        annotations:
+          summary: "存储层错误计数增长"
+          description: "10 分钟内新增 {{ $value }} 次数据库/存储错误，检查 PostgreSQL 连接与迁移状态。"
+
+      - alert: ApiHealthCheckFailing
+        expr: probe_success{job="pjgoiot-api-health"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+        annotations:
+          summary: "readiness 探针失败"
+          description: "/api/v1/health 连续 2 分钟失败（blackbox probe_success=0），API 可能无法访问数据库。"
+
+      - alert: ApiRequestRateDroppedToZero
+        expr: sum(rate(pjgoiot_http_requests_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+        annotations:
+          summary: "请求量降为 0"
+          description: "5 分钟内没有收到任何请求，进程可能已退出、Caddy 上游异常或流量入口故障。"
+
+      - alert: ApiMetricsAbsent
+        expr: absent(pjgoiot_http_requests_total)
+        for: 5m
+        labels:
+          severity: critical
+          service: pjgoiot-api
+        annotations:
+          summary: "无法抓取 /metrics"
+          description: "指标序列完全缺失，通常意味着 API 进程不可用或 Prometheus 抓取失败（检查 METRICS_ENABLED 与网络）。"

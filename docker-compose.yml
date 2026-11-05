@@ -1,57 +1,125 @@
-# 本地开发用编排：PostgreSQL 16 + 迁移任务 + API 服务。
-# 仅用于本地验证，生产环境请自行管理数据库与密钥。
+# 生产形态编排：Caddy（HTTPS 终止/反代）→ API → PostgreSQL。
+# 本地默认 http://localhost 自动跳转 https://localhost（Caddy 自签证书）。
+# 说明：本文件已用 `docker compose config` 静态校验，但未在本机实际起服务（见 docs/runbook.md）。
+name: pjgoiot
+
 services:
-  db:
+  postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: pjgoiot
-      POSTGRES_PASSWORD: pjgoiot
-      POSTGRES_DB: pjgoiot
+      POSTGRES_USER: ${POSTGRES_USER:-pjgoiot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pjgoiot-local-only}
+      POSTGRES_DB: ${POSTGRES_DB:-pjgoiot}
+    # 仅绑定回环地址，避免数据库随宿主机公网暴露；容器内仍通过 backend 网络访问。
     ports:
-      - "55432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pjgoiot -d pjgoiot"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
-
-  migrate:
-    build:
-      context: .
-      args:
-        APP_VERSION: "0.6.0"
-    entrypoint: ["/migrate"]
-    command: ["-direction", "up"]
-    environment:
-      DATABASE_URL: postgres://pjgoiot:pjgoiot@db:5432/pjgoiot?sslmode=disable
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: "no"
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
 
   api:
     build:
       context: .
       args:
-        APP_VERSION: "0.6.0"
+        APP_VERSION: "0.7.0"
+    image: pjgoiot-api:0.7.0
+    restart: unless-stopped
     environment:
       STORE: postgres
-      DATABASE_URL: postgres://pjgoiot:pjgoiot@db:5432/pjgoiot?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
       ADDR: ":8080"
-      APP_VERSION: "0.6.0"
-      RATE_LIMIT_PER_MINUTE: "120"
-      RATE_LIMIT_BURST: "40"
-      CORS_ALLOWED_ORIGINS: "*"
-      LOG_LEVEL: info
-    ports:
-      - "8080:8080"
+      APP_VERSION: "0.7.0"
+      # 启动即迁移；迁移失败进程退出，不会以旧 schema 半可用运行。
+      RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
+      RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-120}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-40}"
+      PAIRING_CLAIM_RATE_PER_MINUTE: "${PAIRING_CLAIM_RATE_PER_MINUTE:-20}"
+      PAIRING_CLAIM_BURST: "${PAIRING_CLAIM_BURST:-10}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # /metrics 仅在容器网络内可达；Caddy 显式拒绝公网访问该路径。
+      METRICS_ENABLED: "${METRICS_ENABLED:-true}"
+      # 健康检查走 readiness（含数据库 Ping）；镜像默认 liveness 为 /healthz。
+      HEALTHCHECK_URL: "http://127.0.0.1:8080/api/v1/health"
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+    # 不发布 8080 到宿主机：所有外部流量必须经 Caddy（HTTPS + 安全头）。
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+      - edge
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    environment:
+      # 本地默认 localhost（自签）；生产改为真实域名并替换 deploy/Caddyfile 的 tls internal。
+      DOMAIN: "${DOMAIN:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+
+  # 读数 90 天清理 + 过期配对码清理。默认不启动，按日执行：
+  #   docker compose --profile maintenance run --rm cleanup
+  cleanup:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      args:
+        APP_VERSION: "0.7.0"
+    image: pjgoiot-api:0.7.0
+    entrypoint: ["/cleanup"]
+    command: ["-retention-days", "${READING_RETENTION_DAYS:-90}"]
+    environment:
+      STORE: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
 
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  # 数据库只在内部网络可达，不接公网。
+  backend:
+    internal: true
+  edge:

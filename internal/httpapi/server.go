@@ -49,6 +49,8 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	api := r.Group("/api/v1")
 
 	api.GET("/health", s.handleHealth)
+	// /healthz 仅用于 liveness：只证明进程在跑，不访问数据库；readiness 必须用 /api/v1/health。
+	r.GET("/healthz", s.handleLiveness)
 
 	authGroup := api.Group("/auth")
 	authGroup.POST("/anonymous", s.handleAnonymous)
@@ -93,6 +95,17 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	})
 }
 
+// handleLiveness 是存活探针：只检查进程能响应，不 touch 数据库。
+func (s *Server) handleLiveness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"service": "pjgoiot-api",
+		"version": s.cfg.Version,
+		"time":    time.Now().UTC(),
+	})
+}
+
+// handleHealth 是就绪探针：数据库 Ping 失败返回 503。
 func (s *Server) handleHealth(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()

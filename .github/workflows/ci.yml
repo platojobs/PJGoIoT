@@ -67,3 +67,78 @@ jobs:
 
       - name: docker build（不推送）
         run: docker build -t pjgoiot-api:ci .
+
+  # 只在 push 时运行；不依赖 Docker 守护进程（compose 仅做静态解析）。
+  lint-configs:
+    name: 配置与脚本校验
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 YAML 与编排关键约束
+        run: |
+          ruby -ryaml <<'RUBY'
+          files = %w[docker-compose.yml deploy/prometheus/alerts.yml deploy/prometheus/scrape.yml]
+          files.each do |f|
+            YAML.load_file(f)
+            puts "YAML ok: #{f}"
+          end
+
+          compose = YAML.load_file('docker-compose.yml')
+          %w[api postgres caddy].each do |svc|
+            abort "compose 缺少服务: #{svc}" unless compose.fetch('services').key?(svc)
+          end
+          api = compose['services']['api']
+          abort 'api 未等待 postgres 健康' unless api.dig('depends_on', 'postgres', 'condition') == 'service_healthy'
+          abort 'api 未启用只读文件系统' unless api['read_only'] == true
+          abort 'caddy 未暴露 443' unless compose['services']['caddy']['ports'].map(&:to_s).any? { |p| p.include?('443') }
+          abort 'cleanup 未使用 maintenance profile' unless compose['services']['cleanup']['profiles'].include?('maintenance')
+
+          alerts = YAML.load_file('deploy/prometheus/alerts.yml')
+          rules = alerts.fetch('groups').flat_map { |g| g.fetch('rules') }
+          abort "告警规则少于 5 条: #{rules.size}" if rules.size < 5
+          rules.each do |r|
+            abort "规则缺少 alert/expr: #{r.inspect}" unless r['alert'] && r['expr']
+            abort "规则缺少 for: #{r['alert']}" unless r['for'] && r['labels'] && r['annotations']
+          end
+          puts "alerts ok: #{rules.size} rules"
+          RUBY
+
+      - name: 脚本语法与 shellcheck
+        run: |
+          set -euo pipefail
+          for f in deploy/scripts/backup.sh deploy/scripts/restore.sh; do
+            bash -n "$f"
+            echo "bash -n ok: $f"
+          done
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -x deploy/scripts/backup.sh deploy/scripts/restore.sh
+            echo "shellcheck ok"
+          else
+            echo "shellcheck 不可用，仅执行 bash -n（未安装时不伪造通过）"
+          fi
+          if command -v shfmt >/dev/null 2>&1; then
+            shfmt -d deploy/scripts/backup.sh deploy/scripts/restore.sh
+            echo "shfmt ok"
+          else
+            echo "shfmt 不可用，跳过格式检查"
+          fi
+
+      - name: compose 静态解析（不依赖守护进程）
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            docker compose config --quiet
+            echo "docker compose config ok"
+          else
+            echo "docker compose 不可用，跳过（YAML 结构已由 ruby 校验）"
+          fi
+
+      - name: Prometheus 规则校验
+        run: |
+          if command -v promtool >/dev/null 2>&1; then
+            promtool check rules deploy/prometheus/alerts.yml
+            echo "promtool ok"
+          else
+            echo "promtool 不可用，跳过；规则 YAML 结构已在前面校验（未做语义校验）"
+          fi

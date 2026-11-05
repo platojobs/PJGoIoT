@@ -1,0 +1,32 @@
+# Caddy：HTTPS 终止 + 反向代理。域名由 compose 的 DOMAIN 环境变量注入。
+# 本地默认 DOMAIN=localhost，使用 Caddy 内置 CA 自签证书（浏览器会提示不受信任）。
+# 生产：把 `tls internal` 改为 `tls <你的邮箱>`，并把 DOMAIN 设为真实域名（需 80/443 可达）。
+{$DOMAIN:localhost} {
+	tls internal
+
+	encode zstd gzip
+
+	# 指标端点不对外：只允许容器内网/Prometheus 抓取。即使 API 开启 METRICS_ENABLED 也不会被公网读到。
+	@metrics path /metrics
+	respond @metrics "not found" 404
+
+	# 基础安全头；API 自身也有限流与鉴权。
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	reverse_proxy api:8080 {
+		health_uri /healthz
+		health_interval 30s
+		health_timeout 3s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
