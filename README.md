@@ -1279,7 +1279,7 @@ seed 数据来源与边界：
 | v0.13.0 房间整段重排 | 通过：`PUT /households/{id}/rooms/order` 写 `0..n-1`；缺项/多项/重复 id → 409 `CONFLICT`；事务内 `FOR UPDATE` 行锁串行化并发重排；`GET /households` 的 `roomCount` 随之更新 |
 | v0.13.0 迁移 000012 | 通过（真实 PostgreSQL，临时库）：`up → down → up`；`household_invitations.id` 列与 `household_invitations_id_idx` / `household_invitations_active_idx` 可正确增删 |
 | v0.13.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.9.0** |
-| v0.13.0 CI | 通过：GitHub Actions 全绿，`构建与测试` 内 `OpenAPI 契约校验` 步骤实际执行（run id 见下节发布记录） |
+| v0.13.0 CI | 通过：GitHub Actions [run 42042030047](https://github.com/platojobs/PJGoIoT/actions/runs/42042030047)，`构建与测试`、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）` 全绿；`构建与测试` 中 `OpenAPI 契约校验` 步骤实际执行并通过，`Postgres 集成测试` 正则已包含 `TestHouseholdManagementPostgres`（commit `3f5380f`） |
 | v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |

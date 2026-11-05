@@ -53,7 +53,7 @@
 | v0.13.0 房间整段重排 | **已验证** | `PUT /households/{id}/rooms/order` 成功写 0..n-1；缺项/多项/重复 id → 409 `CONFLICT`；事务内 `FOR UPDATE` 行锁；`GET /households` 的 `roomCount` 同步 |
 | v0.13.0 迁移 000012 | **已验证** | 临时库 `up → down → up`：`household_invitations.id` 列与两个索引可正确增删，回填结果一致 |
 | v0.13.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.9.0 |
-| v0.13.0 CI | **已验证** | GitHub Actions 全绿，`构建与测试` 内 `OpenAPI 契约校验` 步骤实际执行（见 README「发布流程与 tag 纪律」） |
+| v0.13.0 CI | **已验证** | GitHub Actions [run 42042030047](https://github.com/platojobs/PJGoIoT/actions/runs/42042030047) 全绿；`构建与测试` 中 `OpenAPI 契约校验` 步骤实际执行并通过，`Postgres 集成测试` 正则含 `TestHouseholdManagementPostgres` |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
