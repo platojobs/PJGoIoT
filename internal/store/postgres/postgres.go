@@ -213,6 +213,18 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expir
 	if err := q.CreateToken(ctx, sqlcgen.CreateTokenParams{UserID: userID, TokenHash: tokenHash, ExpiresAt: expiresAt.UTC()}); err != nil {
 		return "", fmt.Errorf("写入 token 失败: %w", err)
 	}
+	// 每个用户创建时自动获得一个个人家庭「我的家」，设备默认归属这里。
+	householdID := uuid.New()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO households (id, name, owner_user_id, is_personal) VALUES ($1, '我的家', $2, true)`,
+		householdID, userID); err != nil {
+		return "", fmt.Errorf("创建个人家庭失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO household_members (household_id, user_id, role) VALUES ($1, $2, 'owner')`,
+		householdID, userID); err != nil {
+		return "", fmt.Errorf("写入个人家庭成员失败: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("提交事务失败: %w", err)
 	}
@@ -275,14 +287,24 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 			vendor        sql.NullString
 			firmware      sql.NullString
 			compatibility []byte
+			householdID   uuid.NullUUID
+			roomID        uuid.NullUUID
 		)
 		if err := rows.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &mac, &d.Alias,
 			&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
-			&deviceType, &vendor, &firmware, &compatibility); err != nil {
+			&deviceType, &vendor, &firmware, &compatibility, &householdID, &roomID); err != nil {
 			return nil, fmt.Errorf("解析用户设备失败: %w", err)
 		}
 		if mac.Valid {
 			d.MAC = mac.String
+		}
+		if householdID.Valid {
+			v := householdID.UUID.String()
+			d.HouseholdID = &v
+		}
+		if roomID.Valid {
+			v := roomID.UUID.String()
+			d.RoomID = &v
 		}
 		if deviceType.Valid && deviceType.String != "" {
 			v := deviceType.String
@@ -318,11 +340,14 @@ SELECT d.id, d.client_id, d.platform, d.external_id, d.mac, d.alias, d.advertise
        CASE
          WHEN pd.compatibility IS NOT NULL AND pd.compatibility <> '{}'::jsonb THEN pd.compatibility
          WHEN dt.compatibility IS NOT NULL THEN dt.compatibility
-       END AS resolved_compatibility
+       END AS resolved_compatibility,
+       d.household_id, d.room_id
 FROM user_devices d
 LEFT JOIN public_devices pd ON pd.mac = lower(d.mac)
 LEFT JOIN device_types dt ON dt.type = COALESCE(NULLIF(d.device_type, ''), pd.device_type)
-WHERE d.user_id = $1 AND d.deleted_at IS NULL
+WHERE d.deleted_at IS NULL
+  AND (d.user_id = $1 OR d.household_id IN (
+        SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1))
 ORDER BY d.updated_at DESC, d.id`
 
 // GetUserDevice 实现 store.Store。
@@ -331,14 +356,17 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 	if err != nil {
 		return model.UserDevice{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	row, err := s.q.GetUserDeviceByMAC(ctx, sqlcgen.GetUserDeviceByMACParams{UserID: uid, Mac: nullableString(mac)})
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.UserDevice{}, store.ErrNotFound
-		}
-		return model.UserDevice{}, fmt.Errorf("查询用户设备失败: %w", err)
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, visibleDeviceSelectSQL+` AND d.mac = $2 LIMIT 1`, uid, mac)
+	d, err := scanVisibleDevice(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.UserDevice{}, store.ErrNotFound
 	}
-	return s.enrichUserDevice(ctx, s.q, mapUserDevice(row)), nil
+	if err != nil {
+		return model.UserDevice{}, err
+	}
+	return s.enrichUserDevice(ctx, s.q, d), nil
 }
 
 // GetUserDeviceByKey 实现 store.Store。
@@ -347,16 +375,57 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 	if err != nil {
 		return model.UserDevice{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	row, err := s.q.GetUserDeviceByKey(ctx, sqlcgen.GetUserDeviceByKeyParams{
-		UserID: uid, Platform: platform, ExternalID: externalID,
-	})
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.UserDevice{}, store.ErrNotFound
-		}
-		return model.UserDevice{}, fmt.Errorf("查询用户设备失败: %w", err)
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, visibleDeviceSelectSQL+` AND d.platform = $2 AND d.external_id = $3 LIMIT 1`,
+		uid, platform, externalID)
+	d, err := scanVisibleDevice(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.UserDevice{}, store.ErrNotFound
 	}
-	return s.enrichUserDevice(ctx, s.q, mapUserDevice(row)), nil
+	if err != nil {
+		return model.UserDevice{}, err
+	}
+	return s.enrichUserDevice(ctx, s.q, d), nil
+}
+
+// visibleDeviceSelectSQL 的可见范围是「本人设备 + 自己是成员的家庭内设备」。
+const visibleDeviceSelectSQL = `
+SELECT d.id, d.client_id, d.platform, d.external_id, COALESCE(d.mac, ''), d.alias, d.advertised_name,
+       d."group", d.rules, d.scan_records, d.updated_at, d.server_seq, d.device_type,
+       d.household_id, d.room_id
+FROM user_devices d
+WHERE d.deleted_at IS NULL
+  AND (d.user_id = $1 OR d.household_id IN (
+        SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1))`
+
+type deviceScanner interface{ Scan(dest ...any) error }
+
+func scanVisibleDevice(row deviceScanner) (model.UserDevice, error) {
+	var (
+		d           model.UserDevice
+		deviceType  sql.NullString
+		householdID uuid.NullUUID
+		roomID      uuid.NullUUID
+	)
+	if err := row.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &d.MAC, &d.Alias,
+		&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
+		&deviceType, &householdID, &roomID); err != nil {
+		return model.UserDevice{}, err
+	}
+	if deviceType.Valid && deviceType.String != "" {
+		v := deviceType.String
+		d.DeviceType = &v
+	}
+	if householdID.Valid {
+		v := householdID.UUID.String()
+		d.HouseholdID = &v
+	}
+	if roomID.Valid {
+		v := roomID.UUID.String()
+		d.RoomID = &v
+	}
+	return d, nil
 }
 
 // pushTimeout 是单次 push 的总预算。连接池耗尽时请求会排队，超过预算即返回
@@ -423,6 +492,11 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 	}
 
 	now := time.Now().UTC()
+	// 新设备默认进入 owner 的个人家庭；已有设备保留原家庭与房间（PATCH 才能改归属）。
+	personalID, err := personalHouseholdID(ctx, tx, uid)
+	if err != nil {
+		return model.PushResult{}, false, err
+	}
 	result := model.PushResult{Applied: []model.AppliedChange{}, Conflicts: []model.Conflict{}}
 
 	// 第一遍：规范化设备键，并批量加载公共元数据与已存设备，避免逐设备查询。
@@ -525,6 +599,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			continue
 		}
 
+		personalIDStr := personalID.String()
 		record := model.UserDevice{
 			ID:             dev.ID,
 			ClientID:       req.ClientID,
@@ -537,6 +612,12 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			Rules:          dev.Rules,
 			ScanRecords:    dev.ScanRecords,
 			UpdatedAt:      decision.EffectiveUpdatedAt,
+			HouseholdID:    &personalIDStr,
+		}
+		// 已存设备沿用归属；历史数据缺失家庭时回落到个人家庭。
+		if existing != nil && existing.HouseholdID != nil {
+			record.HouseholdID = existing.HouseholdID
+			record.RoomID = existing.RoomID
 		}
 		var deletedAt sql.NullTime
 		if dev.Deleted {
@@ -590,7 +671,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		}
 	}
 
-	next, err := q.GetMaxSeqForUser(ctx, uid)
+	next, err := maxVisibleChangeSeq(ctx, tx, uid)
 	if err != nil {
 		return model.PushResult{}, false, fmt.Errorf("查询同步游标失败: %w", err)
 	}
@@ -743,7 +824,8 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 		args = append(args, ext)
 	}
 	query := `SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at,
-		deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name
+		deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name,
+		household_id, room_id
 		FROM user_devices
 		WHERE user_id = $1 AND (id IN (` + buildIN(2, len(ids)) + `) OR external_id IN (` +
 		buildIN(2+len(ids), len(exts)) + `))`
@@ -753,13 +835,26 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var row sqlcgen.UserDevice
+		var (
+			row         sqlcgen.UserDevice
+			householdID uuid.NullUUID
+			roomID      uuid.NullUUID
+		)
 		if err := rows.Scan(&row.UserID, &row.ID, &row.ClientID, &row.Mac, &row.Alias, &row.Group,
 			&row.Rules, &row.ScanRecords, &row.UpdatedAt, &row.DeletedAt, &row.ServerSeq,
-			&row.CreatedAt, &row.Platform, &row.ExternalID, &row.DeviceType, &row.AdvertisedName); err != nil {
+			&row.CreatedAt, &row.Platform, &row.ExternalID, &row.DeviceType, &row.AdvertisedName,
+			&householdID, &roomID); err != nil {
 			return nil, nil, fmt.Errorf("解析已存设备失败: %w", err)
 		}
 		d := mapUserDevice(row)
+		if householdID.Valid {
+			v := householdID.UUID.String()
+			d.HouseholdID = &v
+		}
+		if roomID.Valid {
+			v := roomID.UUID.String()
+			d.RoomID = &v
+		}
 		byID[d.ID] = &d
 		byKey[d.Platform+"|"+d.ExternalID] = &d
 	}
@@ -882,6 +977,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 				uid, devID, clientID, nullableString(p.dev.MAC), p.record.Alias, p.record.Group,
 				p.record.Rules, p.record.ScanRecords, p.record.UpdatedAt, p.deletedAt, seqs[i],
 				p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.DeviceType), p.record.AdvertisedName,
+				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
 			})
 			continue
 		}
@@ -890,6 +986,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 				devID, clientID, p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.MAC),
 				p.record.Alias, p.record.Group, p.record.Rules, p.record.ScanRecords,
 				p.record.UpdatedAt, p.deletedAt, seqs[i], nullableString(p.dev.DeviceType), p.record.AdvertisedName,
+				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
 			})
 			continue
 		}
@@ -901,12 +998,14 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 		res, err := db.ExecContext(ctx, `UPDATE user_devices SET
 			id = $1, client_id = $2, platform = $3, external_id = $4, mac = $5, alias = $6,
 			"group" = $7, rules = $8, scan_records = $9, updated_at = $10, deleted_at = $11,
-			server_seq = $12, device_type = $13, advertised_name = $14
-			WHERE user_id = $15 AND id = $16`,
+			server_seq = $12, device_type = $13, advertised_name = $14,
+			household_id = $15, room_id = $16
+			WHERE user_id = $17 AND id = $18`,
 			devID, clientID, p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.MAC),
 			p.record.Alias, p.record.Group, p.record.Rules, p.record.ScanRecords,
 			p.record.UpdatedAt, p.deletedAt, seqs[i], nullableString(p.dev.DeviceType),
-			p.record.AdvertisedName, uid, oldID)
+			p.record.AdvertisedName, nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
+			uid, oldID)
 		if err != nil {
 			return fmt.Errorf("写入用户设备失败: %w", err)
 		}
@@ -945,7 +1044,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 		if err != nil {
 			return fmt.Errorf("序列化变更记录失败: %w", err)
 		}
-		logRows = append(logRows, []any{seqs[i], uid, "user_device", p.entityID, p.op, payload, time.Now().UTC()})
+		logRows = append(logRows, []any{seqs[i], uid, nullableUUID(p.record.HouseholdID), "user_device", p.entityID, p.op, payload, time.Now().UTC()})
 	}
 	logged, err := insertChangeLogBatch(ctx, db, logRows)
 	if err != nil {
@@ -959,7 +1058,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 
 const listUserDevicesInsertSQL = `INSERT INTO user_devices
 	(user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at,
-	 server_seq, platform, external_id, device_type, advertised_name)
+	 server_seq, platform, external_id, device_type, advertised_name, household_id, room_id)
 VALUES %s ON CONFLICT (user_id, platform, external_id) DO NOTHING`
 
 const listUserDevicesUpdateSQL = `UPDATE user_devices AS d SET
@@ -967,19 +1066,20 @@ const listUserDevicesUpdateSQL = `UPDATE user_devices AS d SET
 	"group" = v.group_name, rules = v.rules, scan_records = v.scan_records,
 	updated_at = v.updated_at, deleted_at = v.deleted_at, server_seq = v.server_seq,
 	device_type = v.device_type, advertised_name = v.advertised_name,
-	client_id = v.client_id
+	client_id = v.client_id, household_id = v.household_id, room_id = v.room_id
 FROM (VALUES %s) AS v(id, client_id, platform, external_id, mac, alias, group_name, rules,
-	scan_records, updated_at, deleted_at, server_seq, device_type, advertised_name)
+	scan_records, updated_at, deleted_at, server_seq, device_type, advertised_name,
+	household_id, room_id)
 WHERE d.user_id = $1 AND d.id = v.id`
 
-const changeLogInsertSQL = `INSERT INTO change_log (seq, user_id, entity, entity_id, op, payload, server_ts)
+const changeLogInsertSQL = `INSERT INTO change_log (seq, user_id, household_id, entity, entity_id, op, payload, server_ts)
 VALUES %s`
 
-var insertDeviceCasts = []string{"uuid", "uuid", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "text", "text"}
+var insertDeviceCasts = []string{"uuid", "uuid", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "text", "text", "uuid", "uuid"}
 
-var updateDeviceCasts = []string{"uuid", "text", "text", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text"}
+var updateDeviceCasts = []string{"uuid", "text", "text", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "uuid", "uuid"}
 
-var changeLogCasts = []string{"bigint", "uuid", "text", "text", "text", "jsonb", "timestamptz"}
+var changeLogCasts = []string{"bigint", "uuid", "uuid", "text", "text", "text", "jsonb", "timestamptz"}
 
 func insertDevicesBatch(ctx context.Context, db *sql.Tx, rows [][]any) (int64, error) {
 	if len(rows) == 0 {
@@ -1058,7 +1158,10 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	// 静默返回空页会让客户端永久丢数据，因此返回 ErrCursorExpired。
 	// cursor=0 表示客户端从未同步过，此时从头拉取剩余变更即可，不构成数据缺口。
 	var minSeq sql.NullInt64
-	if err := s.db.QueryRowContext(qctx, `SELECT MIN(seq) FROM change_log WHERE user_id = $1`, uid).Scan(&minSeq); err != nil {
+	if err := s.db.QueryRowContext(qctx, `
+		SELECT MIN(c.seq) FROM change_log c
+		WHERE c.user_id = $1 OR c.household_id IN (
+			SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1)`, uid).Scan(&minSeq); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return model.ChangesPage{}, store.ErrTimeout
 		}
@@ -1067,26 +1170,39 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	if cursor > 0 && minSeq.Valid && cursor < minSeq.Int64-1 {
 		return model.ChangesPage{}, store.ErrCursorExpired
 	}
-	// 多取一条用于判断 hasMore。
-	rows, err := s.q.ListChanges(qctx, sqlcgen.ListChangesParams{
-		UserID: uid, Seq: cursor, Limit: int32(limit + 1),
-	})
+	rows, err := s.db.QueryContext(qctx, `
+		SELECT c.seq, c.entity, c.entity_id, c.op, c.payload, c.server_ts
+		FROM change_log c
+		WHERE (c.user_id = $1 OR c.household_id IN (
+			SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1))
+		  AND c.seq > $2
+		ORDER BY c.seq
+		LIMIT $3`, uid, cursor, limit+1)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return model.ChangesPage{}, store.ErrTimeout
 		}
 		return model.ChangesPage{}, fmt.Errorf("查询增量变更失败: %w", err)
 	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
+	defer rows.Close()
+	changes := []model.Change{}
+	for rows.Next() {
+		var ch model.Change
+		if err := rows.Scan(&ch.Seq, &ch.Entity, &ch.EntityID, &ch.Op, &ch.Payload, &ch.ServerTS); err != nil {
+			return model.ChangesPage{}, fmt.Errorf("解析增量变更失败: %w", err)
+		}
+		changes = append(changes, ch)
 	}
-	page := model.ChangesPage{Changes: make([]model.Change, 0, len(rows)), NextCursor: cursor, HasMore: hasMore}
-	for _, row := range rows {
-		page.Changes = append(page.Changes, model.Change{
-			Seq: row.Seq, Entity: row.Entity, EntityID: row.EntityID,
-			Op: row.Op, Payload: row.Payload, ServerTS: row.ServerTs,
-		})
+	if err := rows.Err(); err != nil {
+		return model.ChangesPage{}, fmt.Errorf("遍历增量变更失败: %w", err)
+	}
+	hasMore := len(changes) > limit
+	if hasMore {
+		changes = changes[:limit]
+	}
+	page := model.ChangesPage{Changes: make([]model.Change, 0, len(changes)), NextCursor: cursor, HasMore: hasMore}
+	for _, row := range changes {
+		page.Changes = append(page.Changes, row)
 		page.NextCursor = row.Seq
 	}
 	return page, nil
@@ -1138,6 +1254,31 @@ func nullableString(v string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: v, Valid: true}
+}
+
+// nullableUUID 把可空字符串形式的 UUID 转成数据库可写入的值。
+func nullableUUID(v *string) any {
+	if v == nil || *v == "" {
+		return nil
+	}
+	id, err := uuid.Parse(*v)
+	if err != nil {
+		return nil
+	}
+	return id
+}
+
+// maxVisibleChangeSeq 返回用户可见范围内的最大 change_log seq（含共享家庭）。
+func maxVisibleChangeSeq(ctx context.Context, db rowQueryer, uid uuid.UUID) (int64, error) {
+	var seq int64
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(c.seq), 0) FROM change_log c
+		WHERE c.user_id = $1 OR c.household_id IN (
+			SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1)`, uid).Scan(&seq)
+	if err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 func mapUserDevice(row sqlcgen.UserDevice) model.UserDevice {

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.7.0
+  version: 0.8.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -26,6 +26,9 @@ info:
       `/me/export` 导出账号全部数据（读数按 `recordedAt` 升序、游标分页），`DELETE /me` 硬删除账号及全部关联数据；
       `/metrics` 提供 Prometheus 文本指标（无需鉴权，可用 `METRICS_ENABLED=false` 关闭）。
       所有响应带 `X-Request-Id`（客户端可透传，服务端原样回写）。
+    - 自 `0.12.0` 起引入家庭（household）模型：每个账号自动拥有一个不可删除的个人家庭「我的家」，
+      可创建共享家庭、邀请成员、划分房间；家庭成员可读家庭内全部设备与读数，写权限按角色区分。
+      跨家庭访问一律 404，不泄露资源是否存在。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -39,6 +42,7 @@ tags:
   - name: metadata
   - name: user
   - name: sync
+  - name: household
 
 paths:
   /health:
@@ -424,7 +428,11 @@ paths:
     get:
       tags: [user]
       operationId: listMyDevices
-      summary: 当前用户的设备列表（不含已删除）
+      summary: 当前用户可见的设备列表（不含已删除）
+      description: |
+        返回本人拥有的设备，以及本人所在家庭内其他成员共享的设备。
+        跨家庭设备不可见；`householdId`/`roomId` 为设备当前归属，未归属时为 null。
+        未分配（`roomId=null`）仅表示未放入任何房间。
       security:
         - bearerAuth: []
       responses:
@@ -502,6 +510,51 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [user]
+      operationId: patchMyDeviceMeta
+      summary: 更新设备别名、房间与家庭归属
+      description: |
+        仅设备 **owner** 可调用；家庭成员修改他人设备统一返回 404（不泄露设备存在性）。
+        三个字段均为三态：字段缺失 = 保持不变；空串 = 清除；非空值 = 覆盖。
+
+        - `alias`：去除首尾空白后最多 100 个字符；空串表示清空别名；
+        - `roomId`：必须是 UUID 或空串；房间必须属于目标家庭；
+        - `householdId`：必须是 UUID 或空串；空串表示回到 owner 的个人家庭。
+          移动到某个家庭要求调用者是该家庭成员；`roomId` 与 `householdId` 同时给出时，
+          房间必须属于目标家庭，否则返回 400。
+
+        变更会写入 `change_log`，共享家庭成员可在 `/sync/changes` 中看到。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ExternalId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceMetaPatch"
+            example:
+              alias: "客厅灯"
+              roomId: "6f2a9e4c-..."
+              householdId: "0d1f3b2a-..."
+      responses:
+        "200":
+          description: 更新成功，返回更新后的设备
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDevice"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices/{platform}/{externalId}/readings:
     get:
@@ -516,6 +569,7 @@ paths:
         - `metric` 可选，用于按指标过滤（必须是小写 snake_case）；
         - `from` / `to` 可选，RFC3339，闭区间过滤 `recordedAt`；
         - 越权、设备已删除或设备不存在统一返回 404；
+        - 家庭成员可读取共享家庭内设备的读数（自 0.12.0）；跨家庭仍返回 404；
         - 隐式设备（只在 push 中提交过读数、未在 `user_devices` 注册）在注册前查询返回 404。
       security:
         - bearerAuth: []
@@ -786,8 +840,12 @@ paths:
       operationId: getSyncChanges
       summary: 拉取自 cursor 之后的增量变更
       description: |
-        `change_log` 按 user_id 隔离，seq 单调递增。客户端保存 `nextCursor`，
-        下次携带该值继续拉取。`limit` 默认 100，范围 1-500。
+        `change_log` 的可见范围是「本人 + 本人所在家庭」，seq 全局单调递增。
+        客户端保存 `nextCursor`，下次携带该值继续拉取。`limit` 默认 100，范围 1-500。
+
+        家庭成员的设备变更（含别名/房间调整）对其他成员可见：`entityId` 由设备 owner 的 userId 派生，
+        因此同一条变更对不同成员呈现相同的 `entityId`。`push` 仍只匹配并写入**调用者本人**的设备行，
+        不会修改其他成员的记录；若两位成员各自扫描同一台物理设备，会产生两条独立记录（已知限制）。
 
         服务端只保留最近 90 天（`CHANGE_LOG_RETENTION_DAYS` 可配）的变更。
         若客户端 `cursor` 早于当前仍保留的最老 `seq`（即中间存在已被清理的行），
@@ -976,6 +1034,362 @@ paths:
                       code: UNAVAILABLE
                       message: "数据库暂不可用，请稍后重试"
 
+  /households:
+    get:
+      tags: [household]
+      operationId: listHouseholds
+      summary: 列出当前用户所在的家庭
+      description: |
+        包含自动创建的个人家庭（`personal=true`）。每项带当前用户在家庭中的角色、
+        成员数与家庭内设备数。个人家庭不可删除、不可退出。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Household"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+    post:
+      tags: [household]
+      operationId: createHousehold
+      summary: 创建家庭
+      description: 创建者自动成为 owner；名称去除首尾空白后 1–64 个字符。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdCreate"
+            example:
+              name: "老家"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Household"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /households/invitations/claim:
+    post:
+      tags: [household]
+      operationId: claimHouseholdInvitation
+      summary: 使用一次性邀请码加入家庭
+      description: |
+        邀请码为 8 位大写字母数字（不含 0/O/1/I），**一次性**、自签发起 10 分钟内有效。
+        服务端只保存 SHA-256 哈希；邀请码明文仅在签发响应中出现一次。
+
+        无效、过期、已使用、来源家庭已删除统一返回 **404**。
+        同一邀请码累计 5 次失败即作废；本接口同时受每 IP 限流（`429`）。
+        已经是该家庭成员时重复领取为幂等成功（`200`），不会重复计成员。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdInvitationClaim"
+            example:
+              code: "ABCD2345"
+      responses:
+        "200":
+          description: 加入成功，返回家庭视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Household"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /households/{id}:
+    get:
+      tags: [household]
+      operationId: getHousehold
+      summary: 查询家庭详情
+      description: 仅家庭成员可见；非成员与不存在统一返回 404。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Household"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [household]
+      operationId: renameHousehold
+      summary: 修改家庭名称
+      description: |
+        仅 owner 可调用；member 返回 **403 FORBIDDEN**，非成员返回 404。
+        名称去除首尾空白后 1–64 个字符。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdPatch"
+            example:
+              name: "新家名"
+      responses:
+        "200":
+          description: 更新成功，返回更新后的家庭视图
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Household"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [household]
+      operationId: deleteHousehold
+      summary: 删除家庭
+      description: |
+        仅 owner 可调用；个人家庭（`personal=true`）不可删除，返回 **403 FORBIDDEN**。
+        二次确认由客户端完成，服务端不要求额外参数。
+
+        删除的级联语义：
+        - 家庭成员、房间、未使用的邀请码随家庭级联删除；
+        - 家庭内每台设备回到**其各自 owner** 的个人家庭，`roomId` 置为 null，设备本身不删除；
+        - 家庭内变更历史保留，但 `household_id` 置空，成员不再能看到这些变更；
+        - 其他家庭与设备不受影响。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "204":
+          description: 删除成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /households/{id}/members:
+    get:
+      tags: [household]
+      operationId: listHouseholdMembers
+      summary: 列出家庭成员
+      description: 仅家庭成员可见；成员与 owner 均可读。返回结果不包含其他家庭的信息。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HouseholdMember"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /households/{id}/invitations:
+    post:
+      tags: [household]
+      operationId: createHouseholdInvitation
+      summary: 签发一次性家庭邀请码
+      description: |
+        仅 owner 可调用（member 返回 **403 FORBIDDEN**）。
+        邀请码为 8 位大写字母数字（不含 0/O/1/I），TTL 10 分钟；
+        服务端只保存 SHA-256 哈希，明文只在本次响应中出现一次。
+        签发新码不会使旧码失效（旧码仍按其自身 TTL 到期）。
+        本接口受每 IP 限流（`429`）；领取端 `POST /households/invitations/claim`
+        对同一邀请码累计 5 次失败即作废。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "201":
+          description: 签发成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HouseholdInvitation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /households/{id}/rooms:
+    get:
+      tags: [household]
+      operationId: listHouseholdRooms
+      summary: 列出家庭房间
+      description: 家庭成员均可读，按 `sortOrder`、`createdAt` 升序。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HouseholdRoom"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [household]
+      operationId: createHouseholdRoom
+      summary: 创建房间
+      description: 仅 owner 可调用；`sortOrder` 缺省为 0，允许范围 -10000..10000。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdRoomCreate"
+            example:
+              name: "客厅"
+              sortOrder: 1
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HouseholdRoom"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /households/{id}/rooms/{roomId}:
+    patch:
+      tags: [household]
+      operationId: updateHouseholdRoom
+      summary: 更新房间名称或排序
+      description: 仅 owner 可调用；`name`/`sortOrder` 至少提供一个，缺失字段保持不变。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+        - $ref: "#/components/parameters/RoomId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HouseholdRoomPatch"
+            example:
+              name: "主卧"
+              sortOrder: 2
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HouseholdRoom"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [household]
+      operationId: deleteHouseholdRoom
+      summary: 删除房间
+      description: 仅 owner 可调用；房间内设备的 `roomId` 置为 null，设备保留在家庭。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HouseholdId"
+        - $ref: "#/components/parameters/RoomId"
+      responses:
+        "204":
+          description: 删除成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /metrics:
     servers:
       - url: http://127.0.0.1:8080
@@ -1067,6 +1481,24 @@ components:
         type: string
         maxLength: 128
         example: E621E1F8-C36C-495A-93FC-0C247A3E6E5F
+    HouseholdId:
+      name: id
+      in: path
+      required: true
+      description: 家庭 UUID
+      schema:
+        type: string
+        format: uuid
+        example: 0d1f3b2a-4c5d-4e6f-8a9b-0c1d2e3f4a5b
+    RoomId:
+      name: roomId
+      in: path
+      required: true
+      description: 房间 UUID，必须属于路径中的家庭
+      schema:
+        type: string
+        format: uuid
+        example: 6f2a9e4c-7b8d-4c5e-9f01-2a3b4c5d6e7f
 
   responses:
     BadRequest:
@@ -1160,6 +1592,16 @@ components:
             error:
               code: INTERNAL
               message: "服务内部错误"
+    Forbidden:
+      description: 已确认资源存在，但当前角色无权执行该操作（如 member 修改家庭结构）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: FORBIDDEN
+              message: "没有操作权限"
 
   schemas:
     Error:
@@ -1178,6 +1620,7 @@ components:
                 - INVALID_MAC
                 - INVALID_JSON
                 - UNAUTHORIZED
+                - FORBIDDEN
                 - NOT_FOUND
                 - METHOD_NOT_ALLOWED
                 - CONFLICT
@@ -1388,6 +1831,16 @@ components:
         mac:
           type: string
           description: 可选 MAC 元数据；iOS 设备通常为空，不参与唯一约束
+        householdId:
+          type: string
+          format: uuid
+          nullable: true
+          description: 设备所属家庭；未归属任何家庭时省略（自 0.12.0）
+        roomId:
+          type: string
+          format: uuid
+          nullable: true
+          description: 设备所属房间；未分配房间或房间被删除时为 null（自 0.12.0）
         alias:
           type: string
           description: 用户设置的别名；不会因设备广播名变化而被覆盖
@@ -1944,3 +2397,158 @@ components:
           description: 下一页游标；`hasMore=false` 时为空串
         hasMore:
           type: boolean
+
+    Household:
+      type: object
+      required: [id, name, ownerUserId, role, personal, memberCount, deviceCount, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: 家庭名，1–64 字符
+        ownerUserId:
+          type: string
+          format: uuid
+          description: 家庭 owner 的 userId
+        role:
+          type: string
+          enum: [owner, member]
+          description: 当前调用者在该家庭中的角色
+        personal:
+          type: boolean
+          description: 是否为账号自动创建的个人家庭（不可删除）
+        memberCount:
+          type: integer
+          description: 家庭成员数（含 owner）
+        deviceCount:
+          type: integer
+          description: 当前归属该家庭且未删除的设备数
+        createdAt:
+          type: string
+          format: date-time
+
+    HouseholdMember:
+      type: object
+      required: [userId, role, kind, joinedAt]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, member]
+        kind:
+          type: string
+          enum: [anonymous, account]
+          description: 账号类型
+        joinedAt:
+          type: string
+          format: date-time
+
+    HouseholdRoom:
+      type: object
+      required: [id, householdId, name, sortOrder, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        householdId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: 房间名，1–64 字符
+        sortOrder:
+          type: integer
+          description: 排序值，越小越靠前（-10000..10000）
+        createdAt:
+          type: string
+          format: date-time
+
+    HouseholdInvitation:
+      type: object
+      required: [code, expiresAt]
+      properties:
+        code:
+          type: string
+          description: 8 位一次性邀请码；只在本次响应中出现
+          example: "ABCD2345"
+        expiresAt:
+          type: string
+          format: date-time
+          description: 到期时间（签发起 10 分钟）；过期后领取返回 404
+
+    HouseholdCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: 家庭名（去除首尾空白后校验）
+
+    HouseholdPatch:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: 新家庭名（去除首尾空白后校验）
+
+    HouseholdInvitationClaim:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          pattern: "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$"
+          description: 8 位邀请码，大小写不敏感（服务端会转大写并去除首尾空白）
+
+    HouseholdRoomCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        sortOrder:
+          type: integer
+          minimum: -10000
+          maximum: 10000
+          default: 0
+
+    HouseholdRoomPatch:
+      type: object
+      description: 至少提供 name 或 sortOrder；缺失字段保持不变
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        sortOrder:
+          type: integer
+          minimum: -10000
+          maximum: 10000
+
+    DeviceMetaPatch:
+      type: object
+      description: |
+        三个字段均为三态：缺失 = 不变，空串 = 清除，非空值 = 覆盖。
+        householdId 为空串表示回到 owner 的个人家庭。
+      properties:
+        alias:
+          type: string
+          maxLength: 100
+          description: 设备别名；空串表示清空
+        roomId:
+          type: string
+          description: 房间 UUID 或空串；房间必须属于目标家庭
+        householdId:
+          type: string
+          description: 家庭 UUID 或空串

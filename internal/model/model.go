@@ -92,6 +92,43 @@ type UserDevice struct {
 	Vendor          *string         `json:"vendor"`
 	FirmwareVersion *string         `json:"firmwareVersion"`
 	Compatibility   json.RawMessage `json:"compatibility"`
+	HouseholdID     *string         `json:"householdId"`
+	RoomID          *string         `json:"roomId"`
+}
+
+// Household 是家庭视图：role 为当前用户在家庭中的角色，counts 由服务端聚合。
+type Household struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	OwnerUserID string    `json:"ownerUserId"`
+	Role        string    `json:"role"`
+	Personal    bool      `json:"personal"`
+	MemberCount int       `json:"memberCount"`
+	DeviceCount int       `json:"deviceCount"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// HouseholdMember 是家庭成员视图。
+type HouseholdMember struct {
+	UserID   string    `json:"userId"`
+	Role     string    `json:"role"`
+	Kind     string    `json:"kind"`
+	JoinedAt time.Time `json:"joinedAt"`
+}
+
+// HouseholdRoom 是家庭内的房间。
+type HouseholdRoom struct {
+	ID          string    `json:"id"`
+	HouseholdID string    `json:"householdId"`
+	Name        string    `json:"name"`
+	SortOrder   int       `json:"sortOrder"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// HouseholdInvitation 是一次性家庭邀请码的签发结果（只返回明文一次）。
+type HouseholdInvitation struct {
+	HouseholdID string    `json:"householdId"`
+	ExpiresAt   time.Time `json:"expiresAt"`
 }
 
 // PushDevice 是客户端在一次 push 中提交的单台设备。

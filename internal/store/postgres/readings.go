@@ -253,9 +253,11 @@ func (s *Store) ListReadings(ctx context.Context, userID string, platform string
 	if err != nil {
 		return model.ReadingsPage{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+	owner, err := s.resolveVisibleOwner(ctx, uid, platform, externalID)
+	if err != nil {
 		return model.ReadingsPage{}, err
 	}
+	uid = owner
 
 	limit := q.Limit
 	if limit <= 0 {
@@ -332,9 +334,11 @@ func (s *Store) ReadingsSummary(ctx context.Context, userID string, platform str
 	if err != nil {
 		return model.ReadingsSummary{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+	owner, err := s.resolveVisibleOwner(ctx, uid, platform, externalID)
+	if err != nil {
 		return model.ReadingsSummary{}, err
 	}
+	uid = owner
 
 	summary := model.ReadingsSummary{Metric: metric, WindowStart: from.UTC(), WindowEnd: to.UTC()}
 	var minV, maxV, avgV sql.NullFloat64
@@ -412,9 +416,11 @@ func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform stri
 	if _, err := validate.ValidateSeriesRange(from, to, size); err != nil {
 		return model.ReadingsSeries{}, err
 	}
-	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+	owner, err := s.resolveVisibleOwner(ctx, uid, platform, externalID)
+	if err != nil {
 		return model.ReadingsSeries{}, err
 	}
+	uid = owner
 
 	series := model.ReadingsSeries{
 		Metric: normMetric, Bucket: bucket, From: from.UTC(), To: to.UTC(),
@@ -473,9 +479,11 @@ func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform str
 	if err != nil {
 		return model.ReadingMetrics{}, fmt.Errorf("非法 user id: %w", err)
 	}
-	if err := s.ensureUserDevice(ctx, uid, platform, externalID); err != nil {
+	owner, err := s.resolveVisibleOwner(ctx, uid, platform, externalID)
+	if err != nil {
 		return model.ReadingMetrics{}, err
 	}
+	uid = owner
 
 	result := model.ReadingMetrics{Items: make([]model.ReadingMetric, 0)}
 	rows, err := s.db.QueryContext(ctx, `
@@ -508,20 +516,24 @@ func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform str
 	return result, nil
 }
 
-// ensureUserDevice 校验设备属于当前用户且未删除；否则返回 ErrNotFound（含越权）。
-func (s *Store) ensureUserDevice(ctx context.Context, uid uuid.UUID, platform, externalID string) error {
-	var exists bool
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM user_devices
-			WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL
-		)`, uid, platform, externalID).Scan(&exists); err != nil {
-		return fmt.Errorf("查询用户设备失败: %w", err)
+// resolveVisibleOwner 返回设备 owner 的 user_id；仅本人或家庭成员可见，否则 ErrNotFound。
+// 读数仍按 owner 维度存储，共享成员读取时替换查询的 user_id 即可。
+func (s *Store) resolveVisibleOwner(ctx context.Context, uid uuid.UUID, platform, externalID string) (uuid.UUID, error) {
+	var owner uuid.UUID
+	err := s.db.QueryRowContext(ctx, `
+		SELECT d.user_id FROM user_devices d
+		WHERE d.platform = $2 AND d.external_id = $3 AND d.deleted_at IS NULL
+		  AND (d.user_id = $1 OR d.household_id IN (
+		        SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1))
+		ORDER BY (d.user_id = $1) DESC
+		LIMIT 1`, uid, platform, externalID).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, store.ErrNotFound
 	}
-	if !exists {
-		return store.ErrNotFound
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("查询用户设备失败: %w", err)
 	}
-	return nil
+	return owner, nil
 }
 
 func floatPtr(v float64) *float64 { return &v }

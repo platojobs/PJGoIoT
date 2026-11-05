@@ -25,6 +25,7 @@ const (
 	CodeInvalidMAC          = "INVALID_MAC"
 	CodeInvalidJSON         = "INVALID_JSON"
 	CodeUnauthorized        = "UNAUTHORIZED"
+	CodeForbidden           = "FORBIDDEN"
 	CodeNotFound            = "NOT_FOUND"
 	CodeMethodNotAllowed    = "METHOD_NOT_ALLOWED"
 	CodeConflict            = "CONFLICT"
@@ -120,6 +121,8 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "请求参数校验失败")
 		case errors.Is(last, store.ErrUnauthorized):
 			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "token 无效、已过期或已吊销")
+		case errors.Is(last, store.ErrForbidden):
+			writeError(c.Writer, http.StatusForbidden, CodeForbidden, "没有操作权限")
 		case errors.Is(last, store.ErrNotFound):
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		case errors.Is(last, store.ErrIdempotencyConflict):

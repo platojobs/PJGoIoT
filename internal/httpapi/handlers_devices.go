@@ -239,6 +239,7 @@ func (s *Server) respondMyDeviceByKey(c *gin.Context, rawPlatform string, rawExt
 // ErrNotFound/ErrUnauthorized 分别映射 404/401，其余记录日志后返回 500。
 func (s *Server) storeFailure(c *gin.Context, operation string, err error) {
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrUnauthorized) ||
+		errors.Is(err, store.ErrForbidden) ||
 		errors.Is(err, store.ErrTimeout) || errors.Is(err, store.ErrCursorExpired) ||
 		errors.Is(err, store.ErrDuplicateDevice) || isStatementTimeout(err) || isDBUnavailable(err) {
 		// 交给统一错误出口映射；数据库不可达/语句超时必须返回 503 可重试语义，

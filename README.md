@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.7.0**（v0.8.0 新增 `expiresAt` 字段与 `410 RESYNC_REQUIRED` 语义）；服务版本 **v0.11.0**（双实例 + Caddy 负载均衡、优雅下线与滚动发布、可选 Postgres 共享限流）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例，不新增字段；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，不改业务契约，契约保持 **0.7.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.8.0**（v0.12.0 新增家庭/房间/成员/邀请码接口与设备 `householdId`/`roomId` 字段）；服务版本 **v0.12.0**（家庭共享 + 房间管理 + 一次性邀请码；沿用 v0.11.0 的双实例与滚动发布）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -82,16 +82,84 @@ make dev-postgres   # Postgres 模式启动 API
 | GET | `/device-types/{type}/catalog` | 否 | 200 | 按类型聚合元数据、固件、配件，`{deviceType,firmwares,accessories}` |
 | GET | `/device-types/{type}/firmwares` | 否 | 200 | 指定类型的固件列表（历史端点，保持可用） |
 | GET | `/device-types/{type}/accessories` | 否 | 200 | 指定类型的配件列表（历史端点，保持可用） |
-| GET | `/my/devices` | Bearer | 200 | 当前用户未删除设备列表 |
+| GET | `/my/devices` | Bearer | 200 | 本人 + 所在家庭共享的设备列表 |
 | GET | `/my/devices/{mac}` | Bearer | 200 | 按 MAC 元数据查单台设备（仅 Android；iOS 用下一行接口） |
 | GET | `/my/devices/{platform}/{externalId}` | Bearer | 200 | 按设备唯一键查单台设备，iOS 无需 MAC |
+| PATCH | `/my/devices/{platform}/{externalId}` | Bearer | 200 | 改 `alias`/`roomId`/`householdId`（仅设备 owner；三态语义） |
 | GET | `/my/devices/{platform}/{externalId}/readings` | Bearer | 200 | 读数列表，`recordedAt` 倒序游标分页，`{items,nextCursor,hasMore}` |
 | GET | `/my/devices/{platform}/{externalId}/readings/summary` | Bearer | 200 | 单指标聚合，`{metric,unit,count,min,max,avg,last,windowStart,windowEnd}` |
 | GET | `/my/devices/{platform}/{externalId}/readings/series` | Bearer | 200 | UTC 对齐分桶序列，`{metric,unit,bucket,from,to,buckets[]}` |
 | GET | `/my/devices/{platform}/{externalId}/readings/metrics` | Bearer | 200 | 指标清单，`{items:[{metric,unit,count,firstAt,lastAt}]}` |
-| GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}` |
+| GET | `/sync/changes?cursor=&limit=` | Bearer | 200 | 增量变更，`{changes,nextCursor,hasMore}`；范围=本人+家庭 |
 | POST | `/sync/push` | Bearer | 200 | 批量写入设备与读数，`{applied,conflicts,nextCursor,appliedReadings,skippedReadings}` |
+| GET | `/households` | Bearer | 200 | 我所在的家庭列表（含角色/成员数/设备数） |
+| POST | `/households` | Bearer | 201 | 创建家庭，创建者为 owner |
+| GET | `/households/{id}` | Bearer | 200 | 家庭详情（成员可读，跨家庭 404） |
+| PATCH | `/households/{id}` | Bearer | 200 | 改家庭名（仅 owner，member 403） |
+| DELETE | `/households/{id}` | Bearer | 204 | 删家庭（仅 owner；个人家庭 403；设备回个人家庭） |
+| GET | `/households/{id}/members` | Bearer | 200 | 成员列表（成员可读） |
+| POST | `/households/{id}/invitations` | Bearer | 201 | 签发一次性邀请码（仅 owner；TTL 10 分钟） |
+| POST | `/households/invitations/claim` | Bearer | 200 | 用邀请码加入家庭；无效/过期/已用 404 |
+| GET | `/households/{id}/rooms` | Bearer | 200 | 房间列表（成员可读） |
+| POST | `/households/{id}/rooms` | Bearer | 201 | 创建房间（仅 owner） |
+| PATCH | `/households/{id}/rooms/{roomId}` | Bearer | 200 | 改房间名/排序（仅 owner） |
+| DELETE | `/households/{id}/rooms/{roomId}` | Bearer | 204 | 删房间（仅 owner；设备 `roomId` 置 null） |
 | GET | `/metrics`（根路径） | 否 | 200 | Prometheus 文本指标；不受限流，`METRICS_ENABLED=false` 时 404 |
+
+### 家庭、房间与成员（v0.12.0）
+
+对齐米家的「账号 → 家庭 → 房间 → 设备」结构：设备仍由写入它的账号拥有，家庭只决定可见范围与房间归类。
+
+**数据模型与回填**（迁移 `000011_households`，含 down 脚本）：
+
+| 表 | 关键字段 | 说明 |
+| --- | --- | --- |
+| `households` | `id`、`name`、`owner_user_id`、`is_personal`、`created_at` | 每个账号自动一个 `is_personal=true` 的个人家庭；部分唯一索引保证每账号至多一个 |
+| `household_members` | `household_id`、`user_id`、`role(owner/member)`、`joined_at` | 主键 `(household_id,user_id)`，owner 也是成员行 |
+| `household_rooms` | `id`、`household_id`、`name`、`sort_order`、`created_at` | 删除房间不影响设备 |
+| `household_invitations` | `code_hash`(PK)、`household_id`、`invited_by_user_id`、`attempts`、`expires_at` | 只存哈希；`household_id=NULL` 的行只用于猜码失败计数 |
+| `user_devices` | 新增 `household_id`、`room_id`（均可空，`ON DELETE SET NULL`） | 旧设备回填到各自账号的个人家庭，`room_id` 保持 NULL（未分配） |
+| `change_log` | 新增 `household_id` | 旧变更回填到写入者个人家庭 |
+
+迁移对既有数据自动回填：为每个 `users` 行插入「我的家」个人家庭与 owner 成员行，再把该账号的设备与历史变更归入该家庭。
+已验证 `up → down → up`：down 后 4 张家庭表与 `user_devices` 的 2 个新列全部移除，再 up 后回填结果一致。
+
+**角色权限矩阵**（跨家庭访问一律 **404**，不暴露资源是否存在）：
+
+| 操作 | owner | member | 非成员 |
+| --- | --- | --- | --- |
+| 读取家庭/成员/房间 | 200 | 200 | 404 |
+| 读取家庭内全部设备与读数 | 200 | 200 | 404 |
+| 修改家庭名、删除家庭 | 200/204 | **403** | 404 |
+| 签发邀请码 | 201 | **403** | 404 |
+| 创建/修改/删除房间 | 200/201/204 | **403** | 404 |
+| 修改**自己的**设备 alias/room/household | 200 | 200 | — |
+| 修改**他人**的设备 | 404（设备不属于自己） | 404 | 404 |
+| 删除个人家庭 | **403**（个人家庭不可删） | — | — |
+
+**邀请码安全设计**：
+- 8 位、32 字符表（去掉 `0/O/1/I`），约 40 bit 熵；与配对码复用同一生成/规范化/哈希实现；
+- **只存 SHA-256 哈希**，明文仅在 `201` 响应中出现一次；日志只允许输出前 2 位掩码；
+- **一次性**：领取成功即删除该行，重放走「不存在」分支返回 404；TTL 10 分钟；
+- 同一码累计 **5 次失败**即作废（对不存在的码也落库计数，防止无限猜码）；
+- 领取接口复用现有每 IP 限流中间件（`429`），签发接口也受限流；
+- 签发新码不会使旧码失效，旧码仍按其自身 TTL 到期；加入家庭是幂等的（已是成员重复领取返回 200）。
+
+**删除家庭的级联行为**（仅 owner、需客户端二次确认）：
+- 成员行、房间、邀请码随家庭级联删除；
+- 家庭内每台设备回到**其各自 owner** 的个人家庭，`room_id` 置 NULL，设备与读数本身不删除；
+- 家庭内的历史变更保留，但 `household_id` 置 NULL，原成员不再能看到；
+- 个人家庭不可删除（403）。
+
+**同步可见范围的取舍与已知限制**：
+- `GET /sync/changes` 的可见范围从「本人」扩展为「本人 + 本人所在家庭」，`seq` 仍全局单调递增；
+  `entityId` 仍由设备 owner 的 userId 派生，因此同一条共享变更对不同成员呈现相同的 `entityId`。
+- `POST /sync/push` **只匹配并写入调用者自己的设备行**，不会改写其他成员的记录，因此不存在“两个成员同时改同一设备互相覆盖”；
+  代价是：若两位成员各自扫描同一台物理设备，会产生两条独立记录（已知限制，后续可按外部设备指纹合并）。
+- 家庭/房间的结构变更（建房、改名、删房、删家庭、邀请加入）**不写入 `change_log`**；客户端需通过 `GET /households*` 主动刷新。
+  删房间只把设备 `room_id` 置 NULL，也不会为受影响设备追加变更，其他成员可能短暂保留旧房间归属直到重新拉取设备列表。
+- 设备 alias/room/household 的修改通过 `PATCH /my/devices/{platform}/{externalId}` 会写入 `change_log`，家庭成员可见。
+- 家庭内设备视为共享**只读**：成员可看、可读读数，但不能编辑他人设备（404），不能管理家庭结构（403）。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1023,7 +1091,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.11.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.7.0 不是同一个号 |
+| `APP_VERSION` | `0.12.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.8.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1157,6 +1225,9 @@ seed 数据来源与边界：
 | v0.11.0 滚动发布 | 通过：`scripts/rolling-restart.sh` 532 个请求全部 200，502=0、连接失败=0，停机请求数 **0**（`api1=239`、`api2=293`） |
 | v0.11.0 并发迁移 | 通过：`scripts/migration-concurrency-check.sh` 外部持有 migrate advisory lock 5s，两个实例同时启动均在 5 261ms 后就绪，最终 `version=10 dirty=false`、`schema_migrations` 仅 1 行、5 张关键表存在 |
 | v0.11.0 限流真相 | 通过：`scripts/shared-rate-limit-check.sh`，memory 后端双实例放行 6/分钟（2 倍额度）；postgres 后端全局只放行 3 个，两个实例均返回 429 |
+| v0.12.0 家庭模型与迁移回填 | 通过（真实 PostgreSQL）：迁移 `000011` 在临时库上 `up → down → up`；旧账号自动获得「我的家」个人家庭与 owner 成员，设备 `household_id` 回填、`room_id` 为 NULL；down 后 4 张家庭表与 2 个新列全部移除，再 up 回填结果一致 |
+| v0.12.0 家庭共享与权限 | 通过（真实 PostgreSQL）：`TestHouseholdSharingPostgres` 覆盖邀请码一次性、跨家庭 404、member 改名 403、member 改他人设备 404、成员可读共享设备与读数、共享变更进入 `/sync/changes`、删房间清空 `roomId`、删家庭后设备回个人家庭；HTTP 层 `TestHouseholdLifecycleAndPermissions` 通过 |
+| v0.12.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条既有 warning）；契约版本 0.8.0 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1243,6 +1314,9 @@ bash scripts/rolling-restart.sh        # 逐实例摘流 → stop → start → 
 - seed 只有开发板参考数据，尚未接入真实量产设备型号、固件发布列表与官方配件 SKU；需要厂商/产品提供可核实来源后再补。
 - 尚未做 Android 端到端联调；后端 HTTP 压测已完成（见「容量与压测结果」），但未覆盖 App 侧重试/弱网行为。可观测性已提供 `/metrics`（请求量/延迟/DB 错误/近似计数）与 `X-Request-Id`，Tracing 仍待接入。
 - 配对码为 8 位（约 40 bit 熵）且仅 10 分钟有效，配合每 IP 限流与错 5 次作废；如需更高强度可加长码或增加二次验证。
+- 家庭结构变更（建房/改名/删房/删家庭/加入成员）不写 `change_log`，客户端需主动拉取 `/households*`；删房间导致设备 `roomId` 清空时不追加设备变更，成员端可能短暂不一致。
+- 两位成员各自扫描同一台物理设备会产生两条独立设备记录；当前不做跨账号设备指纹合并。
+- 家庭邀请码为 8 位、一次性、TTL 10 分钟、错 5 次作废；没有邮箱/短信二次验证，码的传递安全由客户端负责。
 - `/metrics` 的业务计数为 `pg_class.reltuples` 近似值（依赖 autovacuum/ANALYZE），非精确行数；不应作为计费或审计依据。
 - 完整栈已在本地 `docker compose up` 实测（Caddy 自签 HTTPS、非 root、只读根文件系统、启动迁移、卷持久化、docker 模式备份恢复均通过）；**真实域名 / ACME 证书 / 云主机仍未验证**，仓库未开通任何云账号。
 - distroless 镜像没有 shell、`id`、`curl`，容器内排查请用 `docker top` / `docker inspect` / `docker compose exec api /api -healthcheck`；健康检查已使用二进制自带的 `-healthcheck`，无需额外工具。

@@ -109,18 +109,34 @@ func sameFixtureReading(existing *readingRecord, r model.PushReading) bool {
 		existing.recordedAt.Equal(r.RecordedAt)
 }
 
+// readingOwnerLocked 解析设备可见性并返回读数所属的 owner；本人优先，其次家庭成员。
+func (s *Store) readingOwnerLocked(userID, platform, externalID string) (*userData, error) {
+	if data, ok := s.users[userID]; ok {
+		if d, ok := data.byKey[deviceKey(platform, externalID)]; ok && d.DeletedAt == nil {
+			return data, nil
+		}
+	}
+	visible := s.visibleHouseholdIDsLocked(userID)
+	for ownerID, data := range s.users {
+		if ownerID == userID {
+			continue
+		}
+		d, ok := data.byKey[deviceKey(platform, externalID)]
+		if ok && d.DeletedAt == nil && d.HouseholdID != nil && visible[*d.HouseholdID] {
+			return data, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
 // ListReadings 实现 store.Store。
 func (s *Store) ListReadings(ctx context.Context, userID string, platform string, externalID string, q model.ReadingsQuery) (model.ReadingsPage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	data, ok := s.users[userID]
-	if !ok {
-		return model.ReadingsPage{}, store.ErrNotFound
-	}
-	d, ok := data.byKey[deviceKey(platform, externalID)]
-	if !ok || d.DeletedAt != nil {
-		return model.ReadingsPage{}, store.ErrNotFound
+	data, err := s.readingOwnerLocked(userID, platform, externalID)
+	if err != nil {
+		return model.ReadingsPage{}, err
 	}
 
 	limit := q.Limit
@@ -175,13 +191,9 @@ func (s *Store) ReadingsSummary(ctx context.Context, userID string, platform str
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	data, ok := s.users[userID]
-	if !ok {
-		return model.ReadingsSummary{}, store.ErrNotFound
-	}
-	d, ok := data.byKey[deviceKey(platform, externalID)]
-	if !ok || d.DeletedAt != nil {
-		return model.ReadingsSummary{}, store.ErrNotFound
+	data, err := s.readingOwnerLocked(userID, platform, externalID)
+	if err != nil {
+		return model.ReadingsSummary{}, err
 	}
 
 	summary := model.ReadingsSummary{Metric: metric, WindowStart: from.UTC(), WindowEnd: to.UTC()}
@@ -254,13 +266,9 @@ func (s *Store) ReadingsSeries(ctx context.Context, userID string, platform stri
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	data, ok := s.users[userID]
-	if !ok {
-		return model.ReadingsSeries{}, store.ErrNotFound
-	}
-	d, ok := data.byKey[deviceKey(platform, externalID)]
-	if !ok || d.DeletedAt != nil {
-		return model.ReadingsSeries{}, store.ErrNotFound
+	data, err := s.readingOwnerLocked(userID, platform, externalID)
+	if err != nil {
+		return model.ReadingsSeries{}, err
 	}
 
 	series := model.ReadingsSeries{
@@ -335,13 +343,9 @@ func (s *Store) ReadingsMetrics(ctx context.Context, userID string, platform str
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	data, ok := s.users[userID]
-	if !ok {
-		return model.ReadingMetrics{}, store.ErrNotFound
-	}
-	d, ok := data.byKey[deviceKey(platform, externalID)]
-	if !ok || d.DeletedAt != nil {
-		return model.ReadingMetrics{}, store.ErrNotFound
+	data, err := s.readingOwnerLocked(userID, platform, externalID)
+	if err != nil {
+		return model.ReadingMetrics{}, err
 	}
 
 	result := model.ReadingMetrics{Items: make([]model.ReadingMetric, 0)}

@@ -9,15 +9,15 @@ x-api-common: &api-common
   build:
     context: .
     args:
-      APP_VERSION: "0.11.0"
+      APP_VERSION: "0.12.0"
       GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
-  image: pjgoiot-api:0.11.0
+  image: pjgoiot-api:0.12.0
   restart: unless-stopped
   environment: &api-env
     STORE: postgres
     DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
     ADDR: ":8080"
-    APP_VERSION: "0.11.0"
+    APP_VERSION: "0.12.0"
     # 启动即迁移；golang-migrate 自带数据库级 advisory lock，双实例同时启动时
     # 只有一个实例真正执行迁移，另一个等待锁后发现已是最新版本。
     RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
@@ -133,9 +133,9 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.11.0"
+        APP_VERSION: "0.12.0"
         GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
-    image: pjgoiot-api:0.11.0
+    image: pjgoiot-api:0.12.0
     entrypoint: ["/cleanup"]
     command:
       - "-retention-days"

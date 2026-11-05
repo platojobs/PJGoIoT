@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.11.0）
+# PJGoIoT 运行手册（v0.12.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -44,6 +44,9 @@
 | v0.11.0 滚动发布 | **已验证** | `scripts/rolling-restart.sh` 532 请求全 200，停机请求数 **0**（api1=239 / api2=293） |
 | v0.11.0 并发迁移 | **已验证** | advisory lock 外部持有 5s，两实例同时启动均 5 261ms 后就绪，`version=10 dirty=false`、迁移表仅 1 行 |
 | v0.11.0 共享限流 | **已验证** | memory 双实例 3/分钟额度实际放行 6；postgres 后端全局只放行 3，两实例均 429 |
+| v0.12.0 家庭模型与回填 | **已验证** | 迁移 `000011` 在真实 PG 上 `up → down → up`：旧用户设备回填「我的家」、`room_id=NULL`；down 后家庭表与 2 个新列全部移除，再 up 结果一致 |
+| v0.12.0 家庭权限与共享 | **已验证** | 真实 PG `TestHouseholdSharingPostgres`：邀请码一次性/跨家庭 404、member 改名 403、member 改他人设备 404、成员可读设备与读数、删房间清空 `room_id`、删家庭设备回个人家庭；HTTP fixture 测试 `TestHouseholdLifecycleAndPermissions` 同样通过 |
+| v0.12.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → 0 error（13 条既有 warning） |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -111,7 +114,7 @@ curl -k -o /dev/null -w '%{http_code}\n' https://localhost/metrics
 1. **备份**（必须先做）：`./deploy/scripts/backup.sh`
 2. **预检迁移**：只跑迁移、不启动服务：
    `docker compose run --rm --no-deps --entrypoint /migrate api1 -direction up`。
-3. **构建新镜像**：`APP_VERSION=0.11.0 docker compose build`
+3. **构建新镜像**：`APP_VERSION=0.12.0 docker compose build`
 4. **逐实例滚动替换**：
    ```bash
    bash scripts/rolling-restart.sh
@@ -568,6 +571,55 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 - 热点 IP 会在单行上排队；若 `pg_stat_activity` 出现大量相同 `bucket` 的等待，
   考虑前置网关限流或调大 `RATE_LIMIT_PER_MINUTE`。
 
+### 7.13 家庭 / 房间 / 成员排障（v0.12.0）
+
+#### 7.13.1 看不到家庭或家庭内设备
+
+- 每个账号在创建时自动生成个人家庭；迁移 `000011` 也会为既有用户回填。检查：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT h.id,h.name,h.is_personal,m.role FROM households h
+       JOIN household_members m ON m.household_id=h.id WHERE m.user_id='<userId>';"
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT platform,external_id,household_id,room_id FROM user_devices WHERE user_id='<userId>';"
+  ```
+- 设备 `household_id` 为 NULL 表示未归属家庭（历史异常数据），可调用
+  `PATCH /my/devices/{platform}/{externalId}` 传 `householdId` 修正；
+- 跨家庭访问按设计返回 **404**，不是 403；不要把 404 当成“服务未部署”。
+
+#### 7.13.2 邀请码领取失败
+
+- 无效/过期/已用/家庭已删统一 404，属于预期；不要向客户端区分原因。
+- 邀请码 TTL 10 分钟；同一码累计 5 次失败即作废。查库：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT household_id,attempts,expires_at FROM household_invitations ORDER BY created_at DESC LIMIT 5;"
+  ```
+  只存哈希，无法从库中还原明文；需要重发时由 owner 重新 `POST /households/{id}/invitations`。
+- 大量 429：领取接口走每 IP 限流中间件，按「限流边界」排查；不要通过清空
+  `household_invitations` 绕过限流。
+
+#### 7.13.3 member 收到 403
+
+- 家庭结构写操作（改名、删家庭、签发邀请码、房间增删改）仅 owner 可做；
+  member 收到 `403 FORBIDDEN` 是设计行为；
+- member 修改**他人设备**返回 404（不暴露设备存在性）；member 可以修改自己 push 的设备，
+  包括把它移动到共享家庭或指定房间。
+
+#### 7.13.4 删除家庭后的数据去向
+
+- 成员、房间、邀请码级联删除；设备回到各自 owner 的个人家庭且 `room_id` 清空；
+- 设备与读数不删除，`change_log` 行保留但 `household_id` 置 NULL；
+- 个人家庭不可删除（403）；若客户端需要“解散家庭”，只能删除非个人家庭。
+- 核对：
+  ```bash
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT id,name,owner_user_id FROM households WHERE id='<householdId>';"
+  docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+    "SELECT user_id,household_id,room_id FROM user_devices WHERE household_id='<householdId>';"
+  ```
+
+
 ## 8. 监控与告警
 
 - 抓取目标：`api:8080/metrics`（内网），样例见 `deploy/prometheus/scrape.yml`；
@@ -580,7 +632,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   `pjgoiot_http_request_duration_seconds_bucket{route="..."}`；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0 / v0.10.0 / v0.11.0）
+## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0 / v0.10.0 / v0.11.0 / v0.12.0）
 
 ### 9.1 构建与启动
 
@@ -936,6 +988,64 @@ schema_migrations 行数：1
 运维成本：`postgres` 后端每个请求多一次 UPSERT；`rate_limit_buckets` 只保存活跃 IP 的桶，
 5 分钟惰性清理 10 分钟未更新的行；数据库故障时降级为进程内限流（可用性优先）。
 未引入 Redis：避免新增高可用、持久化与网络运维面。
+
+### 9.11 v0.12.0 家庭模型迁移与共享（真实输出）
+
+#### 9.11.1 迁移 up → down → up（临时库 `hh_roundtrip`）
+
+先迁移到 version 10，写入一个 account 用户与一台旧设备，再执行 `000011`：
+
+```text
+迁移完成 version=11 dirty=false
+-- 回填结果 --
+我的家|t|owner|t|t        # name|is_personal|role|household_id 已回填|room_id 为 NULL
+-- down 到 10 --
+迁移完成 version=10 dirty=false
+0 0                      # 家庭表数量=0；user_devices 新列数量=0
+-- 再 up --
+迁移完成 version=11 dirty=false
+我的家|owner|1            # 家庭与成员行恢复，且每账号仅 1 个家庭
+```
+
+#### 9.11.2 家庭共享集成测试（真实 PostgreSQL）
+
+```bash
+TEST_DATABASE_URL='postgres://pjgoiot:...@127.0.0.1:55432/pjgoiot_v11test?sslmode=disable' \
+  go test ./internal/store/postgres -run TestHouseholdSharingPostgres -count=1 -v
+```
+
+```text
+=== RUN   TestHouseholdSharingPostgres
+--- PASS: TestHouseholdSharingPostgres (0.15s)
+PASS
+ok  	github.com/platojobs/PJGoIoT/internal/store/postgres	0.615s
+```
+
+覆盖点：默认个人家庭、个人家庭不可删、创建共享家庭、邀请码一次性、跨家庭读取 404、
+member 改名 403、设备 push 后移入家庭/房间、member 可见设备与读数、member 改他人设备 404、
+共享变更出现在 member 的 `/sync/changes`、删房间清空 `room_id`、删家庭后设备回个人家庭且成员失去可见性。
+
+#### 9.11.3 HTTP 层家庭生命周期（fixture 存储）
+
+```text
+=== RUN   TestHouseholdLifecycleAndPermissions
+--- PASS: TestHouseholdLifecycleAndPermissions (0.00s)
+PASS
+ok  	github.com/platojobs/PJGoIoT/internal/httpapi	0.463s
+```
+
+覆盖点：默认家庭、创建家庭、邀请码领取、member 写权限 403、跨家庭 404、房间创建、
+设备移动、三态字段清除、成员共享可见性、删除级联与个人家庭 403。
+
+#### 9.11.4 OpenAPI 契约
+
+```text
+api/openapi.yaml: validated in 62ms
+Woohoo! Your API description is valid. 🎉
+You have 13 warnings.
+```
+
+0 error；warning 均为既有的 info/tags/501/login 示例等问题，非本轮新增。
 
 ## 10. 本地栈自检步骤（可复现）
 

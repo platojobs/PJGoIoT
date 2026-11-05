@@ -26,6 +26,8 @@ var (
 	// ErrDuplicateDevice 表示同一批 push 中出现重复设备 id 或重复 (platform, externalId)。
 	// HTTP 层已提前校验；存储层再次校验用于直接调用 Store 的场景，映射为 400 BAD_REQUEST。
 	ErrDuplicateDevice = errors.New("同一批设备存在重复 id 或唯一键")
+	// ErrForbidden 表示已认证用户对同家庭内的资源没有操作权限（跨家庭仍返回 ErrNotFound）。
+	ErrForbidden = errors.New("没有操作权限")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -91,8 +93,37 @@ type Store interface {
 	// Push 执行一次同步写入；replayed 表示命中幂等缓存并直接返回历史响应。
 	Push(ctx context.Context, userID string, req model.PushRequest, opts PushOptions) (result model.PushResult, replayed bool, err error)
 	// Changes 返回用户自 cursor 之后的增量变更，limit 为本次上限。
-	// 若 cursor 早于 change_log 的最老保留 seq（存在缺口），返回 ErrCursorExpired。
+	// 可见范围为「自己是成员的全部家庭」，不再只限本人写入。
+	// 若 cursor 早于可见 change_log 的最老保留 seq（存在缺口），返回 ErrCursorExpired。
 	Changes(ctx context.Context, userID string, cursor int64, limit int) (model.ChangesPage, error)
+
+	// CreateHousehold 创建一个非默认家庭，创建者自动成为 owner。
+	CreateHousehold(ctx context.Context, ownerUserID string, name string) (model.Household, error)
+	// ListHouseholds 返回用户作为成员的全部家庭（含个人家庭）。
+	ListHouseholds(ctx context.Context, userID string) ([]model.Household, error)
+	// GetHousehold 仅家庭成员可见；非成员或不存在统一返回 ErrNotFound。
+	GetHousehold(ctx context.Context, userID string, householdID string) (model.Household, error)
+	// RenameHousehold 仅 owner 可改名。
+	RenameHousehold(ctx context.Context, userID string, householdID string, name string) error
+	// DeleteHousehold 仅 owner 可删除；个人家庭不可删除；设备回到各自 owner 的个人家庭。
+	DeleteHousehold(ctx context.Context, userID string, householdID string) error
+	// ListHouseholdMembers 返回成员列表，仅家庭成员可见。
+	ListHouseholdMembers(ctx context.Context, userID string, householdID string) ([]model.HouseholdMember, error)
+	// CreateHouseholdInvitation 由 owner 签发一次性邀请码（只存哈希）。
+	CreateHouseholdInvitation(ctx context.Context, userID string, householdID string, codeHash string, expiresAt time.Time) (model.HouseholdInvitation, error)
+	// ClaimHouseholdInvitation 用邀请码加入家庭；失败按码计数，满 5 次作废。
+	ClaimHouseholdInvitation(ctx context.Context, userID string, codeHash string, now time.Time, ttl time.Duration) (model.Household, error)
+	// ListHouseholdRooms 返回房间列表，仅家庭成员可见。
+	ListHouseholdRooms(ctx context.Context, userID string, householdID string) ([]model.HouseholdRoom, error)
+	// CreateHouseholdRoom 仅 owner 可建房间。
+	CreateHouseholdRoom(ctx context.Context, userID string, householdID string, name string, sortOrder int) (model.HouseholdRoom, error)
+	// UpdateHouseholdRoom 仅 owner 可改房间；name/sortOrder 为 nil 表示不变。
+	UpdateHouseholdRoom(ctx context.Context, userID string, householdID string, roomID string, name *string, sortOrder *int) (model.HouseholdRoom, error)
+	// DeleteHouseholdRoom 仅 owner 可删房间；房间内设备的 room_id 置 NULL。
+	DeleteHouseholdRoom(ctx context.Context, userID string, householdID string, roomID string) error
+	// UpdateUserDeviceMeta 仅设备 owner 可改 alias/roomId/householdId。
+	// alias/roomID/householdID 为 nil 表示不变，空串表示清除（householdId 清除=回到个人家庭）。
+	UpdateUserDeviceMeta(ctx context.Context, userID string, platform string, externalID string, alias *string, roomID *string, householdID *string) (model.UserDevice, error)
 
 	// ListReadings 返回某设备在时间窗口内的读数，按 recordedAt 倒序游标分页。
 	// 设备不存在、已删除或不属于该用户时返回 ErrNotFound。

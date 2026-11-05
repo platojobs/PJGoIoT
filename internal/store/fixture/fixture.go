@@ -34,13 +34,28 @@ type tokenRecord struct {
 }
 
 type changeRecord struct {
-	seq      int64
-	userID   string
-	entity   string
-	entityID string
-	op       string
-	payload  json.RawMessage
-	serverTS time.Time
+	seq         int64
+	userID      string
+	householdID string
+	entity      string
+	entityID    string
+	op          string
+	payload     json.RawMessage
+	serverTS    time.Time
+}
+
+// householdRecord 是内存版家庭，members 为 userID -> role。
+type householdRecord struct {
+	model.Household
+	members map[string]string
+}
+
+// householdInvitationRecord 是内存版邀请码；householdID 为空表示失败尝试计数行。
+type householdInvitationRecord struct {
+	householdID string
+	invitedBy   string
+	attempts    int
+	expiresAt   time.Time
 }
 
 type userData struct {
@@ -95,6 +110,10 @@ type Store struct {
 	idempotency map[string]idempotencyRecord
 
 	pairingCodes map[string]*pairingRecord // codeHash -> record
+
+	households  map[string]*householdRecord
+	rooms       map[string]model.HouseholdRoom
+	invitations map[string]*householdInvitationRecord
 }
 
 // New 从 fixtures 目录加载公共元数据。
@@ -108,6 +127,9 @@ func New(dir string) (*Store, error) {
 		nextSeq:       1,
 		idempotency:   map[string]idempotencyRecord{},
 		pairingCodes:  map[string]*pairingRecord{},
+		households:    map[string]*householdRecord{},
+		rooms:         map[string]model.HouseholdRoom{},
+		invitations:   map[string]*householdInvitationRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))
@@ -249,6 +271,7 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expir
 		createdAt: time.Now().UTC(),
 	}
 	s.tokens[tokenHash] = tokenRecord{userID: userID, expiresAt: expiresAt.UTC()}
+	s.createPersonalHouseholdLocked(userID)
 	return userID, nil
 }
 
@@ -288,16 +311,21 @@ func (s *Store) RevokeToken(ctx context.Context, tokenHash string) error {
 func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.UserDevice, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, ok := s.users[userID]
-	if !ok {
+	if _, ok := s.users[userID]; !ok {
 		return []model.UserDevice{}, nil
 	}
-	out := make([]model.UserDevice, 0, len(data.byID))
-	for _, d := range data.byID {
-		if d.DeletedAt != nil {
-			continue
+	visible := s.visibleHouseholdIDsLocked(userID)
+	out := make([]model.UserDevice, 0)
+	for ownerID, data := range s.users {
+		for _, d := range data.byID {
+			if d.DeletedAt != nil {
+				continue
+			}
+			if ownerID != userID && (d.HouseholdID == nil || !visible[*d.HouseholdID]) {
+				continue
+			}
+			out = append(out, s.enrichUserDevice(*d))
 		}
-		out = append(out, s.enrichUserDevice(*d))
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if !out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
@@ -312,17 +340,23 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (model.UserDevice, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, ok := s.users[userID]
-	if !ok {
-		return model.UserDevice{}, store.ErrNotFound
-	}
+	visible := s.visibleHouseholdIDsLocked(userID)
 	var found *model.UserDevice
-	for _, d := range data.byID {
-		if d.MAC != mac || d.DeletedAt != nil {
-			continue
-		}
-		if found == nil || d.UpdatedAt.After(found.UpdatedAt) {
-			found = d
+	own := false
+	for ownerID, data := range s.users {
+		for _, d := range data.byID {
+			if d.MAC != mac || d.DeletedAt != nil {
+				continue
+			}
+			if ownerID != userID && (d.HouseholdID == nil || !visible[*d.HouseholdID]) {
+				continue
+			}
+			// 本人设备优先，避免同名 MAC 在不同家庭重复时跨家庭串读。
+			isOwn := ownerID == userID
+			if found == nil || (isOwn && !own) || (isOwn == own && d.UpdatedAt.After(found.UpdatedAt)) {
+				found = d
+				own = isOwn
+			}
 		}
 	}
 	if found == nil {
@@ -335,15 +369,24 @@ func (s *Store) GetUserDevice(ctx context.Context, userID string, mac string) (m
 func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform string, externalID string) (model.UserDevice, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, ok := s.users[userID]
-	if !ok {
-		return model.UserDevice{}, store.ErrNotFound
+	visible := s.visibleHouseholdIDsLocked(userID)
+	key := deviceKey(platform, externalID)
+	if data, ok := s.users[userID]; ok {
+		if d, ok := data.byKey[key]; ok && d.DeletedAt == nil {
+			return s.enrichUserDevice(*d), nil
+		}
 	}
-	d, ok := data.byKey[deviceKey(platform, externalID)]
-	if !ok || d.DeletedAt != nil {
-		return model.UserDevice{}, store.ErrNotFound
+	for ownerID, data := range s.users {
+		if ownerID == userID {
+			continue
+		}
+		d, ok := data.byKey[key]
+		if !ok || d.DeletedAt != nil || d.HouseholdID == nil || !visible[*d.HouseholdID] {
+			continue
+		}
+		return s.enrichUserDevice(*d), nil
 	}
-	return s.enrichUserDevice(*d), nil
+	return model.UserDevice{}, store.ErrNotFound
 }
 
 // enrichUserDevice 用 fixtures 中的公共元数据补全型号、厂商、固件版本与兼容性。
@@ -491,6 +534,13 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 
 		seq := s.nextSeq
 		s.nextSeq++
+		personalID := s.personalHouseholdIDLocked(userID)
+		householdID := personalID
+		var roomID *string
+		if existing != nil && existing.HouseholdID != nil {
+			householdID = *existing.HouseholdID
+			roomID = existing.RoomID
+		}
 		record := &model.UserDevice{
 			ID:             dev.ID,
 			ClientID:       req.ClientID,
@@ -504,6 +554,11 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			ScanRecords:    dev.ScanRecords,
 			UpdatedAt:      decision.EffectiveUpdatedAt,
 			ServerSeq:      seq,
+		}
+		if householdID != "" {
+			v := householdID
+			record.HouseholdID = &v
+			record.RoomID = roomID
 		}
 		if dev.Deleted {
 			deletedAt := decision.EffectiveUpdatedAt
@@ -532,7 +587,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			return model.PushResult{}, false, fmt.Errorf("序列化变更记录失败: %w", err)
 		}
 		s.changes = append(s.changes, changeRecord{
-			seq: seq, userID: userID, entity: "user_device", entityID: entityID,
+			seq: seq, userID: userID, householdID: householdID, entity: "user_device", entityID: entityID,
 			op: op, payload: payload, serverTS: now,
 		})
 		result.Applied = append(result.Applied, model.AppliedChange{
@@ -564,9 +619,10 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	defer s.mu.RUnlock()
 
 	page := model.ChangesPage{Changes: []model.Change{}}
+	visible := s.visibleHouseholdIDsLocked(userID)
 	var minSeq int64
 	for _, rec := range s.changes {
-		if rec.userID == userID && (minSeq == 0 || rec.seq < minSeq) {
+		if (rec.userID == userID || (rec.householdID != "" && visible[rec.householdID])) && (minSeq == 0 || rec.seq < minSeq) {
 			minSeq = rec.seq
 		}
 	}
@@ -578,7 +634,10 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	count := 0
 	lastSeq := cursor
 	for _, rec := range s.changes {
-		if rec.userID != userID || rec.seq <= cursor {
+		if rec.seq <= cursor {
+			continue
+		}
+		if rec.userID != userID && (rec.householdID == "" || !visible[rec.householdID]) {
 			continue
 		}
 		if count == limit {
@@ -600,9 +659,13 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 }
 
 func (s *Store) maxSeqLocked(userID string) int64 {
+	visible := s.visibleHouseholdIDsLocked(userID)
 	var max int64
 	for _, rec := range s.changes {
-		if rec.userID == userID && rec.seq > max {
+		if rec.userID != userID && (rec.householdID == "" || !visible[rec.householdID]) {
+			continue
+		}
+		if rec.seq > max {
 			max = rec.seq
 		}
 	}

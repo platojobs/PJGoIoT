@@ -109,7 +109,7 @@ func (s *Server) cors() gin.HandlerFunc {
 			if allowed, value := s.allowedOrigin(origin); allowed {
 				c.Header("Access-Control-Allow-Origin", value)
 				c.Header("Vary", "Origin")
-				c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+				c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 				c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
 				c.Header("Access-Control-Expose-Headers", "X-Request-Id, Idempotent-Replayed, Content-Disposition")
 				c.Header("Access-Control-Max-Age", "600")

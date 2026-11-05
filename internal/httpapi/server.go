@@ -88,6 +88,22 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	syncGroup.GET("/changes", s.handleChanges)
 	syncGroup.POST("/push", s.handlePush)
 
+	households := api.Group("/households", s.requireAuth())
+	households.GET("", s.handleListHouseholds)
+	households.POST("", s.handleCreateHousehold)
+	households.POST("/invitations/claim", s.claimRateLimit(), s.handleClaimHouseholdInvitation)
+	households.GET("/:id", s.handleGetHousehold)
+	households.PATCH("/:id", s.handlePatchHousehold)
+	households.DELETE("/:id", s.handleDeleteHousehold)
+	households.GET("/:id/members", s.handleListHouseholdMembers)
+	households.POST("/:id/invitations", s.handleCreateHouseholdInvitation)
+	households.GET("/:id/rooms", s.handleListHouseholdRooms)
+	households.POST("/:id/rooms", s.handleCreateHouseholdRoom)
+	households.PATCH("/:id/rooms/:roomId", s.handlePatchHouseholdRoom)
+	households.DELETE("/:id/rooms/:roomId", s.handleDeleteHouseholdRoom)
+
+	myGroup.PATCH("/devices/*key", s.handlePatchMyDevice)
+
 	if s.cfg.MetricsEnabled {
 		r.GET("/metrics", s.handleMetrics)
 	}
