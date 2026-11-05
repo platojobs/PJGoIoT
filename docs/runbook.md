@@ -59,6 +59,7 @@
 | v0.14.0 可见性与错误码 | **已验证** | 被移除成员 token 读家庭/成员/房间/邀请码均 404；缺项重排 409 且 `error.code=ROOM_SET_MISMATCH`；`HouseholdMember.isSelf` 生效 |
 | v0.14.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 0.10.0 |
 | v0.14.0 迁移 | **不涉及** | 本轮无 schema 变更，迁移版本仍为 `000012` |
+| v0.14.0 CI | **已验证** | GitHub Actions [run 42051601765](https://github.com/platojobs/PJGoIoT/actions/runs/42051601765) 四 job 全绿；`Postgres 集成测试` 正则改为 `TestHousehold`，日志确认 `TestHouseholdOwnershipPostgres` 与 `TestHouseholdOwnershipTransferConcurrentPostgres` 实际执行；`OpenAPI 契约校验` 步骤实际执行 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |

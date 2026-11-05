@@ -1308,7 +1308,7 @@ seed 数据来源与边界：
 | v0.14.0 可见性修正 | 通过：被移除成员的 token 读取家庭/成员/房间/邀请码一律 404（`TestHouseholdManagementPostgres` 断言）；`TestHouseholdRoomSetMismatchCode` 断言缺项重排返回 409 且 `error.code == ROOM_SET_MISMATCH` |
 | v0.14.0 迁移 | 本轮无 schema 变更，未新增迁移；迁移版本保持 `000012`（已在 v0.13.0 验证 `up → down → up`） |
 | v0.14.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（13 条非阻断 warning）；契约版本 **0.10.0** |
-| v0.14.0 CI | 通过：GitHub Actions run `__CI_RUN_ID__`，四个 job 全绿；`Postgres 集成测试` 正则已放宽为 `TestHousehold`，`OpenAPI 契约校验` 步骤实际执行 |
+| v0.14.0 CI | 通过：GitHub Actions [run 42051601765](https://github.com/platojobs/PJGoIoT/actions/runs/42051601765)，四个 job 全绿；`Postgres 集成测试` 正则已放宽为 `TestHousehold`，日志可见 `TestHouseholdOwnershipPostgres`、`TestHouseholdOwnershipTransferConcurrentPostgres` 实际执行并通过；`OpenAPI 契约校验` 步骤实际执行（0 error） |
 | v0.11.0 CI 补跑 | 通过：`v0.11-fix` 分支 [run 42037314989](https://github.com/platojobs/PJGoIoT/actions/runs/42037314989) 全绿；修复 shellcheck 对 trap 清理函数的 SC2317/SC2329 误报与未使用变量，v0.11.0 tag 已指向该修复提交 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
