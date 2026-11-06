@@ -163,6 +163,7 @@
 | v0.25.0 e2e 栈 | **已验证（Docker PG + 本地 API）** | `scripts/stack-for-e2e.sh` + `seed-for-e2e.sh`：push `applied=1 skippedReadings=0 conflicts=0`；`user_devices=1`、`readings=24`、`device_types=5`，firmware/accessory/public_model 校验通过 |
 | v0.25.0 契约 | **已验证** | `openapi info.version=0.20.0`；`UserDevice.markedAt` 可空、`PushDevice.markedAt` 三态；redocly lint **0 error**（14 条非阻断 warning）；health 示例版本 0.25.0 |
 | v0.25.0 校验 job 等价项 | **已验证（本机）** | YAML 解析、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（含改动的 `migrate-drill.sh`）全部通过 |
+| v0.25.0 CI | **已验证** | GitHub Actions [run 42306039234](https://github.com/platojobs/PJGoIoT/actions/runs/42306039234) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 | v0.25.0 未验证 | **未验证** | 标记密集写入下的写放大与 payload 增长；`marked_at` 高频变更对端到端 HTTP+JSON 的影响（§7 只测 SQL 层）；其余同 v0.24.0 |
 
 ## 1. 部署前检查清单
