@@ -57,9 +57,10 @@ func main() {
 	idempotencyCutoff := now.Add(-time.Duration(*idempotencyDays) * 24 * time.Hour)
 
 	if *dryRun {
-		fmt.Printf("dry-run:\n  readings: recorded_at < %s\n  change_log: server_ts < %s\n  idempotency_keys: created_at < %s\n  tokens: expires_at < %s\n  pairing_codes: expires_at < %s\n",
+		fmt.Printf("dry-run:\n  readings: recorded_at < %s\n  change_log: server_ts < %s\n  idempotency_keys: created_at < %s\n  tokens: expires_at < %s\n  pairing_codes: expires_at < %s\n  account_deletion_tokens: expires_at < %s\n  personal_data_export_tasks: expires_at < %s\n",
 			readingsCutoff.Format(time.RFC3339), changeLogCutoff.Format(time.RFC3339),
-			idempotencyCutoff.Format(time.RFC3339), now.Format(time.RFC3339), now.Format(time.RFC3339))
+			idempotencyCutoff.Format(time.RFC3339), now.Format(time.RFC3339), now.Format(time.RFC3339),
+			now.Format(time.RFC3339), now.Format(time.RFC3339))
 		return
 	}
 
@@ -89,13 +90,20 @@ func main() {
 	idempotency := run("idempotency_keys", func(c context.Context) (int64, error) { return st.CleanupIdempotencyKeys(c, idempotencyCutoff) })
 	tokens := run("tokens", func(c context.Context) (int64, error) { return st.CleanupTokens(c, now) })
 	codes := run("pairing_codes", func(c context.Context) (int64, error) { return st.CleanupPairingCodes(c, now) })
+	deletionTokens := run("account_deletion_tokens", func(c context.Context) (int64, error) {
+		return st.CleanupDeletionTokens(c, now)
+	})
+	exportTasks := run("personal_data_export_tasks", func(c context.Context) (int64, error) {
+		return st.CleanupExportTasks(c, now)
+	})
 
 	fmt.Printf("清理完成 readings_deleted=%d readings_cutoff=%s retention_days=%d\n"+
 		"change_log_deleted=%d change_log_cutoff=%s change_log_retention_days=%d\n"+
 		"idempotency_keys_deleted=%d idempotency_cutoff=%s idempotency_retention_days=%d\n"+
-		"tokens_deleted=%d pairing_codes_deleted=%d\n",
+		"tokens_deleted=%d pairing_codes_deleted=%d\n"+
+		"account_deletion_tokens_deleted=%d personal_data_export_tasks_deleted=%d\n",
 		readings, readingsCutoff.Format(time.RFC3339), *retentionDays,
 		changes, changeLogCutoff.Format(time.RFC3339), *changeLogDays,
 		idempotency, idempotencyCutoff.Format(time.RFC3339), *idempotencyDays,
-		tokens, codes)
+		tokens, codes, deletionTokens, exportTasks)
 }

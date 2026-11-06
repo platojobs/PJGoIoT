@@ -45,6 +45,20 @@ const (
 	// CodeFeedbackInvalidTransition 表示反馈状态机不允许该跳转（含对已关闭反馈的任何推进）。
 	// 与 CONFLICT 区分，客户端可直接提示「该反馈已关闭」而不是泛化冲突重试。
 	CodeFeedbackInvalidTransition = "FEEDBACK_INVALID_TRANSITION"
+	// CodeDeletionTokenRequired 表示 DELETE /me 缺少二次确认令牌。HTTP 400。
+	CodeDeletionTokenRequired = "DELETION_TOKEN_REQUIRED"
+	// CodeDeletionTokenInvalid 表示删除令牌不存在或与任何账号不匹配。HTTP 403。
+	CodeDeletionTokenInvalid = "DELETION_TOKEN_INVALID"
+	// CodeDeletionTokenExpired 表示删除令牌已超过 10 分钟 TTL。HTTP 410。
+	CodeDeletionTokenExpired = "DELETION_TOKEN_EXPIRED"
+	// CodeAccountDeletionBlocked 表示 owner 的家庭还有其他成员，必须先转让或移除成员。HTTP 409。
+	CodeAccountDeletionBlocked = "ACCOUNT_DELETION_BLOCKED"
+	// CodeExportNotReady 表示导出任务尚未完成，暂不能下载。HTTP 409。
+	CodeExportNotReady = "EXPORT_NOT_READY"
+	// CodeExportDownloadInvalid 表示下载令牌不匹配任何可下载产物。HTTP 403。
+	CodeExportDownloadInvalid = "EXPORT_DOWNLOAD_INVALID"
+	// CodeExportDownloadExpired 表示下载链接已过期或已被使用。HTTP 410。
+	CodeExportDownloadExpired = "EXPORT_DOWNLOAD_EXPIRED"
 )
 
 type errorBody struct {
@@ -147,6 +161,18 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
 		case errors.Is(last, store.ErrFeedbackInvalidTransition):
 			writeError(c.Writer, http.StatusConflict, CodeFeedbackInvalidTransition, "反馈状态不允许该变更（已关闭的反馈不能再次修改）")
+		case errors.Is(last, store.ErrDeletionTokenInvalid):
+			writeError(c.Writer, http.StatusForbidden, CodeDeletionTokenInvalid, "删除令牌无效，请重新申请")
+		case errors.Is(last, store.ErrDeletionTokenExpired):
+			writeError(c.Writer, http.StatusGone, CodeDeletionTokenExpired, "删除令牌已过期，请重新申请")
+		case errors.Is(last, store.ErrAccountDeletionBlocked):
+			writeError(c.Writer, http.StatusConflict, CodeAccountDeletionBlocked, store.ErrAccountDeletionBlocked.Error())
+		case errors.Is(last, store.ErrExportTaskNotReady):
+			writeError(c.Writer, http.StatusConflict, CodeExportNotReady, "导出任务尚未完成，请稍后重试")
+		case errors.Is(last, store.ErrExportDownloadInvalid):
+			writeError(c.Writer, http.StatusForbidden, CodeExportDownloadInvalid, "下载令牌无效或导出任务不可下载")
+		case errors.Is(last, store.ErrExportDownloadExpired):
+			writeError(c.Writer, http.StatusGone, CodeExportDownloadExpired, "下载链接已过期或已被使用，请重新查询导出任务")
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
 		case errors.Is(last, store.ErrDuplicateDevice):

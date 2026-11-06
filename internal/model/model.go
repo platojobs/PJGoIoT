@@ -512,27 +512,97 @@ type User struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-// ExportReading 是数据导出中的一条读数，包含平台与设备键等完整字段。
-type ExportReading struct {
-	ID         string    `json:"id"`
+// DeletionRequest 是 POST /me/deletion-request 的响应体。
+// Token 为一次性删除凭据，只在此处返回一次；服务端仅保存哈希，10 分钟后过期。
+type DeletionRequest struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+// ExportTask 是 POST /me/export 与 GET /me/export/{id} 的响应体（异步导出）。
+// Status 取值 pending / ready / failed；仅 ready 时返回 downloadUrl 与 downloadExpiresAt。
+type ExportTask struct {
+	ID                string     `json:"id"`
+	Status            string     `json:"status"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	CompletedAt       *time.Time `json:"completedAt,omitempty"`
+	DownloadURL       string     `json:"downloadUrl,omitempty"`
+	DownloadExpiresAt *time.Time `json:"downloadExpiresAt,omitempty"`
+	ExpiresAt         time.Time  `json:"expiresAt"`
+}
+
+// ExportTaskStatus 是存储层返回的导出任务内部视图（不直接序列化）。
+type ExportTaskStatus struct {
+	ID                string
+	Status            string
+	CreatedAt         time.Time
+	CompletedAt       *time.Time
+	ExpiresAt         time.Time
+	DownloadExpiresAt *time.Time
+}
+
+// ExportReadingAggregate 是导出中的读数聚合项：按 (platform, externalId, metric, unit) 分组。
+// 个人数据导出刻意采用聚合而非明细，避免大体量账号的产物与内存无界增长；
+// 明细在账号删除前仍可通过 /my/devices/.../readings 获取。
+type ExportReadingAggregate struct {
 	Platform   string    `json:"platform"`
 	ExternalID string    `json:"externalId"`
 	Metric     string    `json:"metric"`
-	Value      float64   `json:"value"`
 	Unit       string    `json:"unit"`
-	RecordedAt time.Time `json:"recordedAt"`
-	DeviceType string    `json:"deviceType,omitempty"`
+	Count      int64     `json:"count"`
+	Min        float64   `json:"min"`
+	Max        float64   `json:"max"`
+	Avg        float64   `json:"avg"`
+	FirstAt    time.Time `json:"firstAt"`
+	LastAt     time.Time `json:"lastAt"`
 }
 
-// ExportPage 是 GET /me/export 的响应体。
-// readings 按 recordedAt 升序；nextCursor 为空且 hasMore=false 表示导出结束。
-type ExportPage struct {
-	User       User            `json:"user"`
-	Devices    []UserDevice    `json:"devices"`
-	Readings   []ExportReading `json:"readings"`
-	ExportedAt time.Time       `json:"exportedAt"`
-	NextCursor string          `json:"nextCursor"`
-	HasMore    bool            `json:"hasMore"`
+// ExportRoom 是导出中的房间信息（仅结构，不含其他成员数据）。
+type ExportRoom struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	SortOrder int       `json:"sortOrder"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ExportHousehold 是导出中本人所属家庭的信息。
+// 只包含本人角色与家庭结构，绝不包含其他成员的身份或联系方式。
+type ExportHousehold struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Role      string       `json:"role"`
+	Personal  bool         `json:"personal"`
+	CreatedAt time.Time    `json:"createdAt"`
+	Rooms     []ExportRoom `json:"rooms"`
+}
+
+// ExportFeedback 是导出中的本人反馈。
+// 包含本人填写的联系方式与诊断文本，但绝不包含运营侧内部备注（internalNote）。
+type ExportFeedback struct {
+	FeedbackID  string    `json:"feedbackId"`
+	Kind        string    `json:"kind"`
+	Body        string    `json:"body"`
+	Contact     *string   `json:"contact,omitempty"`
+	Platform    string    `json:"platform"`
+	AppVersion  string    `json:"appVersion"`
+	BuildType   string    `json:"buildType"`
+	OSVersion   string    `json:"osVersion"`
+	DeviceModel string    `json:"deviceModel"`
+	Diagnostics *string   `json:"diagnostics,omitempty"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+// PersonalDataExport 是导出产物的内容。
+// 只包含调用账号自己的数据；家庭仅含本人角色与房间，不含其他成员信息。
+type PersonalDataExport struct {
+	User        User                     `json:"user"`
+	Devices     []UserDevice             `json:"devices"`
+	Readings    []ExportReadingAggregate `json:"readings"`
+	Households  []ExportHousehold        `json:"households"`
+	Feedback    []ExportFeedback         `json:"feedback"`
+	GeneratedAt time.Time                `json:"generatedAt"`
 }
 
 // StoreCounts 是用于 /metrics 的近似行数，Postgres 通过 pg_class.reltuples 读取。

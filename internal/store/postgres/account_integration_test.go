@@ -11,7 +11,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/platojobs/PJGoIoT/internal/auth"
-	"github.com/platojobs/PJGoIoT/internal/model"
 	"github.com/platojobs/PJGoIoT/internal/store"
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
 )
@@ -47,9 +46,9 @@ func TestPostgresAccountIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A 会在注销测试中被删除，这里只清理 B 与可能残留的码。
+	// 配对码测试结束后两个账号都清理；A 的删除路径在专门的注销测试中覆盖。
 	t.Cleanup(func() {
-		db.Exec("DELETE FROM users WHERE id = $1", userB)
+		db.Exec("DELETE FROM users WHERE id = $1 OR id = $2", userA, userB)
 		db.Exec("DELETE FROM pairing_codes")
 	})
 
@@ -161,99 +160,6 @@ func TestPostgresAccountIntegration(t *testing.T) {
 		}
 	})
 
-	// 准备导出数据：两台设备（其中一台为 tombstone）与 3 条读数。
-	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
-	devices := []model.PushDevice{
-		{
-			ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:01",
-			MAC: "AA:BB:CC:00:00:01", Alias: strPtr("导出设备"), Rules: []byte(`{}`),
-			ScanRecords: []byte(`[]`), UpdatedAt: base,
-		},
-		{
-			ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:02",
-			MAC: "AA:BB:CC:00:00:02", Rules: []byte(`{}`), ScanRecords: []byte(`[]`),
-			UpdatedAt: base.Add(time.Minute), Deleted: true,
-		},
-	}
-	pushReadings := []model.PushReading{
-		{ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:01", Metric: "temperature_celsius", Value: 21, Unit: "celsius", RecordedAt: base},
-		{ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:01", Metric: "temperature_celsius", Value: 22, Unit: "celsius", RecordedAt: base.Add(10 * time.Minute)},
-		{ID: uuid.NewString(), Platform: "android", ExternalID: "AA:BB:CC:00:00:01", Metric: "relative_humidity", Value: 48, Unit: "percent", RecordedAt: base.Add(20 * time.Minute)},
-	}
-	if _, _, err := st.Push(ctx, userA, model.PushRequest{ClientID: "export-client", Devices: devices, Readings: pushReadings},
-		store.PushOptions{IdempotencyKey: "export-1", RequestHash: "export-hash"}); err != nil {
-		t.Fatalf("准备导出数据 push: %v", err)
-	}
-
-	t.Run("导出设备含 tombstone", func(t *testing.T) {
-		list, err := st.ListUserDevicesForExport(ctx, userA)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(list) != 2 {
-			t.Fatalf("设备数=%d", len(list))
-		}
-		var tombstones int
-		for _, d := range list {
-			if d.DeletedAt != nil {
-				tombstones++
-			}
-		}
-		if tombstones != 1 {
-			t.Fatalf("tombstone=%d", tombstones)
-		}
-	})
-
-	t.Run("导出读数分页与内容", func(t *testing.T) {
-		var dbCount int
-		if err := db.QueryRow(`SELECT count(*) FROM readings WHERE user_id = $1`, userA).Scan(&dbCount); err != nil {
-			t.Fatal(err)
-		}
-		if dbCount != 3 {
-			t.Fatalf("库内读数=%d", dbCount)
-		}
-
-		var all []model.ExportReading
-		cursor := ""
-		for page := 0; page < 10; page++ {
-			items, next, hasMore, err := st.ExportReadings(ctx, userA, cursor, 2)
-			if err != nil {
-				t.Fatalf("导出第 %d 页: %v", page, err)
-			}
-			all = append(all, items...)
-			if !hasMore {
-				if next != "" {
-					t.Fatalf("末页 cursor 非空: %q", next)
-				}
-				break
-			}
-			if next == "" || len(items) != 2 {
-				t.Fatalf("分页游标异常: next=%q len=%d", next, len(items))
-			}
-			cursor = next
-		}
-		if len(all) != dbCount {
-			t.Fatalf("导出条数=%d want=%d", len(all), dbCount)
-		}
-		for i := 1; i < len(all); i++ {
-			if all[i].RecordedAt.Before(all[i-1].RecordedAt) {
-				t.Fatalf("导出未按 recordedAt 升序: %+v", all)
-			}
-		}
-		if all[0].ID != pushReadings[0].ID || all[1].ID != pushReadings[1].ID || all[2].ID != pushReadings[2].ID {
-			t.Fatalf("导出顺序与写入不一致: %+v", all)
-		}
-		if all[2].Metric != "relative_humidity" || all[2].Unit != "percent" || all[2].Value != 48 {
-			t.Fatalf("导出字段不一致: %+v", all[2])
-		}
-	})
-
-	t.Run("非法游标", func(t *testing.T) {
-		if _, _, _, err := st.ExportReadings(ctx, userA, "not-base64", 10); !errors.Is(err, store.ErrBadCursor) {
-			t.Fatalf("err=%v", err)
-		}
-	})
-
 	t.Run("近似计数可读", func(t *testing.T) {
 		counts, err := st.ApproxCounts(ctx)
 		if err != nil {
@@ -261,52 +167,6 @@ func TestPostgresAccountIntegration(t *testing.T) {
 		}
 		if counts.Users < 0 || counts.Devices < 0 || counts.Readings < 0 {
 			t.Fatalf("计数为负: %+v", counts)
-		}
-	})
-
-	t.Run("注销级联与幂等", func(t *testing.T) {
-		tables := []string{"tokens", "user_devices", "change_log", "idempotency_keys", "readings", "pairing_codes"}
-		nonZero := 0
-		for _, table := range tables {
-			var n int
-			if err := db.QueryRow("SELECT count(*) FROM "+table+" WHERE user_id = $1", userA).Scan(&n); err != nil {
-				t.Fatalf("统计 %s: %v", table, err)
-			}
-			if n > 0 {
-				nonZero++
-			}
-		}
-		if nonZero < 3 {
-			t.Fatalf("注销前关联数据异常，非空表数=%d", nonZero)
-		}
-
-		if err := st.DeleteUser(ctx, userA); err != nil {
-			t.Fatalf("DeleteUser: %v", err)
-		}
-		for _, table := range tables {
-			var n int
-			if err := db.QueryRow("SELECT count(*) FROM "+table+" WHERE user_id = $1", userA).Scan(&n); err != nil {
-				t.Fatalf("统计 %s: %v", table, err)
-			}
-			if n != 0 {
-				t.Fatalf("注销后 %s 仍有 %d 行", table, n)
-			}
-		}
-		var users int
-		if err := db.QueryRow(`SELECT count(*) FROM users WHERE id = $1`, userA).Scan(&users); err != nil {
-			t.Fatal(err)
-		}
-		if users != 0 {
-			t.Fatalf("注销后 users 仍有 %d 行", users)
-		}
-		if _, err := st.UserIDByTokenHash(ctx, hashA); !errors.Is(err, store.ErrUnauthorized) {
-			t.Fatalf("注销后 token 仍有效: err=%v", err)
-		}
-		if err := st.DeleteUser(ctx, userA); !errors.Is(err, store.ErrUnauthorized) {
-			t.Fatalf("重复注销 err=%v", err)
-		}
-		if _, err := st.UserIDByTokenHash(ctx, hashB); err != nil {
-			t.Fatalf("其他用户受影响: %v", err)
 		}
 	})
 }

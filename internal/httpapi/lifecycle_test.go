@@ -216,7 +216,6 @@ func TestListLimitOutOfRange(t *testing.T) {
 	cases := []string{
 		"/api/v1/my/devices/ios/" + uuid.NewString() + "/readings?limit=501",
 		"/api/v1/sync/changes?limit=501",
-		"/api/v1/me/export?limit=5001",
 	}
 	for _, path := range cases {
 		rec := do(t, h, http.MethodGet, path, "", user.Token, nil)

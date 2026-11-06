@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.14.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.14.0", got)
+	if got := info["version"]; got != "0.15.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.15.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -238,6 +238,115 @@ func TestOpenAPICatalogContract(t *testing.T) {
 	assertRef(t, putOp, "200", "#/components/schemas/CatalogDeviceType")
 	if _, ok := digMap(t, deleteOp, "responses")["204"]; !ok {
 		t.Fatalf("DELETE /admin/catalog/device-types/{type} 缺少 204 响应")
+	}
+}
+
+// TestOpenAPIDeletionExportContract 校验账号删除与个人数据导出契约：
+// 字段与模型逐一对齐、删除接口只用一次性令牌、下载接口允许匿名、错误码齐全。
+func TestOpenAPIDeletionExportContract(t *testing.T) {
+	doc := loadOpenAPIDoc(t)
+	paths := digMap(t, doc, "paths")
+	schemas := digMap(t, digMap(t, doc, "components"), "schemas")
+
+	requestOp := digMap(t, asMapAny(t, paths["/me/deletion-request"]), "post")
+	if requestOp["operationId"] != "createDeletionRequest" || !hasSecurityScheme(t, requestOp, "bearerAuth") {
+		t.Fatalf("deletion-request 契约异常: %v", requestOp)
+	}
+	assertRef(t, requestOp, "201", "#/components/schemas/DeletionRequest")
+
+	// DELETE /me 只用 X-Deletion-Token：security 必须为空，且必须有必填的删除令牌头。
+	deleteOp := digMap(t, asMapAny(t, paths["/me"]), "delete")
+	if sec, ok := deleteOp["security"].([]any); !ok || len(sec) != 0 {
+		t.Fatalf("DELETE /me 不应使用 Bearer（security 必须为空数组），实际 %v", deleteOp["security"])
+	}
+	list, ok := deleteOp["parameters"].([]any)
+	if !ok || len(list) == 0 {
+		t.Fatalf("DELETE /me 缺少 X-Deletion-Token 参数")
+	}
+	header := asMapAny(t, list[0])
+	if header["name"] != "X-Deletion-Token" || header["in"] != "header" || header["required"] != true {
+		t.Fatalf("DELETE /me 删除令牌参数异常: %v", header)
+	}
+	for _, status := range []string{"400", "403", "404", "409", "410", "204"} {
+		if _, ok := digMap(t, deleteOp, "responses")[status]; !ok {
+			t.Fatalf("DELETE /me 缺少 %s 响应", status)
+		}
+	}
+
+	// 导出：POST 创建 + GET 状态都要 Bearer；下载链接本身即凭据，不使用 Bearer。
+	createExportOp := digMap(t, asMapAny(t, paths["/me/export"]), "post")
+	if !hasSecurityScheme(t, createExportOp, "bearerAuth") {
+		t.Fatalf("/me/export POST 应使用 bearerAuth")
+	}
+	assertRef(t, createExportOp, "202", "#/components/schemas/ExportTask")
+	getExportOp := digMap(t, asMapAny(t, paths["/me/export/{id}"]), "get")
+	if !hasSecurityScheme(t, getExportOp, "bearerAuth") {
+		t.Fatalf("/me/export/{id} 应使用 bearerAuth")
+	}
+	assertRef(t, getExportOp, "200", "#/components/schemas/ExportTask")
+	downloadOp := digMap(t, asMapAny(t, paths["/me/export/{id}/download"]), "get")
+	if sec, ok := downloadOp["security"].([]any); !ok || len(sec) != 0 {
+		t.Fatalf("下载接口不应使用 Bearer，实际 %v", downloadOp["security"])
+	}
+	if _, ok := digMap(t, downloadOp, "responses")["403"]; !ok {
+		t.Fatalf("下载接口缺少 403")
+	}
+	if _, ok := digMap(t, downloadOp, "responses")["410"]; !ok {
+		t.Fatalf("下载接口缺少 410")
+	}
+	assertRef(t, downloadOp, "200", "#/components/schemas/PersonalDataExport")
+
+	// 新 schema 的 required/properties 必须与模型 JSON 标签逐项一致。
+	for _, tc := range []struct {
+		schema string
+		model  any
+	}{
+		{"DeletionRequest", model.DeletionRequest{}},
+		{"ExportTask", model.ExportTask{}},
+		{"PersonalDataExport", model.PersonalDataExport{}},
+		{"ExportReadingAggregate", model.ExportReadingAggregate{}},
+		{"ExportHousehold", model.ExportHousehold{}},
+		{"ExportRoom", model.ExportRoom{}},
+		{"ExportFeedback", model.ExportFeedback{}},
+	} {
+		schema := digMap(t, schemas, tc.schema)
+		wantFields := jsonFieldSet(t, tc.model)
+		if got := stringSet(propsOf(digMap(t, schema, "properties"))); !reflect.DeepEqual(got, wantFields) {
+			t.Fatalf("%s properties=%v，模型字段=%v", tc.schema, got, wantFields)
+		}
+		if got := stringSet(asStrings(t, schema["required"])); !reflect.DeepEqual(got, jsonRequiredSet(t, tc.model)) {
+			t.Fatalf("%s required=%v，模型必填字段=%v", tc.schema, got, jsonRequiredSet(t, tc.model))
+		}
+	}
+
+	// 导出产物不得包含他人联系人与运营内部备注；家庭不得暴露其他成员字段。
+	for _, forbidden := range []string{"internalNote", "internal_note", "members", "ownerUserId"} {
+		if _, ok := digMap(t, digMap(t, schemas, "ExportHousehold"), "properties")[forbidden]; ok {
+			t.Fatalf("ExportHousehold 不应暴露 %s", forbidden)
+		}
+	}
+	if _, ok := digMap(t, digMap(t, schemas, "ExportFeedback"), "properties")["internalNote"]; ok {
+		t.Fatalf("ExportFeedback 不应暴露运营内部备注")
+	}
+
+	if got := stringSet(enumOf(t, digMap(t, digMap(t, schemas, "ExportTask"), "properties", "status"))); !reflect.DeepEqual(got,
+		stringSet([]string{"pending", "ready", "failed"})) {
+		t.Fatalf("ExportTask status enum=%v", got)
+	}
+
+	codeEnum := stringSet(enumOf(t, digMap(t, digMap(t, schemas, "Error"), "properties", "error", "properties", "code")))
+	for _, code := range []string{
+		httpapi.CodeDeletionTokenRequired,
+		httpapi.CodeDeletionTokenInvalid,
+		httpapi.CodeDeletionTokenExpired,
+		httpapi.CodeAccountDeletionBlocked,
+		httpapi.CodeExportNotReady,
+		httpapi.CodeExportDownloadInvalid,
+		httpapi.CodeExportDownloadExpired,
+	} {
+		if _, ok := codeEnum[code]; !ok {
+			t.Fatalf("错误码枚举缺少 %s: %v", code, codeEnum)
+		}
 	}
 }
 

@@ -159,6 +159,10 @@ type Store struct {
 	catalogVersion   int64
 	catalogUpdatedAt time.Time
 	catalogAccesses  map[string]map[int64]struct{} // userID -> catalogVersion 集合
+
+	// 账号删除令牌与异步导出任务（与 000016 迁移的表对应）。
+	deletionTokens map[string]*deletionTokenRecord
+	exportTasks    map[string]*exportTaskRecord
 }
 
 // New 从 fixtures 目录加载公共元数据。
@@ -182,6 +186,8 @@ func New(dir string) (*Store, error) {
 		catalogVersion:   1,
 		catalogUpdatedAt: time.Now().UTC(),
 		catalogAccesses:  map[string]map[int64]struct{}{},
+		deletionTokens:   map[string]*deletionTokenRecord{},
+		exportTasks:      map[string]*exportTaskRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))

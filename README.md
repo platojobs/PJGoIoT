@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.14.0**（v0.18.0 新增设备类型目录读取与运营管理）；服务版本 **v0.18.0**（设备类型目录服务端化）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.15.0**（v0.19.0 新增账号删除与个人数据导出）；服务版本 **v0.19.0**（账号删除与数据导出）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -74,8 +74,11 @@ make dev-postgres   # Postgres 模式启动 API
 | POST | `/auth/logout` | Bearer | 204 | 吊销当前 token |
 | POST | `/auth/pairing-code` | Bearer | 201 | 生成一次性配对码，`{code,expiresAt}`；10 分钟有效，新码使旧码失效 |
 | POST | `/auth/pairing-code/claim` | 否 | 200 | 用配对码换取**同一 userId** 的新 token，`{userId,token}`；按 IP 独立限流 |
-| GET | `/me/export` | Bearer | 200 | 导出账号全部数据，读数升序、游标分页，附件下载 |
-| DELETE | `/me` | Bearer | 204 | 硬删除账号及设备/读数/变更日志/token/配对码；重复调用 401 |
+| POST | `/me/deletion-request` | Bearer | 201 | 签发一次性删除令牌 `{token,expiresAt}`；10 分钟有效，只存哈希，再次申请作废旧令牌 |
+| DELETE | `/me` | `X-Deletion-Token` | 204 | 二次确认后硬删除账号及全部个人数据；令牌缺失 400、错误 403、过期 410、owner 有成员 409、重放 404 |
+| POST | `/me/export` | Bearer | 202 | 创建异步导出任务，返回任务 id；客户端轮询状态 |
+| GET | `/me/export/{id}` | Bearer | 200 | 查询导出状态；ready 时返回 10 分钟一次性下载链接 |
+| GET | `/me/export/{id}/download` | 下载令牌 | 200 | 下载导出 JSON；一次性，过期/已用 410，令牌错误 403 |
 | GET | `/devices/{mac}` | 否 | 200 | 公共设备元数据（厂商、型号、固件、GATT、兼容性） |
 | GET | `/device-types` | 否 | 200 | 设备类型列表，`{"items":[...]}` |
 | GET | `/device-types/{type}` | 否 | 200 | 按类型查询设备类型元数据，供 iOS 等无法获取 MAC 的端使用 |
@@ -563,30 +566,48 @@ down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
   （默认 20 次/分钟、突发 10，`PAIRING_CLAIM_RATE_PER_MINUTE` / `PAIRING_CLAIM_BURST` 可调），超限 429；
 - 码哈希比较使用 `crypto/subtle.ConstantTimeCompare`，避免时序侧信道。
 
-#### 数据导出：`GET /me/export`
+#### 个人数据导出：`POST /me/export` → `GET /me/export/{id}` → 下载
 
-响应结构：
+统一采用**异步**导出（不做「小体量同步 / 大体量异步」双分支，客户端只维护一套轮询语义）：
+
+1. `POST /me/export`（Bearer）→ `202`，返回 `{id,status:"pending",createdAt,expiresAt}`；
+2. 轮询 `GET /me/export/{id}`；`status` 为 `pending` / `ready` / `failed`；
+3. `ready` 时响应带 `downloadUrl`（含一次性令牌，10 分钟有效）与 `downloadExpiresAt`；
+   每次查询都会签发**新**链接并让旧链接立即失效；
+4. `GET /me/export/{id}/download?token=…` 不使用 Bearer；首次下载即失效，重放/过期 `410`，
+   令牌错误 `403`；响应头 `Content-Disposition: attachment; filename="pjgoiot-export-<taskId>.json"`。
+
+产物结构（仅本人数据）：
 
 ```json
 {"user":{"id":"...","kind":"anonymous","createdAt":"..."},
- "devices":[...全部设备，含 tombstone...],
- "readings":[{"id":"...","platform":"android","externalId":"...","metric":"...",
-              "value":21.5,"unit":"celsius","recordedAt":"...","deviceType":"..."}],
- "exportedAt":"...","nextCursor":"...","hasMore":false}
+ "devices":[...全部设备，含 tombstone，按 updatedAt 倒序...],
+ "readings":[{"platform":"android","externalId":"...","metric":"...","unit":"celsius",
+              "count":2,"min":21,"max":23,"avg":22,"firstAt":"...","lastAt":"..."}],
+ "households":[{"id":"...","name":"...","role":"owner","personal":true,"createdAt":"...",
+               "rooms":[{"id":"...","name":"...","sortOrder":0,"createdAt":"..."}]}],
+ "feedback":[{"feedbackId":"...","kind":"bug","body":"...","contact":"...","diagnostics":"...",
+              "status":"received","createdAt":"...","updatedAt":"..."}],
+ "generatedAt":"..."}
 ```
 
-- `readings` 按 `recordedAt` **升序**（同一时刻按 `id` 升序）；`devices` 按 `updatedAt` 倒序；
-- `?limit=` 默认 5000、最大 5000；`?cursor=` 传上一页 `nextCursor`，`hasMore=false` 时 `nextCursor` 为空串；
-  单账号超过 5 万条时客户端按页拉取，服务端不做一次性全量拼装；
-- 响应头 `Content-Disposition: attachment; filename="pjkotlinapp-export-<userId>.json"`；
-- 非法 `limit` / `cursor` 返回 400；未认证 401。
+- 读数按 `(platform, externalId, metric, unit)` **聚合**，产物大小与读数条数无关；逐条明细在删除前仍可通过读数接口获取；
+- 家庭只含本人角色与房间，**不含其他成员身份或联系方式**；
+- 反馈只含本人联系方式与诊断文本，**不含运营内部备注**；
+- 产物保留 24 小时，到期由 `cmd/cleanup` 清理。
 
-#### 注销：`DELETE /me`
+#### 注销：`POST /me/deletion-request` + `DELETE /me`
 
-- 硬删除 `users` 行，外键 `ON DELETE CASCADE` 级联清理 `tokens`、`user_devices`、`readings`、
-  `change_log`、`idempotency_keys`、`pairing_codes`；成功 `204`；
-- 删除后该账号**所有 token 立即 401**；重复调用同样返回 **401**（幂等语义，不是 404）；
-- 不可恢复，客户端必须二次确认。
+- 第一步（Bearer）`POST /me/deletion-request` → `201`，返回一次性令牌 `{token,expiresAt}`；
+  服务端只存 SHA-256 哈希，10 分钟过期，同一账号再次申请让旧令牌立即失效；
+- 第二步 `DELETE /me`，请求头 `X-Deletion-Token`（**不用 Bearer**）→ `204`；
+- 单事务硬删除：设备（含 tombstone）、读数、房间、家庭关系、邀请码、本人反馈及其状态审计、
+  token、推送幂等记录、变更日志、目录访问记录、导出任务；
+- 本人是 owner 的家庭还有其他成员时返回 `409 ACCOUNT_DELETION_BLOCKED`，
+  必须先转让所有权或移除成员（避免孤儿家庭）；被拦截时账号与数据完整保留；
+- 删除后全部 token 立即 `401`；同一删除令牌重放返回 `404`（账号已不存在），不会部分删除；
+- 令牌缺失 `400 DELETION_TOKEN_REQUIRED`、错误 `403 DELETION_TOKEN_INVALID`、过期 `410 DELETION_TOKEN_EXPIRED`；
+- 不可恢复。
 
 #### 可观测性
 
@@ -1116,13 +1137,15 @@ curl -s -X POST $BASE/auth/pairing-code/claim \
   -d '{"code":"K7M2QX9P"}'
 # 失败统一 404：{"error":{"code":"NOT_FOUND","message":"配对码无效或已过期"}}
 
-# 12. 导出全部数据（附件下载；读数升序，超过 limit 时用 nextCursor 翻页）
-curl -s -D - "$BASE/me/export?limit=1000" \
-  -H "Authorization: Bearer $TOKEN" -o "pjkotlinapp-export.json"
-# 下一页：curl -s "$BASE/me/export?limit=1000&cursor=<nextCursor>" -H "Authorization: Bearer $TOKEN"
+# 12. 异步导出（先创建任务并轮询状态，ready 后用返回的 downloadUrl 下载）
+TASK=$(curl -s -X POST "$BASE/me/export" -H "Authorization: Bearer $TOKEN" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+curl -s "$BASE/me/export/$TASK" -H "Authorization: Bearer $TOKEN"
+# 拿到 downloadUrl 后：curl -s "$BASE${downloadUrl}" -o pjgoiot-export.json
 
-# 13. 注销账号（硬删除全部数据；返回 204，之后原 token 401）
-curl -i -X DELETE $BASE/me -H "Authorization: Bearer $TOKEN"
+# 13. 注销账号（二次确认：先申请 10 分钟一次性令牌，再带 X-Deletion-Token 删除）
+DEL=$(curl -s -X POST "$BASE/me/deletion-request" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -i -X DELETE $BASE/me -H "X-Deletion-Token: $DEL"
 
 # 14. Prometheus 指标（根路径，无需鉴权，不受限流）
 curl -s http://127.0.0.1:8080/metrics
@@ -1298,7 +1321,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.18.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.14.0 不是同一个号 |
+| `APP_VERSION` | `0.19.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.15.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1482,6 +1505,13 @@ seed 数据来源与边界：
 | v0.18.0 CI | 通过：GitHub Actions [run 42166636796](https://github.com/platojobs/PJGoIoT/actions/runs/42166636796) 四 job 全绿；`Postgres 集成测试` 执行 `TestPostgresCatalogDeviceTypesIntegration` 全部子测试，`OpenAPI 契约校验` 0 error |
 | v0.18.0 客户端接入 | 未验证：两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
 | v0.18.0 admin 并发 | 未验证：目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
+| v0.19.0 删除令牌与逐表清空 | 通过（真实 PostgreSQL）：错误令牌/过期令牌分别返回明确错误；删除前 14 张关联表全部非空，删除后逐表计数为 0，`users` 为 0；新申请作废旧令牌 |
+| v0.19.0 旧 token 与重放 | 通过（真实 PostgreSQL）：删除后旧 token 返回 `ErrUnauthorized`；同一令牌重放返回 `ErrNotFound`（404 语义）；清理墓碑后重放返回 `ErrDeletionTokenInvalid` |
+| v0.19.0 owner 拦截与转让 | 通过（真实 PostgreSQL + HTTP）：owner 家庭有成员时 409 `ACCOUNT_DELETION_BLOCKED` 且数据保留；转让后同一令牌可删除，家庭归新 owner |
+| v0.19.0 异步导出与隔离 | 通过（真实 PostgreSQL）：任务 pending→ready；读数聚合字段正确；产物不含他人设备/读数/用户 id 与运营 `internal_note`；家庭仅含本人角色与房间 |
+| v0.19.0 下载链接一次性 | 通过（真实 PostgreSQL + HTTP）：pending 不可签发（409）；首次下载成功，重放/过期 410，错误令牌 403；任务过期清理后查询 404 |
+| v0.19.0 HTTP 鉴权与错误码 | 通过（fixture）：删除申请/导出须 Bearer；`DELETE /me` 缺/错令牌 400/403，owner 有成员 409，成功 204，重放 404；下载与任务查询隔离 |
+| v0.19.0 契约一致性 | 通过：`TestOpenAPIDeletionExportContract` 校验 7 个新 schema 的 properties/required、`security: []`、错误码枚举与 `ExportTask` 状态枚举；契约版本 **0.15.0** |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |

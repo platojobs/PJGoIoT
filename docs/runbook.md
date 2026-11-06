@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.18.0）
+# PJGoIoT 运行手册（v0.19.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -98,6 +98,15 @@
 | v0.18.0 客户端接入 | **未验证** | 两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
 | v0.18.0 admin 并发 | **未验证** | 目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
 | v0.18.0 访问日志分析 | **未验证** | 访问表只做 `(user, 版本)` 去重，未接入灰度分流逻辑；未评估长期行数增长与清理策略 |
+| v0.19.0 删除令牌 | **已验证** | 真实 PG：错误令牌→`ErrDeletionTokenInvalid`、过期令牌→`ErrDeletionTokenExpired`、有效令牌删除成功；缺令牌由 HTTP 层 400 拦截；令牌只存哈希，新申请作废旧令牌 |
+| v0.19.0 逐表清空 | **已验证** | 真实 PG：删除前 14 张关联表全部非空，删除后 `tokens`/`user_devices`/`readings`/`change_log`/`idempotency_keys`/`pairing_codes`/`feedback`/`feedback_status_events`/目录访问/导出任务/家庭/成员/房间/邀请逐表计数为 0，`users` 为 0 |
+| v0.19.0 旧 token 与重放 | **已验证** | 真实 PG：删除后 `UserIDByTokenHash` 返回 `ErrUnauthorized`；同一令牌重放返回 `ErrNotFound`（404 语义），无部分删除；清理墓碑后重放返回 `ErrDeletionTokenInvalid` |
+| v0.19.0 owner 拦截与转让 | **已验证** | 真实 PG + HTTP：owner 家庭有成员时 `ErrAccountDeletionBlocked`/409，账号与家庭完整保留；转让后同一令牌可删除，家庭归新 owner 且成员数 1 |
+| v0.19.0 异步导出与隔离 | **已验证** | 真实 PG：`CreateExportTask`→`BuildPersonalDataExport`→`FinishExportTask`；读数聚合 `count/min/max/avg/firstAt/lastAt`；产物不含他人设备/读数/用户 id、不含运营 `internal_note`；家庭仅含本人角色与房间 |
+| v0.19.0 下载链接一次性 | **已验证** | 真实 PG + HTTP：pending 任务签发下载令牌返回 `ErrExportTaskNotReady`/409；首次消费成功，重放 410，错误令牌 403，过期 410；任务过期清理后查询 404 |
+| v0.19.0 HTTP 错误码矩阵 | **已验证** | `TestExportAsyncAndDownload` / `TestDeleteMeRequiresDeletionToken` / `TestDeleteMeBlockedByOwnedHousehold`：未认证 401、缺/错/过期令牌 400/403/410、冲突 409、重放 404、他人任务 404、下载 403/410 |
+| v0.19.0 迁移与清理 | **已验证** | 真实 PG 执行 `000016_account_deletion_export` up；`cmd/cleanup` 新增 `account_deletion_tokens` 与 `personal_data_export_tasks` 清理；dry-run 输出两个新计数 |
+| v0.19.0 契约一致性 | **已验证** | `TestOpenAPIDeletionExportContract`：7 个新 schema 的 properties/required 与模型 JSON 标签逐项一致；`DELETE /me` 与下载接口 `security: []`；错误码枚举含 7 个新码；契约版本 0.15.0 |
 
 ## 1. 部署前检查清单
 
@@ -844,6 +853,22 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 - **软删恢复**：当前管理端不提供恢复接口；需要恢复时由 DBA 将 `deleted_at` 置空、
   执行 `UPDATE device_type_catalog_meta SET version = version + 1, updated_at = now() WHERE id = 1`
   并补一条审计，或按真值表重新生成 seed 后走发布流程。操作前先备份该行。
+
+### 7.16 账号删除与个人数据导出排障（v0.19.0）
+
+- **删除被 409 拦截**：说明调用者是某个家庭的 owner 且该家庭还有其他成员。
+  先让 owner 用 `POST /households/{id}/transfer-ownership` 转让，或先移除其他成员，再重新申请删除令牌。
+  被拦截不会删除任何数据。
+- **删除令牌报错**：400 = 请求头缺 `X-Deletion-Token`；403 = 令牌不存在/不属于该账号；
+  410 = 超过 10 分钟；404 = 令牌已用于一次成功删除（账号已不存在，重放语义）。重新申请即可。
+- **旧 token 仍能访问**：正常删除是单事务并删除 `tokens`，不应出现；若出现，检查是否删除事务失败
+  （看 API 日志 `删除 xxx 失败`），事务失败会整体回滚、账号保持可用。
+- **导出一直 pending**：后台构建有 60 秒超时，失败会置为 `failed`；查看 API 日志
+  `生成个人数据导出失败` / `写入导出产物失败`。`failed` 任务需要重新 `POST /me/export`。
+- **下载 410**：链接一次性且 10 分钟有效，重复下载或超时都会 410；重新 `GET /me/export/{id}`
+  会签发新链接并让旧链接失效。403 表示令牌不正确（不要手动拼接 `token`）。
+- **产物保留**：导出产物保留 24 小时；`cmd/cleanup` 同时清理过期的 `account_deletion_tokens`
+  与 `personal_data_export_tasks`，dry-run 会打印两类计数。
 
 ## 8. 监控与告警
 

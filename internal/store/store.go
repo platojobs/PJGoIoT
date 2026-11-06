@@ -45,6 +45,21 @@ var (
 	// ErrFeedbackInvalidTransition 表示反馈状态机不允许该跳转（含对已关闭反馈的任何推进）。
 	// HTTP 层映射为 409 FEEDBACK_INVALID_TRANSITION。
 	ErrFeedbackInvalidTransition = errors.New("反馈状态不允许该变更")
+	// ErrDeletionTokenInvalid 表示删除令牌不存在或与任何账号不匹配。
+	// HTTP 层映射为 403 DELETION_TOKEN_INVALID。
+	ErrDeletionTokenInvalid = errors.New("删除令牌无效")
+	// ErrDeletionTokenExpired 表示删除令牌已超过 10 分钟 TTL。
+	// HTTP 层映射为 410 DELETION_TOKEN_EXPIRED。
+	ErrDeletionTokenExpired = errors.New("删除令牌已过期")
+	// ErrAccountDeletionBlocked 表示账号是某个家庭的 owner，且该家庭还有其他成员。
+	// 删除会留下孤儿家庭成员，因此必须先转让所有权或移除成员。HTTP 层映射为 409 ACCOUNT_DELETION_BLOCKED。
+	ErrAccountDeletionBlocked = errors.New("家庭还有其他成员，请先转让所有权或移除其他成员后再删除账号")
+	// ErrExportTaskNotReady 表示导出任务尚未完成，不能签发下载链接。HTTP 层映射为 409 EXPORT_NOT_READY。
+	ErrExportTaskNotReady = errors.New("导出任务尚未完成")
+	// ErrExportDownloadInvalid 表示下载令牌不匹配任何可下载产物。HTTP 层映射为 403 EXPORT_DOWNLOAD_INVALID。
+	ErrExportDownloadInvalid = errors.New("下载令牌无效")
+	// ErrExportDownloadExpired 表示下载令牌已过期或已被使用。HTTP 层映射为 410 EXPORT_DOWNLOAD_EXPIRED。
+	ErrExportDownloadExpired = errors.New("下载链接已过期或已被使用")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -103,9 +118,35 @@ type Store interface {
 	RevokeToken(ctx context.Context, tokenHash string) error
 	// GetUser 返回账号基础信息，供数据导出使用。
 	GetUser(ctx context.Context, userID string) (model.User, error)
-	// DeleteUser 硬删除用户及其设备、读数、变更日志、token 与配对码。
-	// 用户不存在时返回 ErrUnauthorized，保证重复注销仍是 401。
-	DeleteUser(ctx context.Context, userID string) error
+
+	// CreateDeletionToken 为账号签发一次性删除令牌（只存哈希）；同一账号的新令牌使旧令牌失效。
+	CreateDeletionToken(ctx context.Context, userID string, tokenHash string, expiresAt time.Time) error
+	// DeleteAccount 用一次性删除令牌删除账号及其全部个人数据（单事务）。
+	// 令牌不存在 -> ErrDeletionTokenInvalid；已过期 -> ErrDeletionTokenExpired；
+	// 已使用或账号已不存在 -> ErrNotFound（重放删除返回 404）；
+	// owner 的家庭还有其他成员 -> ErrAccountDeletionBlocked。
+	DeleteAccount(ctx context.Context, tokenHash string, now time.Time) error
+
+	// CreateExportTask 创建一个 pending 的异步导出任务，返回任务 id 与保留到期时间。
+	CreateExportTask(ctx context.Context, userID string, expiresAt time.Time) (model.ExportTaskStatus, error)
+	// BuildPersonalDataExport 汇总账号自己的数据（设备、读数聚合、家庭、反馈），不含他人数据。
+	BuildPersonalDataExport(ctx context.Context, userID string) (model.PersonalDataExport, error)
+	// FinishExportTask 把任务置为 ready 并写入产物。
+	FinishExportTask(ctx context.Context, taskID string, artifact model.PersonalDataExport) error
+	// FailExportTask 把任务置为 failed 并写入对外可读原因。
+	FailExportTask(ctx context.Context, taskID string, reason string) error
+	// GetExportTask 按 (userID, taskID) 查询任务；不存在或不属于该用户返回 ErrNotFound。
+	GetExportTask(ctx context.Context, userID string, taskID string) (model.ExportTaskStatus, error)
+	// PrepareExportDownload 为 ready 的任务签发一次性下载令牌（只存哈希），替换旧令牌。
+	// 任务不存在 -> ErrNotFound；未 ready -> ErrExportTaskNotReady；产物已过期 -> ErrNotFound。
+	PrepareExportDownload(ctx context.Context, userID string, taskID string, tokenHash string, expiresAt time.Time) (model.ExportTaskStatus, error)
+	// ConsumeExportDownload 校验并消费一次性下载令牌，返回产物。
+	// 令牌不存在或任务未 ready -> ErrExportDownloadInvalid；已使用或已过期 -> ErrExportDownloadExpired。
+	ConsumeExportDownload(ctx context.Context, tokenHash string, now time.Time) (model.PersonalDataExport, error)
+	// CleanupDeletionTokens 删除 expiresAt 早于 before 的删除令牌，返回删除条数。
+	CleanupDeletionTokens(ctx context.Context, before time.Time) (int64, error)
+	// CleanupExportTasks 删除 expiresAt 早于 before 的导出任务（产物一并删除），返回删除条数。
+	CleanupExportTasks(ctx context.Context, before time.Time) (int64, error)
 
 	// CreatePairingCode 为当前用户签发一次性配对码；同一用户的新码使旧码失效。
 	CreatePairingCode(ctx context.Context, userID string, codeHash string, expiresAt time.Time) error
@@ -213,10 +254,4 @@ type Store interface {
 	// 允许 submitted->received、submitted->closed、received->submitted、received->closed；
 	// 同状态视为幂等 no-op（不写审计）；其余跳转返回 ErrFeedbackInvalidTransition。
 	UpdateFeedbackStatus(ctx context.Context, feedbackID string, targetStatus string, note *string) (model.AdminFeedback, error)
-
-	// ListUserDevicesForExport 返回用户全部设备（含已删除的 tombstone），按 updated_at 倒序。
-	ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error)
-	// ExportReadings 按 recorded_at 升序导出读数，cursor 为不透明游标。
-	// 返回下一页游标与是否还有更多；非法游标返回 ErrBadCursor。
-	ExportReadings(ctx context.Context, userID string, cursor string, limit int) ([]model.ExportReading, string, bool, error)
 }

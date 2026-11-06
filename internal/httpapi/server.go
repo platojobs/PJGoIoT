@@ -71,9 +71,15 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	authGroup.POST("/pairing-code", s.requireAuth(), s.handleCreatePairingCode)
 	authGroup.POST("/pairing-code/claim", s.claimRateLimit(), s.handleClaimPairingCode)
 
-	meGroup := api.Group("/me", s.requireAuth())
-	meGroup.GET("/export", s.handleExport)
+	// 账号数据：删除与导出。
+	// DELETE /me 只用一次性删除令牌鉴权（账号删除后 Bearer 已失效，重放必须得到 404 而不是 401）。
+	meGroup := api.Group("/me")
+	meGroup.POST("/deletion-request", s.requireAuth(), s.handleCreateDeletionRequest)
 	meGroup.DELETE("", s.handleDeleteMe)
+	meGroup.POST("/export", s.requireAuth(), s.handleCreateExport)
+	meGroup.GET("/export/:id", s.requireAuth(), s.handleGetExport)
+	// 下载链接本身即凭据（短期 + 一次性），不使用 Bearer，便于浏览器直接打开。
+	meGroup.GET("/export/:id/download", s.handleDownloadExport)
 
 	devicesGroup := api.Group("/devices")
 	devicesGroup.GET("/:mac", s.handlePublicDevice)

@@ -31,27 +31,45 @@ type claimResp struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 
-type exportReading struct {
-	ID         string    `json:"id"`
+type deletionRequestResp struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type exportTaskResp struct {
+	ID                string     `json:"id"`
+	Status            string     `json:"status"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	CompletedAt       *time.Time `json:"completedAt,omitempty"`
+	DownloadURL       string     `json:"downloadUrl,omitempty"`
+	DownloadExpiresAt *time.Time `json:"downloadExpiresAt,omitempty"`
+	ExpiresAt         time.Time  `json:"expiresAt"`
+}
+
+type exportAggregate struct {
 	Platform   string    `json:"platform"`
 	ExternalID string    `json:"externalId"`
 	Metric     string    `json:"metric"`
-	Value      float64   `json:"value"`
 	Unit       string    `json:"unit"`
-	RecordedAt time.Time `json:"recordedAt"`
+	Count      int64     `json:"count"`
+	Min        float64   `json:"min"`
+	Max        float64   `json:"max"`
+	Avg        float64   `json:"avg"`
+	FirstAt    time.Time `json:"firstAt"`
+	LastAt     time.Time `json:"lastAt"`
 }
 
-type exportResp struct {
+type personalExportResp struct {
 	User struct {
 		ID        string    `json:"id"`
 		Kind      string    `json:"kind"`
 		CreatedAt time.Time `json:"createdAt"`
 	} `json:"user"`
-	Devices    []map[string]any `json:"devices"`
-	Readings   []exportReading  `json:"readings"`
-	ExportedAt time.Time        `json:"exportedAt"`
-	NextCursor string           `json:"nextCursor"`
-	HasMore    bool             `json:"hasMore"`
+	Devices     []map[string]any  `json:"devices"`
+	Readings    []exportAggregate `json:"readings"`
+	Households  []map[string]any  `json:"households"`
+	Feedback    []map[string]any  `json:"feedback"`
+	GeneratedAt time.Time         `json:"generatedAt"`
 }
 
 func newHandlerWithStore(t *testing.T, cfg config.Config, st *fixture.Store) http.Handler {
@@ -186,9 +204,14 @@ func TestPairingCodeExpired(t *testing.T) {
 	}
 }
 
-func TestExportContentAndPagination(t *testing.T) {
-	h := newHandler(t, 0)
+func TestExportAsyncAndDownload(t *testing.T) {
+	st, err := fixture.New("../../fixtures")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandlerWithStore(t, config.Config{Version: "test"}, st)
 	user := newUser(t, h)
+	other := newUser(t, h)
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 
 	readings := []string{
@@ -197,76 +220,125 @@ func TestExportContentAndPagination(t *testing.T) {
 		readingJSON("44444444-4444-4444-8444-444444444444", "android", "AA:BB:CC:00:00:01", "temperature_celsius", "21", "celsius", base),
 	}
 	body := pushBody(t, "["+deviceJSON("11111111-1111-4111-8111-111111111111", "AA:BB:CC:00:00:01", base)+"]", readings)
-	rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil)
-	if rec.Code != http.StatusOK {
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", body, user.Token, nil); rec.Code != http.StatusOK {
 		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
 	}
-
-	rec = do(t, h, http.MethodGet, "/api/v1/me/export", "", user.Token, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("export status=%d body=%s", rec.Code, rec.Body.String())
+	// 另一个账号的数据绝不能出现在导出里。
+	otherBody := pushBody(t, "["+deviceJSON("55555555-5555-4555-8555-555555555555", "AA:BB:CC:00:00:02", base)+"]",
+		[]string{readingJSON("66666666-6666-4666-8666-666666666666", "android", "AA:BB:CC:00:00:02", "temperature_celsius", "99", "celsius", base)})
+	if rec := do(t, h, http.MethodPost, "/api/v1/sync/push", otherBody, other.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("other push status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	wantCD := `attachment; filename="pjkotlinapp-export-` + user.UserID + `.json"`
+
+	if rec := do(t, h, http.MethodPost, "/api/v1/me/export", "", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未认证 export status=%d", rec.Code)
+	}
+	rec := do(t, h, http.MethodPost, "/api/v1/me/export", "", user.Token, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("创建导出任务 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	created := decode[exportTaskResp](t, rec)
+	if created.ID == "" || created.Status != "pending" || created.ExpiresAt.IsZero() {
+		t.Fatalf("创建任务响应异常: %+v", created)
+	}
+
+	ready := waitExportReady(t, h, user.Token, created.ID)
+	if ready.Status != "ready" || ready.DownloadURL == "" || ready.DownloadExpiresAt == nil {
+		t.Fatalf("任务未就绪: %+v", ready)
+	}
+	if d := time.Until(*ready.DownloadExpiresAt); d < 9*time.Minute || d > 11*time.Minute {
+		t.Fatalf("下载链接 TTL 异常: %v", d)
+	}
+
+	// 错误令牌 403。
+	rec = do(t, h, http.MethodGet, "/api/v1/me/export/"+created.ID+"/download?token=not-a-real-token", "", "", nil)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "EXPORT_DOWNLOAD_INVALID") {
+		t.Fatalf("错误下载令牌 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodGet, ready.DownloadURL, "", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("下载 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	wantCD := `attachment; filename="pjgoiot-export-` + created.ID + `.json"`
 	if got := rec.Header().Get("Content-Disposition"); got != wantCD {
 		t.Fatalf("Content-Disposition=%q want=%q", got, wantCD)
 	}
-	first := decode[exportResp](t, rec)
-	if first.User.ID != user.UserID || first.User.Kind != "anonymous" || first.User.CreatedAt.IsZero() {
-		t.Fatalf("user 信息不完整: %+v", first.User)
+	exported := decode[personalExportResp](t, rec)
+	if exported.User.ID != user.UserID || exported.User.Kind != "anonymous" || exported.User.CreatedAt.IsZero() {
+		t.Fatalf("user 信息不完整: %+v", exported.User)
 	}
-	if len(first.Devices) != 1 {
-		t.Fatalf("devices=%d", len(first.Devices))
+	if len(exported.Devices) != 1 {
+		t.Fatalf("devices=%d", len(exported.Devices))
 	}
-	if len(first.Readings) != 3 {
-		t.Fatalf("readings=%d", len(first.Readings))
+	// 3 条读数聚合为 temperature(2 条) 与 humidity(1 条)。
+	if len(exported.Readings) != 2 {
+		t.Fatalf("readings 聚合数=%d want=2: %+v", len(exported.Readings), exported.Readings)
 	}
-	for i := 1; i < len(first.Readings); i++ {
-		if first.Readings[i].RecordedAt.Before(first.Readings[i-1].RecordedAt) {
-			t.Fatalf("readings 未按 recordedAt 升序: %+v", first.Readings)
+	var temp *exportAggregate
+	for i := range exported.Readings {
+		if exported.Readings[i].Metric == "temperature_celsius" {
+			temp = &exported.Readings[i]
 		}
 	}
-	if first.Readings[0].ID != "44444444-4444-4444-8444-444444444444" ||
-		first.Readings[2].ID != "33333333-3333-4333-8333-333333333333" {
-		t.Fatalf("导出内容与写入不一致: %+v", first.Readings)
+	if temp == nil || temp.Count != 2 || temp.Min != 21 || temp.Max != 23 || temp.Avg != 22 {
+		t.Fatalf("temperature 聚合异常: %+v", temp)
 	}
-	if first.HasMore || first.NextCursor != "" {
-		t.Fatalf("默认 limit 下不应分页: hasMore=%v cursor=%q", first.HasMore, first.NextCursor)
+	if !temp.FirstAt.Equal(base) || !temp.LastAt.Equal(base.Add(20*time.Minute)) {
+		t.Fatalf("聚合时间范围异常: first=%s last=%s", temp.FirstAt, temp.LastAt)
 	}
-
-	// limit=2 分页。
-	rec = do(t, h, http.MethodGet, "/api/v1/me/export?limit=2", "", user.Token, nil)
-	page1 := decode[exportResp](t, rec)
-	if len(page1.Readings) != 2 || !page1.HasMore || page1.NextCursor == "" {
-		t.Fatalf("第一页异常: len=%d hasMore=%v cursor=%q", len(page1.Readings), page1.HasMore, page1.NextCursor)
-	}
-	rec = do(t, h, http.MethodGet, "/api/v1/me/export?limit=2&cursor="+page1.NextCursor, "", user.Token, nil)
-	page2 := decode[exportResp](t, rec)
-	if len(page2.Readings) != 1 || page2.HasMore || page2.NextCursor != "" {
-		t.Fatalf("第二页异常: len=%d hasMore=%v cursor=%q", len(page2.Readings), page2.HasMore, page2.NextCursor)
-	}
-	combined := append(append([]exportReading{}, page1.Readings...), page2.Readings...)
-	if len(combined) != 3 || combined[0].ID != first.Readings[0].ID || combined[2].ID != first.Readings[2].ID {
-		t.Fatalf("分页内容不连续: %+v", combined)
+	if strings.Contains(rec.Body.String(), "AA:BB:CC:00:00:02") || strings.Contains(rec.Body.String(), other.UserID) {
+		t.Fatalf("导出泄露他人数据: %s", rec.Body.String())
 	}
 
-	// 非法分页参数。
-	for _, path := range []string{
-		"/api/v1/me/export?limit=0",
-		"/api/v1/me/export?limit=5001",
-		"/api/v1/me/export?limit=abc",
-		"/api/v1/me/export?cursor=not-base64",
-	} {
-		rec := do(t, h, http.MethodGet, path, "", user.Token, nil)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("%s status=%d body=%s", path, rec.Code, rec.Body.String())
-		}
+	// 一次性：同一链接第二次 410；重新查询任务可拿到新链接。
+	if rec := do(t, h, http.MethodGet, ready.DownloadURL, "", "", nil); rec.Code != http.StatusGone {
+		t.Fatalf("重放下载 status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := do(t, h, http.MethodGet, "/api/v1/me/export", "", "", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("未认证 export status=%d", rec.Code)
+	again := waitExportReady(t, h, user.Token, created.ID)
+	if again.DownloadURL == "" || again.DownloadURL == ready.DownloadURL {
+		t.Fatalf("应签发新下载链接: %q", again.DownloadURL)
+	}
+	if rec := do(t, h, http.MethodGet, again.DownloadURL, "", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("新链接不可用: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 过期链接：把下载令牌有效期拨到过去后必须 410。
+	expiredToken, expiredHash, err := auth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PrepareExportDownload(context.Background(), user.UserID, created.ID, expiredHash, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, h, http.MethodGet, "/api/v1/me/export/"+created.ID+"/download?token="+expiredToken, "", "", nil)
+	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "EXPORT_DOWNLOAD_EXPIRED") {
+		t.Fatalf("过期链接 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if rec := do(t, h, http.MethodGet, "/api/v1/me/export/"+created.ID, "", other.Token, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("他人任务 status=%d", rec.Code)
 	}
 }
 
-func TestDeleteMeIdempotent(t *testing.T) {
+func waitExportReady(t *testing.T, h http.Handler, token string, taskID string) exportTaskResp {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rec := do(t, h, http.MethodGet, "/api/v1/me/export/"+taskID, "", token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("查询导出任务 status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		task := decode[exportTaskResp](t, rec)
+		if task.Status == "ready" {
+			return task
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("等待导出任务就绪超时")
+	return exportTaskResp{}
+}
+
+func TestDeleteMeRequiresDeletionToken(t *testing.T) {
 	h := newHandler(t, 0)
 	victim := newUser(t, h)
 	other := newUser(t, h)
@@ -278,19 +350,105 @@ func TestDeleteMeIdempotent(t *testing.T) {
 		t.Fatalf("push status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	rec := do(t, h, http.MethodDelete, "/api/v1/me", "", victim.Token, nil)
+	if rec := do(t, h, http.MethodPost, "/api/v1/me/deletion-request", "", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未认证 deletion-request status=%d", rec.Code)
+	}
+	rec := do(t, h, http.MethodPost, "/api/v1/me/deletion-request", "", victim.Token, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("deletion-request status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	request := decode[deletionRequestResp](t, rec)
+	if len(request.Token) < 32 || request.ExpiresAt.IsZero() {
+		t.Fatalf("删除令牌响应异常: %+v", request)
+	}
+	if d := time.Until(request.ExpiresAt); d < 9*time.Minute || d > 11*time.Minute {
+		t.Fatalf("删除令牌 TTL 异常: %v", d)
+	}
+
+	// 少令牌与错令牌必须是明确错误码。
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", nil)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "DELETION_TOKEN_REQUIRED") {
+		t.Fatalf("缺令牌 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", map[string]string{"X-Deletion-Token": "wrong-token"})
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "DELETION_TOKEN_INVALID") {
+		t.Fatalf("错令牌 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", map[string]string{"X-Deletion-Token": request.Token})
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("注销 status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := do(t, h, http.MethodGet, "/api/v1/me/export", "", victim.Token, nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("注销后 export status=%d body=%s", rec.Code, rec.Body.String())
+	// 旧 Bearer 立即失效。
+	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", victim.Token, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("注销后旧 token status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := do(t, h, http.MethodDelete, "/api/v1/me", "", victim.Token, nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("重复注销 status=%d body=%s", rec.Code, rec.Body.String())
+	// 同一删除请求重放：账号已不存在，返回 404 而不是未知错误。
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", map[string]string{"X-Deletion-Token": request.Token})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("重放删除 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 新的删除申请也无法再找到账号（Bearer 已失效）。
+	if rec := do(t, h, http.MethodPost, "/api/v1/me/deletion-request", "", victim.Token, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("注销后申请删除 status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	// 其他用户不受影响。
 	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", other.Token, nil); rec.Code != http.StatusOK {
 		t.Fatalf("其他用户受注销影响: %d", rec.Code)
+	}
+}
+
+func TestDeleteMeBlockedByOwnedHousehold(t *testing.T) {
+	st, err := fixture.New("../../fixtures")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandlerWithStore(t, config.Config{Version: "test"}, st)
+	ctx := context.Background()
+
+	owner := newUser(t, h)
+	member := newUser(t, h)
+	household, err := st.CreateHousehold(ctx, owner.UserID, "共享家庭")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := auth.NewPairingCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := auth.PairingCodeHash(code)
+	if _, err := st.CreateHouseholdInvitation(ctx, owner.UserID, household.ID, hash, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimHouseholdInvitation(ctx, member.UserID, hash, time.Now().UTC(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := do(t, h, http.MethodPost, "/api/v1/me/deletion-request", "", owner.Token, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("deletion-request status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	request := decode[deletionRequestResp](t, rec)
+
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", map[string]string{"X-Deletion-Token": request.Token})
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "ACCOUNT_DELETION_BLOCKED") {
+		t.Fatalf("owner 有成员时应 409: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 被拦截后账号仍完整可用。
+	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", owner.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("拦截后账号不可用: %d", rec.Code)
+	}
+
+	// 转让所有权后可以删除。
+	if err := st.TransferHouseholdOwnership(ctx, owner.UserID, household.ID, member.UserID); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, h, http.MethodDelete, "/api/v1/me", "", "", map[string]string{"X-Deletion-Token": request.Token})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("转让后注销 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, h, http.MethodGet, "/api/v1/my/devices", "", member.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("新 owner 受影响: %d", rec.Code)
 	}
 }
 

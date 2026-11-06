@@ -3,10 +3,9 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,36 +36,208 @@ func (s *Store) GetUser(ctx context.Context, userID string) (model.User, error) 
 	return user, nil
 }
 
-// DeleteUser 实现 store.Store。
-// users 上的外键均为 ON DELETE CASCADE，删除用户行即级联清理 tokens、user_devices、
-// change_log、idempotency_keys、readings 与 pairing_codes。
-func (s *Store) DeleteUser(ctx context.Context, userID string) error {
+// CreateDeletionToken 实现 store.Store。
+// 同一账号只保留一个未使用的删除令牌：新申请先删除旧令牌再写入，保证并发申请也不会留下两个可用令牌。
+func (s *Store) CreateDeletionToken(ctx context.Context, userID string, tokenHash string, expiresAt time.Time) error {
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return fmt.Errorf("非法 user id: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id = $1`, uid)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("删除用户失败: %w", err)
+		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("读取删除结果失败: %w", err)
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM account_deletion_tokens WHERE user_id = $1 AND used_at IS NULL`, uid); err != nil {
+		return fmt.Errorf("回收旧删除令牌失败: %w", err)
 	}
-	if affected == 0 {
-		// 已删除的用户再次注销仍应得到 401（token 已随用户删除而失效）。
-		return store.ErrUnauthorized
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO account_deletion_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+		tokenHash, uid, expiresAt.UTC()); err != nil {
+		return fmt.Errorf("写入删除令牌失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
 	}
 	return nil
 }
 
-// ListUserDevicesForExport 实现 store.Store。
-// 导出包含已删除（tombstone）设备，保证用户能拿到自己全部写入过的记录。
-func (s *Store) ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error) {
+// DeleteAccount 实现 store.Store。
+//
+// 所有删除在同一个事务内完成：先按令牌定位账号，再检查 owner 家庭是否还有其他成员，
+// 然后按外键安全顺序逐表显式删除，最后删除 users 行并把令牌标记为已使用。
+// 任一步失败都整体回滚，不会留下部分删除的账号。
+func (s *Store) DeleteAccount(ctx context.Context, tokenHash string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var uid uuid.UUID
+	var expiresAt time.Time
+	var usedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT user_id, expires_at, used_at
+		FROM account_deletion_tokens WHERE token_hash = $1 FOR UPDATE`, tokenHash).
+		Scan(&uid, &expiresAt, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.ErrDeletionTokenInvalid
+	}
+	if err != nil {
+		return fmt.Errorf("查询删除令牌失败: %w", err)
+	}
+	if usedAt.Valid {
+		// 令牌已用于一次删除：账号已不存在，重放按 404 处理，避免把重放当成未知错误。
+		return store.ErrNotFound
+	}
+	if !expiresAt.After(now) {
+		return store.ErrDeletionTokenExpired
+	}
+
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, uid).Scan(&exists); err != nil {
+		return fmt.Errorf("查询用户失败: %w", err)
+	}
+	if !exists {
+		return store.ErrNotFound
+	}
+
+	// owner 的家庭还有其他成员时不能删除：直接删 users 会级联删掉家庭与成员关系，
+	// 对其他成员造成孤儿状态。必须先转让所有权或移除成员。
+	var blockedNames []string
+	rows, err := tx.QueryContext(ctx, `
+		SELECT h.name FROM households h
+		WHERE h.owner_user_id = $1
+		  AND EXISTS (SELECT 1 FROM household_members m
+		              WHERE m.household_id = h.id AND m.user_id <> $1)
+		ORDER BY h.created_at, h.id`, uid)
+	if err != nil {
+		return fmt.Errorf("检查家庭成员失败: %w", err)
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("解析家庭名失败: %w", err)
+		}
+		blockedNames = append(blockedNames, name)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("遍历家庭失败: %w", err)
+	}
+	rows.Close()
+	if len(blockedNames) > 0 {
+		return store.ErrAccountDeletionBlocked
+	}
+
+	// 显式逐表删除：不依赖外键级联，删除范围在代码里可见，也便于集成测试逐表断言。
+	// 顺序遵循外键依赖：先删引用方，再删被引用方。
+	stmts := []struct {
+		name string
+		sql  string
+	}{
+		{"feedback_status_events", `DELETE FROM feedback_status_events WHERE feedback_id IN (SELECT id FROM feedback WHERE user_id = $1)`},
+		{"feedback", `DELETE FROM feedback WHERE user_id = $1`},
+		{"personal_data_export_tasks", `DELETE FROM personal_data_export_tasks WHERE user_id = $1`},
+		{"device_type_catalog_accesses", `DELETE FROM device_type_catalog_accesses WHERE user_id = $1`},
+		{"household_invitations", `DELETE FROM household_invitations
+			WHERE invited_by_user_id = $1
+			   OR household_id IN (SELECT id FROM households WHERE owner_user_id = $1)`},
+		{"household_rooms", `DELETE FROM household_rooms
+			WHERE household_id IN (SELECT id FROM households WHERE owner_user_id = $1)`},
+		{"user_devices", `DELETE FROM user_devices WHERE user_id = $1`},
+		{"readings", `DELETE FROM readings WHERE user_id = $1`},
+		{"change_log", `DELETE FROM change_log WHERE user_id = $1`},
+		{"idempotency_keys", `DELETE FROM idempotency_keys WHERE user_id = $1`},
+		{"pairing_codes", `DELETE FROM pairing_codes WHERE user_id = $1`},
+		{"household_members", `DELETE FROM household_members
+			WHERE user_id = $1
+			   OR household_id IN (SELECT id FROM households WHERE owner_user_id = $1)`},
+		{"households", `DELETE FROM households WHERE owner_user_id = $1`},
+		{"tokens", `DELETE FROM tokens WHERE user_id = $1`},
+		{"users", `DELETE FROM users WHERE id = $1`},
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt.sql, uid); err != nil {
+			return fmt.Errorf("删除 %s 失败: %w", stmt.name, err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE account_deletion_tokens SET used_at = $2 WHERE token_hash = $1`, tokenHash, now.UTC()); err != nil {
+		return fmt.Errorf("标记删除令牌失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+	return nil
+}
+
+// CreateExportTask 实现 store.Store：插入一个 pending 任务。
+func (s *Store) CreateExportTask(ctx context.Context, userID string, expiresAt time.Time) (model.ExportTaskStatus, error) {
 	uid, err := uuid.Parse(userID)
 	if err != nil {
-		return nil, fmt.Errorf("非法 user id: %w", err)
+		return model.ExportTaskStatus{}, fmt.Errorf("非法 user id: %w", err)
 	}
+	id := uuid.New()
+	var createdAt time.Time
+	if err := s.db.QueryRowContext(ctx, `
+		INSERT INTO personal_data_export_tasks (id, user_id, status, expires_at)
+		VALUES ($1, $2, 'pending', $3)
+		RETURNING created_at`, id, uid, expiresAt.UTC()).Scan(&createdAt); err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("创建导出任务失败: %w", err)
+	}
+	return model.ExportTaskStatus{
+		ID:        id.String(),
+		Status:    "pending",
+		CreatedAt: createdAt.UTC(),
+		ExpiresAt: expiresAt.UTC(),
+	}, nil
+}
+
+// BuildPersonalDataExport 实现 store.Store。
+// 只读取调用账号自己的数据；家庭仅取本人角色与房间，反馈不含 internal_note。
+func (s *Store) BuildPersonalDataExport(ctx context.Context, userID string) (model.PersonalDataExport, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	user, err := s.GetUser(ctx, userID)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
+	devices, err := s.exportDevices(ctx, uid)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
+	readings, err := s.exportReadingAggregates(ctx, uid)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
+	households, err := s.exportHouseholds(ctx, uid)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
+	feedback, err := s.exportFeedback(ctx, uid)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
+	return model.PersonalDataExport{
+		User:        user,
+		Devices:     devices,
+		Readings:    readings,
+		Households:  households,
+		Feedback:    feedback,
+		GeneratedAt: time.Now().UTC(),
+	}, nil
+}
+
+// exportDevices 返回全部设备（含 tombstone），按 updated_at 倒序。
+func (s *Store) exportDevices(ctx context.Context, uid uuid.UUID) ([]model.UserDevice, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, client_id, platform, external_id, mac, alias, advertised_name, "group",
 		       rules, scan_records, updated_at, deleted_at, server_seq, device_type
@@ -94,62 +265,340 @@ func (s *Store) ListUserDevicesForExport(ctx context.Context, userID string) ([]
 	return out, nil
 }
 
-// ExportReadings 实现 store.Store。
-func (s *Store) ExportReadings(ctx context.Context, userID string, cursor string, limit int) ([]model.ExportReading, string, bool, error) {
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		return nil, "", false, fmt.Errorf("非法 user id: %w", err)
-	}
-	if limit <= 0 {
-		limit = 5000
-	}
-	var afterAt sql.NullTime
-	afterID := uuid.Nil
-	if cursor != "" {
-		at, id, err := decodeExportCursor(cursor)
-		if err != nil {
-			return nil, "", false, err
-		}
-		afterAt = sql.NullTime{Time: at, Valid: true}
-		afterID = id
-	}
-
+// exportReadingAggregates 按 (platform, external_id, metric, unit) 聚合读数。
+func (s *Store) exportReadingAggregates(ctx context.Context, uid uuid.UUID) ([]model.ExportReadingAggregate, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, platform, external_id, metric, value, unit, recorded_at, device_type
+		SELECT platform, external_id, metric, unit,
+		       count(*), min(value), max(value), avg(value),
+		       min(recorded_at), max(recorded_at)
 		FROM readings
 		WHERE user_id = $1
-		  AND ($2::timestamptz IS NULL OR recorded_at > $2 OR (recorded_at = $2 AND id > $3))
-		ORDER BY recorded_at ASC, id ASC
-		LIMIT $4`, uid, afterAt, afterID, limit+1)
+		GROUP BY platform, external_id, metric, unit
+		ORDER BY platform, external_id, metric, unit`, uid)
 	if err != nil {
-		return nil, "", false, fmt.Errorf("导出读数失败: %w", err)
+		return nil, fmt.Errorf("导出读数聚合失败: %w", err)
 	}
 	defer rows.Close()
 
-	items := make([]model.ExportReading, 0, limit)
+	out := make([]model.ExportReadingAggregate, 0)
 	for rows.Next() {
-		var item model.ExportReading
-		var id uuid.UUID
-		var deviceType sql.NullString
-		if err := rows.Scan(&id, &item.Platform, &item.ExternalID, &item.Metric, &item.Value,
-			&item.Unit, &item.RecordedAt, &deviceType); err != nil {
-			return nil, "", false, fmt.Errorf("解析导出读数失败: %w", err)
+		var item model.ExportReadingAggregate
+		if err := rows.Scan(&item.Platform, &item.ExternalID, &item.Metric, &item.Unit,
+			&item.Count, &item.Min, &item.Max, &item.Avg, &item.FirstAt, &item.LastAt); err != nil {
+			return nil, fmt.Errorf("解析读数聚合失败: %w", err)
 		}
-		item.ID = id.String()
-		item.RecordedAt = item.RecordedAt.UTC()
-		item.DeviceType = strings.TrimSpace(deviceType.String)
-		items = append(items, item)
+		item.FirstAt = item.FirstAt.UTC()
+		item.LastAt = item.LastAt.UTC()
+		out = append(out, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", false, fmt.Errorf("遍历导出读数失败: %w", err)
+		return nil, fmt.Errorf("遍历读数聚合失败: %w", err)
+	}
+	return out, nil
+}
+
+// exportHouseholds 返回本人所属家庭与房间，只含本人角色，不含其他成员身份。
+func (s *Store) exportHouseholds(ctx context.Context, uid uuid.UUID) ([]model.ExportHousehold, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT h.id, h.name, h.is_personal, h.created_at, m.role
+		FROM households h
+		JOIN household_members m ON m.household_id = h.id
+		WHERE m.user_id = $1
+		ORDER BY h.created_at ASC, h.id`, uid)
+	if err != nil {
+		return nil, fmt.Errorf("导出家庭失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.ExportHousehold, 0)
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var item model.ExportHousehold
+		var id uuid.UUID
+		if err := rows.Scan(&id, &item.Name, &item.Personal, &item.CreatedAt, &item.Role); err != nil {
+			return nil, fmt.Errorf("解析家庭失败: %w", err)
+		}
+		item.ID = id.String()
+		item.CreatedAt = item.CreatedAt.UTC()
+		item.Rooms = []model.ExportRoom{}
+		out = append(out, item)
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历家庭失败: %w", err)
 	}
 
-	if len(items) > limit {
-		items = items[:limit]
-		last := items[len(items)-1]
-		return items, encodeExportCursor(last.RecordedAt, last.ID), true, nil
+	for i, id := range ids {
+		rooms, err := s.exportRooms(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Rooms = rooms
 	}
-	return items, "", false, nil
+	return out, nil
+}
+
+func (s *Store) exportRooms(ctx context.Context, householdID uuid.UUID) ([]model.ExportRoom, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, sort_order, created_at
+		FROM household_rooms WHERE household_id = $1
+		ORDER BY sort_order, created_at, id`, householdID)
+	if err != nil {
+		return nil, fmt.Errorf("导出房间失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.ExportRoom, 0)
+	for rows.Next() {
+		var item model.ExportRoom
+		var id uuid.UUID
+		if err := rows.Scan(&id, &item.Name, &item.SortOrder, &item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("解析房间失败: %w", err)
+		}
+		item.ID = id.String()
+		item.CreatedAt = item.CreatedAt.UTC()
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历房间失败: %w", err)
+	}
+	return out, nil
+}
+
+// exportFeedback 返回本人反馈；包含本人联系方式与诊断文本，但绝不选择 internal_note。
+func (s *Store) exportFeedback(ctx context.Context, uid uuid.UUID) ([]model.ExportFeedback, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, kind, body, contact, platform, app_version, build_type,
+		       os_version, device_model, diagnostics, status, created_at, updated_at
+		FROM feedback WHERE user_id = $1
+		ORDER BY created_at ASC, id`, uid)
+	if err != nil {
+		return nil, fmt.Errorf("导出反馈失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.ExportFeedback, 0)
+	for rows.Next() {
+		var item model.ExportFeedback
+		var id uuid.UUID
+		if err := rows.Scan(&id, &item.Kind, &item.Body, &item.Contact, &item.Platform,
+			&item.AppVersion, &item.BuildType, &item.OSVersion, &item.DeviceModel,
+			&item.Diagnostics, &item.Status, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("解析反馈失败: %w", err)
+		}
+		item.FeedbackID = id.String()
+		item.CreatedAt = item.CreatedAt.UTC()
+		item.UpdatedAt = item.UpdatedAt.UTC()
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历反馈失败: %w", err)
+	}
+	return out, nil
+}
+
+// FinishExportTask 实现 store.Store：写入产物并置为 ready。
+func (s *Store) FinishExportTask(ctx context.Context, taskID string, artifact model.PersonalDataExport) error {
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		return fmt.Errorf("非法导出任务 id: %w", err)
+	}
+	raw, err := json.Marshal(artifact)
+	if err != nil {
+		return fmt.Errorf("序列化导出产物失败: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE personal_data_export_tasks
+		SET status = 'ready', artifact = $2, failure_reason = NULL, completed_at = now()
+		WHERE id = $1 AND status = 'pending'`, id, raw); err != nil {
+		return fmt.Errorf("写入导出产物失败: %w", err)
+	}
+	return nil
+}
+
+// FailExportTask 实现 store.Store：置为 failed 并记录对外可读原因。
+func (s *Store) FailExportTask(ctx context.Context, taskID string, reason string) error {
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		return fmt.Errorf("非法导出任务 id: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE personal_data_export_tasks
+		SET status = 'failed', artifact = NULL, failure_reason = $2, completed_at = now()
+		WHERE id = $1 AND status = 'pending'`, id, reason); err != nil {
+		return fmt.Errorf("标记导出任务失败: %w", err)
+	}
+	return nil
+}
+
+// GetExportTask 实现 store.Store。
+func (s *Store) GetExportTask(ctx context.Context, userID string, taskID string) (model.ExportTaskStatus, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	tid, err := uuid.Parse(taskID)
+	if err != nil {
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	var status model.ExportTaskStatus
+	var id uuid.UUID
+	var completedAt sql.NullTime
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, status, created_at, completed_at, expires_at
+		FROM personal_data_export_tasks
+		WHERE id = $1 AND user_id = $2 AND expires_at > now()`, tid, uid).
+		Scan(&id, &status.Status, &status.CreatedAt, &completedAt, &status.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	if err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("查询导出任务失败: %w", err)
+	}
+	status.ID = id.String()
+	status.CreatedAt = status.CreatedAt.UTC()
+	status.ExpiresAt = status.ExpiresAt.UTC()
+	if completedAt.Valid {
+		t := completedAt.Time.UTC()
+		status.CompletedAt = &t
+	}
+	return status, nil
+}
+
+// PrepareExportDownload 实现 store.Store：为 ready 任务签发新的下载令牌，替换旧令牌。
+func (s *Store) PrepareExportDownload(ctx context.Context, userID string, taskID string, tokenHash string, expiresAt time.Time) (model.ExportTaskStatus, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("非法 user id: %w", err)
+	}
+	tid, err := uuid.Parse(taskID)
+	if err != nil {
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var status model.ExportTaskStatus
+	var id uuid.UUID
+	var completedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, status, created_at, completed_at, expires_at
+		FROM personal_data_export_tasks
+		WHERE id = $1 AND user_id = $2 FOR UPDATE`, tid, uid).
+		Scan(&id, &status.Status, &status.CreatedAt, &completedAt, &status.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	if err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("查询导出任务失败: %w", err)
+	}
+	if !status.ExpiresAt.After(time.Now().UTC()) {
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	if status.Status != "ready" {
+		if status.Status == "pending" {
+			return model.ExportTaskStatus{}, store.ErrExportTaskNotReady
+		}
+		return model.ExportTaskStatus{}, store.ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE personal_data_export_tasks
+		SET download_token_hash = $2, download_expires_at = $3, download_used_at = NULL
+		WHERE id = $1`, tid, tokenHash, expiresAt.UTC()); err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("更新下载令牌失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return model.ExportTaskStatus{}, fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	status.ID = id.String()
+	status.CreatedAt = status.CreatedAt.UTC()
+	status.ExpiresAt = status.ExpiresAt.UTC()
+	if completedAt.Valid {
+		t := completedAt.Time.UTC()
+		status.CompletedAt = &t
+	}
+	dl := expiresAt.UTC()
+	status.DownloadExpiresAt = &dl
+	return status, nil
+}
+
+// ConsumeExportDownload 实现 store.Store：原子校验并消费一次性下载令牌。
+func (s *Store) ConsumeExportDownload(ctx context.Context, tokenHash string, now time.Time) (model.PersonalDataExport, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var artifact []byte
+	var status string
+	var expiresAt sql.NullTime
+	var usedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT artifact, status, download_expires_at, download_used_at
+		FROM personal_data_export_tasks
+		WHERE download_token_hash = $1 FOR UPDATE`, tokenHash).
+		Scan(&artifact, &status, &expiresAt, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.PersonalDataExport{}, store.ErrExportDownloadInvalid
+	}
+	if err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("查询下载令牌失败: %w", err)
+	}
+	if status != "ready" || artifact == nil {
+		return model.PersonalDataExport{}, store.ErrExportDownloadInvalid
+	}
+	if usedAt.Valid {
+		return model.PersonalDataExport{}, store.ErrExportDownloadExpired
+	}
+	if !expiresAt.Valid || !expiresAt.Time.After(now) {
+		return model.PersonalDataExport{}, store.ErrExportDownloadExpired
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE personal_data_export_tasks SET download_used_at = $2
+		WHERE download_token_hash = $1`, tokenHash, now.UTC()); err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("标记下载令牌失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	var out model.PersonalDataExport
+	if err := json.Unmarshal(artifact, &out); err != nil {
+		return model.PersonalDataExport{}, fmt.Errorf("解析导出产物失败: %w", err)
+	}
+	return out, nil
+}
+
+// CleanupDeletionTokens 实现 store.Store。
+func (s *Store) CleanupDeletionTokens(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM account_deletion_tokens WHERE expires_at < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("清理删除令牌失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果失败: %w", err)
+	}
+	return n, nil
+}
+
+// CleanupExportTasks 实现 store.Store：整行删除过期任务，产物随之清理。
+func (s *Store) CleanupExportTasks(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM personal_data_export_tasks WHERE expires_at < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("清理导出任务失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清理结果失败: %w", err)
+	}
+	return n, nil
 }
 
 // CreatePairingCode 实现 store.Store：同一用户的新码使旧码失效。
@@ -377,30 +826,4 @@ func (s *Store) ApproxCounts(ctx context.Context) (model.StoreCounts, error) {
 		return model.StoreCounts{}, fmt.Errorf("查询近似行数失败: %w", err)
 	}
 	return counts, nil
-}
-
-// encodeExportCursor 把 (recordedAt, id) 编码为升序导出的不透明游标。
-func encodeExportCursor(at time.Time, id string) string {
-	raw := at.UTC().Format(time.RFC3339Nano) + "|" + id
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
-}
-
-func decodeExportCursor(cursor string) (time.Time, uuid.UUID, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(cursor)
-	if err != nil {
-		return time.Time{}, uuid.Nil, store.ErrBadCursor
-	}
-	parts := strings.SplitN(string(raw), "|", 2)
-	if len(parts) != 2 {
-		return time.Time{}, uuid.Nil, store.ErrBadCursor
-	}
-	at, err := time.Parse(time.RFC3339Nano, parts[0])
-	if err != nil {
-		return time.Time{}, uuid.Nil, store.ErrBadCursor
-	}
-	id, err := uuid.Parse(parts[1])
-	if err != nil {
-		return time.Time{}, uuid.Nil, store.ErrBadCursor
-	}
-	return at.UTC(), id, nil
 }

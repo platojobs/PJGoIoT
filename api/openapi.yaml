@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.14.0
+  version: 0.15.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -23,7 +23,7 @@ info:
       前者按 **UTC** 对齐做 `1m`/`1h`/`1d` 聚合，后者列出设备已上报的指标及其计数与时间范围。
     - 自 `0.6.0` 起支持跨设备接管与合规能力：
       `/auth/pairing-code` 生成一次性配对码，`/auth/pairing-code/claim` 用码换取**同一 userId** 的新 token；
-      `/me/export` 导出账号全部数据（读数按 `recordedAt` 升序、游标分页），`DELETE /me` 硬删除账号及全部关联数据；
+      `/me/export` 异步导出账号数据（联系契约 0.15.0 的最终语义），`DELETE /me` 用一次性令牌硬删除账号及全部关联数据；
       `/metrics` 提供 Prometheus 文本指标（无需鉴权，可用 `METRICS_ENABLED=false` 关闭）。
       所有响应带 `X-Request-Id`（客户端可透传，服务端原样回写）。
     - 自 `0.12.0` 起引入家庭（household）模型：每个账号自动拥有一个不可删除的个人家庭「我的家」，
@@ -44,6 +44,13 @@ info:
       **运营侧**另有独立凭据的内部入口 `GET|PATCH /admin/feedback`（请求头 `X-Admin-Token`，
       由环境变量 `ADMIN_TOKEN` 配置；未配置时整组返回 404）。该入口**不在公开客户端 SDK 中**，
       仅运维系统与内部工具使用。
+    - 自契约 `0.15.0`（服务 v0.19.0）起补齐上架合规所需的账号删除与个人数据导出：
+      `POST /me/deletion-request` 签发 10 分钟有效的一次性删除令牌（只存哈希），
+      再以 `X-Deletion-Token` 调用 `DELETE /me` 硬删除账号及全部个人数据（单事务）；
+      删除接口不使用 Bearer，使「旧 token 访问返回 401」与「同一删除请求重放返回 404」同时成立；
+      owner 的家庭若还有其他成员，删除返回 `409 ACCOUNT_DELETION_BLOCKED`，避免留下孤儿家庭。
+      导出统一异步：`POST /me/export` 返回任务 id，`GET /me/export/{id}` 轮询状态并获取
+      10 分钟有效、一次性使用的下载链接；产物只含本人数据（读数聚合、家庭不含其他成员、反馈不含内部备注）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -82,7 +89,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.13.0"
+                version: "0.19.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -230,52 +237,27 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
 
-  /me/export:
-    get:
+  /me/deletion-request:
+    post:
       tags: [user]
-      operationId: exportMyData
-      summary: 导出当前账号全部数据
+      operationId: createDeletionRequest
+      summary: 申请一次性账号删除令牌
       description: |
-        返回 `{user, devices, readings, exportedAt}`，并附分页字段 `nextCursor` / `hasMore`。
+        账号删除的**二次确认**第一步：返回一次性删除令牌（明文只在此响应中出现一次，服务端只存 SHA-256 哈希），
+        10 分钟后过期。拿到令牌后在有效期内调用 `DELETE /me`。
 
-        - `devices` 包含该账号全部设备（含已删除的 tombstone），按 `updatedAt` 倒序；
-        - `readings` 按 `recordedAt` **升序**，同一时刻按 `id` 升序，保证翻页稳定；
-        - `limit` 默认 5000、最大 5000；账号读数超过限制时客户端携带 `nextCursor` 继续拉取，
-          直到 `hasMore=false`（此时 `nextCursor` 为空串）；
-        - `cursor` 为不透明串，客户端不得解析或构造；
-        - 响应头 `Content-Disposition: attachment; filename="pjkotlinapp-export-<userId>.json"`。
+        - 同一账号再次申请会让旧令牌立即失效（只保留一个未使用令牌）；
+        - 令牌与账号绑定，不能用于删除其他账号；
+        - 该接口要求 Bearer token，说明调用者当前仍能访问自己的账号。
       security:
         - bearerAuth: []
-      parameters:
-        - name: cursor
-          in: query
-          required: false
-          description: 上一页的 nextCursor；第一页省略
-          schema:
-            type: string
-        - name: limit
-          in: query
-          required: false
-          description: 单页读数条数
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 5000
-            default: 5000
       responses:
-        "200":
-          description: 导出 JSON
-          headers:
-            Content-Disposition:
-              description: 附件文件名，含当前 userId
-              schema:
-                type: string
+        "201":
+          description: 令牌已签发
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExportPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+                $ref: "#/components/schemas/DeletionRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -285,22 +267,192 @@ paths:
     delete:
       tags: [user]
       operationId: deleteMyAccount
-      summary: 注销账号并硬删除全部数据
+      summary: 用一次性删除令牌注销账号并硬删除全部数据
       description: |
-        硬删除当前用户，以及其设备（含 tombstone）、读数、变更日志、幂等键、token 与配对码
-        （数据库外键 `ON DELETE CASCADE`），成功返回 `204`。
+        硬删除当前账号及其全部个人数据（单事务，失败整体回滚）：
+
+        - 设备（含 tombstone）、读数、场景（当前后端无独立场景表）、房间、家庭关系、邀请码、
+          反馈（含本人反馈的状态审计）、token、推送幂等记录、设备目录访问记录、导出任务；
+        - 本人是 owner 的家庭若还有其他成员，返回 `409 ACCOUNT_DELETION_BLOCKED`，
+          必须先在运营/家庭接口中转让所有权或移除成员，避免留下孤儿家庭；
+        - 本人只是其他家庭成员的，删除时仅移除自己的成员关系，不影响该家庭与其他成员。
 
         语义：
-        - 该账号已签发的**所有 token 立即失效**，后续请求返回 401；
-        - 幂等：重复调用（原 token 已失效）返回 **401**，而不是 404；
-        - 不可恢复；客户端调用前必须二次确认。
+        - 该接口**不使用 Bearer**，只用请求头 `X-Deletion-Token`：账号删除后旧 Bearer 已失效，
+          仍要求 Bearer 会让「重放删除」永远得到 401，与「再次删除返回 404」冲突；
+        - 删除后该账号全部 token 立即失效，旧 token 访问其他接口返回 `401`；
+        - 幂等：同一删除令牌重放返回 `404`（账号已不存在），不会造成部分删除或未知错误；
+        - 令牌缺失 `400 DELETION_TOKEN_REQUIRED`、错误 `403 DELETION_TOKEN_INVALID`、
+          过期 `410 DELETION_TOKEN_EXPIRED`；
+        - 不可恢复。
+      security: []
+      parameters:
+        - name: X-Deletion-Token
+          in: header
+          required: true
+          description: "`POST /me/deletion-request` 返回的一次性令牌"
+          schema:
+            type: string
+      responses:
+        "204":
+          description: 账号及其全部个人数据已删除
+        "400":
+          description: 缺少删除令牌
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: DELETION_TOKEN_REQUIRED
+                  message: "缺少 X-Deletion-Token，请先调用 POST /me/deletion-request"
+        "403":
+          description: 删除令牌无效
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: DELETION_TOKEN_INVALID
+                  message: "删除令牌无效，请重新申请"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: owner 的家庭还有其他成员，需先转让或移除成员
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: ACCOUNT_DELETION_BLOCKED
+                  message: "家庭还有其他成员，请先转让所有权或移除其他成员后再删除账号"
+        "410":
+          description: 删除令牌已过期
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: DELETION_TOKEN_EXPIRED
+                  message: "删除令牌已过期，请重新申请"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /me/export:
+    post:
+      tags: [user]
+      operationId: createMyDataExport
+      summary: 创建异步个人数据导出任务
+      description: |
+        统一采用**异步**导出：立即返回 `202` 与任务 id，客户端轮询 `GET /me/export/{id}`。
+        不做「小体量同步、大体量异步」的双分支，避免客户端维护两套语义；
+        导出内容对读数做聚合，产物大小与读数条数无关。
+
+        产物只包含调用账号自己的数据：
+        - 设备（含 tombstone，按 `updatedAt` 倒序）；
+        - 读数按 `(platform, externalId, metric, unit)` 聚合（count/min/max/avg/firstAt/lastAt），
+          不含逐条明细（明细可在删除前通过读数接口获取）；
+        - 家庭仅含本人角色与家庭结构（含房间），**不含其他成员的身份或联系方式**；
+        - 本人反馈（含本人填写的联系方式与诊断文本），**不含运营内部备注**。
+
+        产物保留 24 小时，到期由 `cmd/cleanup` 清理。
       security:
         - bearerAuth: []
       responses:
-        "204":
-          description: 账号及其全部数据已删除
+        "202":
+          description: 任务已创建，状态为 pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportTask"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /me/export/{id}:
+    get:
+      tags: [user]
+      operationId: getMyDataExport
+      summary: 查询导出任务状态（ready 时签发一次性下载链接）
+      description: |
+        `status` 取值 `pending` / `ready` / `failed`。任务 `ready` 时每次查询都会签发**新的**一次性下载令牌
+        并返回 `downloadUrl`（旧的下载链接立即失效），因此同一时刻只有一个有效链接。
+        下载链接 10 分钟内有效且只能使用一次。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ExportTaskId"
+      responses:
+        "200":
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportTask"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /me/export/{id}/download:
+    get:
+      tags: [user]
+      operationId: downloadMyDataExport
+      summary: 用一次性令牌下载导出 JSON
+      description: |
+        下载链接本身即凭据，**不使用 Bearer**，便于在浏览器直接打开。
+        `downloadUrl` 中的 `token` 为一次性令牌：首次下载成功即失效；
+        再次使用返回 `410 EXPORT_DOWNLOAD_EXPIRED`，应重新查询任务状态获取新链接。
+        令牌错误返回 `403 EXPORT_DOWNLOAD_INVALID`。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ExportTaskId"
+        - name: token
+          in: query
+          required: true
+          description: 查询任务状态时返回的一次性下载令牌
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 导出 JSON
+          headers:
+            Content-Disposition:
+              description: 附件文件名，含导出任务 id
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonalDataExport"
+        "403":
+          description: 下载令牌无效或任务不可下载
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: EXPORT_DOWNLOAD_INVALID
+                  message: "下载令牌无效或导出任务不可下载"
+        "410":
+          description: 下载链接已过期或已被使用
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: EXPORT_DOWNLOAD_EXPIRED
+                  message: "下载链接已过期或已被使用，请重新查询导出任务"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /devices/{mac}:
     get:
@@ -2242,6 +2394,14 @@ components:
       schema:
         type: string
         format: uuid
+    ExportTaskId:
+      name: id
+      in: path
+      required: true
+      description: 导出任务 id（UUID）
+      schema:
+        type: string
+        format: uuid
     Mac:
       name: mac
       in: path
@@ -2457,6 +2617,13 @@ components:
                 - ROOM_SET_MISMATCH
                 - FEEDBACK_RATE_LIMITED
                 - FEEDBACK_INVALID_TRANSITION
+                - DELETION_TOKEN_REQUIRED
+                - DELETION_TOKEN_INVALID
+                - DELETION_TOKEN_EXPIRED
+                - ACCOUNT_DELETION_BLOCKED
+                - EXPORT_NOT_READY
+                - EXPORT_DOWNLOAD_INVALID
+                - EXPORT_DOWNLOAD_EXPIRED
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -3327,14 +3494,51 @@ components:
           type: string
           format: date-time
 
-    ExportReading:
+    DeletionRequest:
       type: object
-      required: [id, platform, externalId, metric, value, unit, recordedAt]
+      required: [token, expiresAt]
+      properties:
+        token:
+          type: string
+          description: 一次性删除令牌；明文只返回一次，10 分钟后过期
+        expiresAt:
+          type: string
+          format: date-time
+          description: 令牌过期时间（签发后 10 分钟）
+
+    ExportTask:
+      type: object
+      required: [id, status, createdAt, expiresAt]
       properties:
         id:
           type: string
           format: uuid
-          description: 客户端生成的读数 id
+        status:
+          type: string
+          enum: [pending, ready, failed]
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          description: 任务完成（ready 或 failed）时间；未完成时省略
+        downloadUrl:
+          type: string
+          description: 仅 ready 时返回；相对路径，含一次性下载令牌，10 分钟有效且只能使用一次
+        downloadExpiresAt:
+          type: string
+          format: date-time
+          description: 仅 ready 时返回；下载链接过期时间
+        expiresAt:
+          type: string
+          format: date-time
+          description: 导出产物的保留到期时间（创建后 24 小时），到期后由清理任务删除
+
+    ExportReadingAggregate:
+      type: object
+      required: [platform, externalId, metric, unit, count, min, max, avg, firstAt, lastAt]
+      properties:
         platform:
           type: string
           enum: [android, ios]
@@ -3342,43 +3546,133 @@ components:
           type: string
         metric:
           type: string
-        value:
-          type: number
-          format: double
         unit:
           type: string
-        recordedAt:
+        count:
+          type: integer
+          format: int64
+        min:
+          type: number
+          format: double
+        max:
+          type: number
+          format: double
+        avg:
+          type: number
+          format: double
+        firstAt:
           type: string
           format: date-time
-        deviceType:
+        lastAt:
+          type: string
+          format: date-time
+
+    ExportRoom:
+      type: object
+      required: [id, name, sortOrder, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        sortOrder:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
+    ExportHousehold:
+      type: object
+      required: [id, name, role, personal, createdAt, rooms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        role:
+          type: string
+          enum: [owner, member]
+          description: 调用者在该家庭中的角色（不包含其他成员信息）
+        personal:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        rooms:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExportRoom"
+
+    ExportFeedback:
+      type: object
+      required: [feedbackId, kind, body, platform, appVersion, buildType, osVersion, deviceModel, status, createdAt, updatedAt]
+      properties:
+        feedbackId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        body:
+          type: string
+        contact:
           type: string
           nullable: true
-          description: 读数上报时携带的设备类型；未上报时省略
+          description: 本人填写的联系方式；无则省略
+        platform:
+          type: string
+        appVersion:
+          type: string
+        buildType:
+          type: string
+        osVersion:
+          type: string
+        deviceModel:
+          type: string
+        diagnostics:
+          type: string
+          nullable: true
+          description: 本人提交的诊断文本；无则省略
+        status:
+          type: string
+          enum: [submitted, received, closed]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
 
-    ExportPage:
+    PersonalDataExport:
       type: object
-      required: [user, devices, readings, exportedAt, nextCursor, hasMore]
+      required: [user, devices, readings, households, feedback, generatedAt]
       properties:
         user:
           $ref: "#/components/schemas/ExportUser"
         devices:
           type: array
-          description: 全部设备，含已删除（tombstone），按 updatedAt 倒序
+          description: 本人全部设备，含已删除（tombstone），按 updatedAt 倒序
           items:
             $ref: "#/components/schemas/UserDevice"
         readings:
           type: array
-          description: 按 recordedAt 升序（同一时刻按 id 升序）
+          description: 本人读数按 (platform, externalId, metric, unit) 聚合
           items:
-            $ref: "#/components/schemas/ExportReading"
-        exportedAt:
+            $ref: "#/components/schemas/ExportReadingAggregate"
+        households:
+          type: array
+          description: 本人所属家庭，仅含本人角色与房间，不含其他成员身份或联系方式
+          items:
+            $ref: "#/components/schemas/ExportHousehold"
+        feedback:
+          type: array
+          description: 本人反馈，含本人联系方式与诊断，不含运营内部备注
+          items:
+            $ref: "#/components/schemas/ExportFeedback"
+        generatedAt:
           type: string
           format: date-time
-        nextCursor:
-          type: string
-          description: 下一页游标；`hasMore=false` 时为空串
-        hasMore:
-          type: boolean
 
     Household:
       type: object
