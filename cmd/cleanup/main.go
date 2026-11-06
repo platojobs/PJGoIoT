@@ -38,6 +38,10 @@ func main() {
 		"变更日志保留天数（默认 90，或环境变量 CHANGE_LOG_RETENTION_DAYS）")
 	idempotencyDays := flag.Int("idempotency-retention-days", envInt("IDEMPOTENCY_RETENTION_DAYS", 7),
 		"幂等键保留天数（默认 7，或环境变量 IDEMPOTENCY_RETENTION_DAYS）")
+	pushDeliveryDays := flag.Int("push-delivery-retention-days", envInt("PUSH_DELIVERY_RETENTION_DAYS", 7),
+		"已终止推送投递保留天数（默认 7，或环境变量 PUSH_DELIVERY_RETENTION_DAYS）")
+	pushDeviceDays := flag.Int("push-device-retention-days", envInt("PUSH_DEVICE_RETENTION_DAYS", 30),
+		"已失效推送令牌保留天数（默认 30，或环境变量 PUSH_DEVICE_RETENTION_DAYS）")
 	opTimeout := flag.Duration("operation-timeout", 30*time.Second, "每类清理操作的超时时间")
 	dryRun := flag.Bool("dry-run", false, "只打印将要删除的时间边界，不实际删除")
 	flag.Parse()
@@ -46,7 +50,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "缺少 DATABASE_URL 或 -database-url")
 		os.Exit(1)
 	}
-	if *retentionDays <= 0 || *changeLogDays <= 0 || *idempotencyDays <= 0 {
+	if *retentionDays <= 0 || *changeLogDays <= 0 || *idempotencyDays <= 0 || *pushDeliveryDays <= 0 || *pushDeviceDays <= 0 {
 		fmt.Fprintln(os.Stderr, "所有保留天数必须为正整数")
 		os.Exit(1)
 	}
@@ -55,12 +59,15 @@ func main() {
 	readingsCutoff := now.Add(-time.Duration(*retentionDays) * 24 * time.Hour)
 	changeLogCutoff := now.Add(-time.Duration(*changeLogDays) * 24 * time.Hour)
 	idempotencyCutoff := now.Add(-time.Duration(*idempotencyDays) * 24 * time.Hour)
+	pushDeliveryCutoff := now.Add(-time.Duration(*pushDeliveryDays) * 24 * time.Hour)
+	pushDeviceCutoff := now.Add(-time.Duration(*pushDeviceDays) * 24 * time.Hour)
 
 	if *dryRun {
-		fmt.Printf("dry-run:\n  readings: recorded_at < %s\n  change_log: server_ts < %s\n  idempotency_keys: created_at < %s\n  tokens: expires_at < %s\n  pairing_codes: expires_at < %s\n  account_deletion_tokens: expires_at < %s\n  personal_data_export_tasks: expires_at < %s\n",
+		fmt.Printf("dry-run:\n  readings: recorded_at < %s\n  change_log: server_ts < %s\n  idempotency_keys: created_at < %s\n  tokens: expires_at < %s\n  pairing_codes: expires_at < %s\n  account_deletion_tokens: expires_at < %s\n  personal_data_export_tasks: expires_at < %s\n  push_deliveries: terminal 且 created_at < %s\n  push_devices: inactive 且 updated_at < %s\n",
 			readingsCutoff.Format(time.RFC3339), changeLogCutoff.Format(time.RFC3339),
 			idempotencyCutoff.Format(time.RFC3339), now.Format(time.RFC3339), now.Format(time.RFC3339),
-			now.Format(time.RFC3339), now.Format(time.RFC3339))
+			now.Format(time.RFC3339), now.Format(time.RFC3339),
+			pushDeliveryCutoff.Format(time.RFC3339), pushDeviceCutoff.Format(time.RFC3339))
 		return
 	}
 
@@ -96,14 +103,24 @@ func main() {
 	exportTasks := run("personal_data_export_tasks", func(c context.Context) (int64, error) {
 		return st.CleanupExportTasks(c, now)
 	})
+	pushDeliveries := run("push_deliveries", func(c context.Context) (int64, error) {
+		return st.CleanupPushDeliveries(c, pushDeliveryCutoff)
+	})
+	pushDevices := run("push_devices", func(c context.Context) (int64, error) {
+		return st.CleanupPushDevices(c, pushDeviceCutoff)
+	})
 
 	fmt.Printf("清理完成 readings_deleted=%d readings_cutoff=%s retention_days=%d\n"+
 		"change_log_deleted=%d change_log_cutoff=%s change_log_retention_days=%d\n"+
 		"idempotency_keys_deleted=%d idempotency_cutoff=%s idempotency_retention_days=%d\n"+
 		"tokens_deleted=%d pairing_codes_deleted=%d\n"+
-		"account_deletion_tokens_deleted=%d personal_data_export_tasks_deleted=%d\n",
+		"account_deletion_tokens_deleted=%d personal_data_export_tasks_deleted=%d\n"+
+		"push_deliveries_deleted=%d push_delivery_cutoff=%s push_delivery_retention_days=%d\n"+
+		"push_devices_deleted=%d push_device_cutoff=%s push_device_retention_days=%d\n",
 		readings, readingsCutoff.Format(time.RFC3339), *retentionDays,
 		changes, changeLogCutoff.Format(time.RFC3339), *changeLogDays,
 		idempotency, idempotencyCutoff.Format(time.RFC3339), *idempotencyDays,
-		tokens, codes, deletionTokens, exportTasks)
+		tokens, codes, deletionTokens, exportTasks,
+		pushDeliveries, pushDeliveryCutoff.Format(time.RFC3339), *pushDeliveryDays,
+		pushDevices, pushDeviceCutoff.Format(time.RFC3339), *pushDeviceDays)
 }

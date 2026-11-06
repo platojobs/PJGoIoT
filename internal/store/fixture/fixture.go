@@ -169,6 +169,11 @@ type Store struct {
 	// 账号删除令牌与异步导出任务（与 000016 迁移的表对应）。
 	deletionTokens map[string]*deletionTokenRecord
 	exportTasks    map[string]*exportTaskRecord
+
+	// 推送通道（与 000018 迁移的表对应）。令牌按 id 存，投递按入队顺序存。
+	pushDevices    map[string]*pushDeviceRecord
+	pushAlerts     []model.Alert
+	pushDeliveries []*pushDeliveryRecord
 }
 
 // New 从 fixtures 目录加载公共元数据。
@@ -194,6 +199,8 @@ func New(dir string) (*Store, error) {
 		catalogAccesses:  map[string]map[int64]struct{}{},
 		deletionTokens:   map[string]*deletionTokenRecord{},
 		exportTasks:      map[string]*exportTaskRecord{},
+		pushDevices:      map[string]*pushDeviceRecord{},
+		pushDeliveries:   []*pushDeliveryRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))

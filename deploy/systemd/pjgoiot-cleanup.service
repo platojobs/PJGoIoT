@@ -1,0 +1,14 @@
+[Unit]
+Description=PJGoIoT 数据清理（读数 / change_log / 幂等键 / 令牌 / 推送投递与失效设备）
+Documentation=file:///opt/pjgoiot/docs/runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pjgoiot
+Group=pjgoiot
+EnvironmentFile=/etc/pjgoiot/cleanup.env
+ExecStart=/opt/pjgoiot/bin/cleanup
+# 清理失败时保留非零退出码，systemd 会记录到 journal。
+TimeoutStartSec=10min

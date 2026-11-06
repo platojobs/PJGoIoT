@@ -1,0 +1,13 @@
+[Unit]
+Description=PJGoIoT PostgreSQL 备份（pg_dump 自定义格式 + SHA-256）
+Documentation=file:///opt/pjgoiot/docs/runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pjgoiot
+Group=pjgoiot
+EnvironmentFile=/etc/pjgoiot/backup.env
+ExecStart=/opt/pjgoiot/deploy/scripts/backup.sh
+TimeoutStartSec=30min

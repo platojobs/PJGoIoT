@@ -130,6 +130,14 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	adminCatalog.PUT("/:type", s.handleAdminUpdateCatalogDeviceType)
 	adminCatalog.DELETE("/:type", s.handleAdminDeleteCatalogDeviceType)
 
+	// 服务端推送：客户端注册/停用设备令牌；告警由运营侧入口产生（当前无内建告警产生者）。
+	pushGroup := api.Group("/push", s.requireAuth())
+	pushGroup.POST("/devices", s.handleRegisterPushDevice)
+	pushGroup.DELETE("/devices/:deviceId", s.handleDeactivatePushDevice)
+
+	adminAlerts := api.Group("/admin/alerts", s.requireAdmin())
+	adminAlerts.POST("", s.handleCreateAlert)
+
 	// 场景（本地触发条件 + 动作）上云：全部限定本人，软删除参与同步 tombstone。
 	scenesGroup := api.Group("/scenes", s.requireAuth())
 	scenesGroup.GET("", s.handleListScenes)

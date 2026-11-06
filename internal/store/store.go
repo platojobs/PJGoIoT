@@ -72,6 +72,9 @@ var (
 	ErrSceneDeviceNotFound = errors.New("场景引用的设备不存在或不属于本人")
 	// ErrSceneMetricNotSupported 表示指标越界条件绑定的设备类型不存在，或该类型不支持该指标。HTTP 层映射为 400 SCENE_METRIC_NOT_SUPPORTED。
 	ErrSceneMetricNotSupported = errors.New("场景绑定的设备类型不存在或该类型不支持该指标")
+	// ErrPushDeviceInvalid 表示推送设备注册参数不合法（platform 非 android/ios、token 为空或过长）。
+	// HTTP 层映射为 400 PUSH_DEVICE_INVALID。
+	ErrPushDeviceInvalid = errors.New("推送设备参数不合法")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -85,6 +88,14 @@ type PushOptions struct {
 type FeedbackOptions struct {
 	IdempotencyKey string
 	RequestHash    string
+}
+
+// SceneQuery 是 GET /scenes 的可选分页参数。
+// Limit<=0 表示不分页，返回全量（与 v0.20.0 起的行为完全一致）。
+// Cursor 为不透明游标，指向上一页最后一条的 (updatedAt, id)；非法游标返回 ErrBadCursor。
+type SceneQuery struct {
+	Cursor string
+	Limit  int
 }
 
 // Store 是服务端依赖的全部存储能力。
@@ -283,7 +294,8 @@ type Store interface {
 	UpdateFeedbackStatus(ctx context.Context, feedbackID string, targetStatus string, note *string) (model.AdminFeedback, error)
 
 	// ListScenes 返回本人未删除的场景，按 updatedAt 倒序。
-	ListScenes(ctx context.Context, userID string) ([]model.Scene, error)
+	// Limit<=0 时返回全量；Limit>0 时按 (updatedAt DESC, id ASC) 游标分页。
+	ListScenes(ctx context.Context, userID string, q SceneQuery) (model.ScenePage, error)
 	// GetScene 返回本人单个场景；不存在、已删除或属于他人统一返回 ErrNotFound。
 	GetScene(ctx context.Context, userID string, sceneID string) (model.Scene, error)
 	// CreateScene 创建场景；触发条件引用的设备必须存在且属于本人，指标必须被目录支持。
@@ -294,4 +306,30 @@ type Store interface {
 	UpdateScene(ctx context.Context, userID string, sceneID string, patch model.ScenePatch, now time.Time) (model.Scene, error)
 	// DeleteScene 软删除场景（保留 tombstone），version 自增并写一条 op=delete 的 change_log。
 	DeleteScene(ctx context.Context, userID string, sceneID string, now time.Time) error
+
+	// UpsertPushDevice 注册或幂等更新一条设备推送令牌。
+	// 同一用户同一 token 命中唯一约束时更新 appVersion/deviceModel/状态为 active，
+	// 返回同一条记录（id 不变）。参数不合法返回 ErrPushDeviceInvalid。
+	UpsertPushDevice(ctx context.Context, userID string, input model.PushRegistrationInput, now time.Time) (model.PushRegistration, error)
+	// DeactivatePushDevice 把令牌标记为 inactive（不硬删）。不存在或不属于该用户返回 ErrNotFound；
+	// 已 inactive 时按幂等成功处理。
+	DeactivatePushDevice(ctx context.Context, userID string, deviceID string, now time.Time) error
+	// CreateAlertWithDeliveries 在同一事务内写入一条告警，并为该用户全部 active 令牌各写一条
+	// pending 投递记录（快照 token/title/body/data）。返回告警与本次入队的条数。
+	// 用户不存在返回 ErrNotFound。
+	CreateAlertWithDeliveries(ctx context.Context, input model.AlertInput, now time.Time) (model.Alert, int, error)
+	// ClaimPushDeliveries 抢占最多 limit 条到期的 pending 投递，置为 sending 并 attempts+1。
+	// 先把 claimed_at 早于 sendingStaleBefore 的 sending 投递归还为 pending（进程崩溃恢复）。
+	// 多实例通过 FOR UPDATE SKIP LOCKED 保证同一条只被一个 worker 消费。
+	ClaimPushDeliveries(ctx context.Context, now time.Time, limit int, sendingStaleBefore time.Time) ([]model.PushDelivery, error)
+	// CompletePushDelivery 把投递置为 sent，记录 provider 与 dryRun，并写 sent_at。
+	CompletePushDelivery(ctx context.Context, deliveryID string, provider string, dryRun bool, sentAt time.Time) error
+	// RetryPushDelivery 把投递置回 pending，写入下一次退避时间与最近错误。
+	RetryPushDelivery(ctx context.Context, deliveryID string, nextAttemptAt time.Time, lastError string) error
+	// FailPushDelivery 把投递置为 failed 并写终态原因；deactivate 为 true 时同一事务把对应令牌置 inactive。
+	FailPushDelivery(ctx context.Context, deliveryID string, reason string, deactivate bool, now time.Time) error
+	// CleanupPushDeliveries 删除 created_at 早于 before 的终态（sent/failed）投递，返回删除条数。
+	CleanupPushDeliveries(ctx context.Context, before time.Time) (int64, error)
+	// CleanupPushDevices 删除 updated_at 早于 before 的 inactive 令牌（级联删除其历史投递），返回删除条数。
+	CleanupPushDevices(ctx context.Context, before time.Time) (int64, error)
 }

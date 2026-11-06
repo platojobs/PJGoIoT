@@ -3,9 +3,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,17 +83,40 @@ func (s *Store) exportScenes(ctx context.Context, uid uuid.UUID) ([]model.Scene,
 }
 
 // ListScenes 实现 store.Store。
-func (s *Store) ListScenes(ctx context.Context, userID string) ([]model.Scene, error) {
+func (s *Store) ListScenes(ctx context.Context, userID string, q store.SceneQuery) (model.ScenePage, error) {
 	uid, err := uuid.Parse(userID)
 	if err != nil {
-		return nil, store.ErrNotFound
+		return model.ScenePage{}, store.ErrNotFound
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sceneBaseColumns+`, `+sceneDeviceMissingExpr+`
+	limit := q.Limit
+	if limit > 200 {
+		limit = 200
+	}
+	where := `s.user_id = $1 AND s.deleted_at IS NULL`
+	args := []any{uid}
+	if limit > 0 {
+		if q.Cursor != "" {
+			at, id, err := decodeSceneCursor(q.Cursor)
+			if err != nil {
+				return model.ScenePage{}, err
+			}
+			args = append(args, at, id)
+			// 排序为 updated_at DESC, id ASC，游标条件是行的严格后继。
+			where += fmt.Sprintf(` AND (s.updated_at < $%d OR (s.updated_at = $%d AND s.id > $%d))`,
+				len(args)-1, len(args)-1, len(args))
+		}
+		args = append(args, limit+1)
+	}
+	query := `SELECT ` + sceneBaseColumns + `, ` + sceneDeviceMissingExpr + `
 		FROM scenes s
-		WHERE s.user_id = $1 AND s.deleted_at IS NULL
-		ORDER BY s.updated_at DESC, s.id ASC`, uid)
+		WHERE ` + where + `
+		ORDER BY s.updated_at DESC, s.id ASC`
+	if limit > 0 {
+		query += fmt.Sprintf(` LIMIT $%d`, len(args))
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("查询场景列表失败: %w", err)
+		return model.ScenePage{}, fmt.Errorf("查询场景列表失败: %w", err)
 	}
 	defer rows.Close()
 
@@ -104,21 +129,56 @@ func (s *Store) ListScenes(ctx context.Context, userID string) ([]model.Scene, e
 		if err := rows.Scan(&st.scene.ID, &st.scene.Name, &st.scene.Enabled, &st.scene.CooldownSeconds,
 			&rawTrigger, &rawActions, &st.scene.Version, &st.scene.CreatedAt, &st.scene.UpdatedAt, &deleted,
 			&st.nameTS, &st.enabledTS, &st.cooldownTS, &st.triggerTS, &st.actionsTS, &missing); err != nil {
-			return nil, fmt.Errorf("读取场景失败: %w", err)
+			return model.ScenePage{}, fmt.Errorf("读取场景失败: %w", err)
 		}
 		if err := json.Unmarshal(rawTrigger, &st.scene.Trigger); err != nil {
-			return nil, fmt.Errorf("解析场景触发条件失败: %w", err)
+			return model.ScenePage{}, fmt.Errorf("解析场景触发条件失败: %w", err)
 		}
 		if err := json.Unmarshal(rawActions, &st.scene.Actions); err != nil {
-			return nil, fmt.Errorf("解析场景动作失败: %w", err)
+			return model.ScenePage{}, fmt.Errorf("解析场景动作失败: %w", err)
 		}
 		st.scene.DeviceMissing = missing
 		out = append(out, st.scene)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历场景列表失败: %w", err)
+		return model.ScenePage{}, fmt.Errorf("遍历场景列表失败: %w", err)
 	}
-	return out, nil
+
+	page := model.ScenePage{Items: out}
+	if limit > 0 && len(out) > limit {
+		page.Items = out[:limit]
+		last := page.Items[limit-1]
+		page.NextCursor = encodeSceneCursor(last.UpdatedAt, last.ID)
+		page.HasMore = true
+	}
+	return page, nil
+}
+
+// encodeSceneCursor 把 (updatedAt, id) 编码为不透明游标，与反馈列表同一形式。
+func encodeSceneCursor(at time.Time, id string) string {
+	raw := at.UTC().Format(time.RFC3339Nano) + "|" + id
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// decodeSceneCursor 解析游标；非法游标返回 ErrBadCursor 供 HTTP 层映射为 400。
+func decodeSceneCursor(cursor string) (time.Time, uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, uuid.Nil, store.ErrBadCursor
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, uuid.Nil, store.ErrBadCursor
+	}
+	at, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, uuid.Nil, store.ErrBadCursor
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil {
+		return time.Time{}, uuid.Nil, store.ErrBadCursor
+	}
+	return at.UTC(), id, nil
 }
 
 // GetScene 实现 store.Store。

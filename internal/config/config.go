@@ -42,33 +42,47 @@ type Config struct {
 	InstanceID   string
 	TokenTTLDays int
 	Version      string
+	// 服务端推送 worker：消费 push_deliveries。没有 FCM/APNs 凭据时适配层进入 dry-run，
+	// worker 仍会把投递标记为 sent 并记录完整载荷，不会卡住队列。
+	PushWorkerEnabled     bool
+	PushWorkerInterval    time.Duration
+	PushWorkerBatch       int
+	PushMaxAttempts       int
+	PushBackoffBase       time.Duration
+	PushSendingStaleAfter time.Duration
 }
 
 // Load 读取环境变量并返回配置。默认不连接数据库，直接使用 fixtures，便于快速启动。
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:                getEnv("ADDR", ":8080"),
-		StoreBackend:        strings.ToLower(getEnv("STORE", "")),
-		DatabaseURL:         os.Getenv("DATABASE_URL"),
-		FixturesDir:         getEnv("FIXTURES_DIR", "./fixtures"),
-		RateLimitBackend:    strings.ToLower(getEnv("RATE_LIMIT_BACKEND", "memory")),
-		RateLimitPerMin:     getEnvInt("RATE_LIMIT_PER_MINUTE", 120),
-		RateLimitBurst:      getEnvInt("RATE_LIMIT_BURST", 40),
-		PairingClaimPerMin:  getEnvInt("PAIRING_CLAIM_RATE_PER_MINUTE", 20),
-		PairingClaimBurst:   getEnvInt("PAIRING_CLAIM_BURST", 10),
-		FeedbackUserPerMin:  getEnvInt("FEEDBACK_USER_RATE_PER_MINUTE", 10),
-		FeedbackUserBurst:   getEnvInt("FEEDBACK_USER_BURST", 5),
-		FeedbackIPPerMin:    getEnvInt("FEEDBACK_IP_RATE_PER_MINUTE", 30),
-		FeedbackIPBurst:     getEnvInt("FEEDBACK_IP_BURST", 10),
-		AdminToken:          getEnv("ADMIN_TOKEN", ""),
-		MetricsEnabled:      getEnvBool("METRICS_ENABLED", true),
-		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
-		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
-		ShutdownTimeout:     10 * time.Second,
-		ShutdownDrain:       time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
-		InstanceID:          getEnv("INSTANCE_ID", ""),
-		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:             getEnv("APP_VERSION", "0.22.0"),
+		Addr:                  getEnv("ADDR", ":8080"),
+		StoreBackend:          strings.ToLower(getEnv("STORE", "")),
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		FixturesDir:           getEnv("FIXTURES_DIR", "./fixtures"),
+		RateLimitBackend:      strings.ToLower(getEnv("RATE_LIMIT_BACKEND", "memory")),
+		RateLimitPerMin:       getEnvInt("RATE_LIMIT_PER_MINUTE", 120),
+		RateLimitBurst:        getEnvInt("RATE_LIMIT_BURST", 40),
+		PairingClaimPerMin:    getEnvInt("PAIRING_CLAIM_RATE_PER_MINUTE", 20),
+		PairingClaimBurst:     getEnvInt("PAIRING_CLAIM_BURST", 10),
+		FeedbackUserPerMin:    getEnvInt("FEEDBACK_USER_RATE_PER_MINUTE", 10),
+		FeedbackUserBurst:     getEnvInt("FEEDBACK_USER_BURST", 5),
+		FeedbackIPPerMin:      getEnvInt("FEEDBACK_IP_RATE_PER_MINUTE", 30),
+		FeedbackIPBurst:       getEnvInt("FEEDBACK_IP_BURST", 10),
+		AdminToken:            getEnv("ADMIN_TOKEN", ""),
+		MetricsEnabled:        getEnvBool("METRICS_ENABLED", true),
+		RunMigrationsOnBoot:   getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
+		LogLevel:              parseLogLevel(getEnv("LOG_LEVEL", "info")),
+		ShutdownTimeout:       10 * time.Second,
+		ShutdownDrain:         time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
+		InstanceID:            getEnv("INSTANCE_ID", ""),
+		TokenTTLDays:          getEnvInt("TOKEN_TTL_DAYS", 180),
+		Version:               getEnv("APP_VERSION", "0.23.0"),
+		PushWorkerEnabled:     getEnvBool("PUSH_WORKER_ENABLED", true),
+		PushWorkerInterval:    time.Duration(getEnvInt("PUSH_WORKER_INTERVAL_SECONDS", 5)) * time.Second,
+		PushWorkerBatch:       getEnvInt("PUSH_WORKER_BATCH", 50),
+		PushMaxAttempts:       getEnvInt("PUSH_MAX_ATTEMPTS", 5),
+		PushBackoffBase:       time.Duration(getEnvInt("PUSH_BACKOFF_BASE_SECONDS", 30)) * time.Second,
+		PushSendingStaleAfter: time.Duration(getEnvInt("PUSH_SENDING_STALE_SECONDS", 300)) * time.Second,
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")
@@ -112,6 +126,21 @@ func Load() (Config, error) {
 	}
 	if cfg.TokenTTLDays <= 0 {
 		return Config{}, fmt.Errorf("TOKEN_TTL_DAYS 必须大于 0，当前为 %d", cfg.TokenTTLDays)
+	}
+	if cfg.PushWorkerInterval <= 0 {
+		return Config{}, fmt.Errorf("PUSH_WORKER_INTERVAL_SECONDS 必须大于 0")
+	}
+	if cfg.PushWorkerBatch <= 0 || cfg.PushWorkerBatch > 500 {
+		return Config{}, fmt.Errorf("PUSH_WORKER_BATCH 必须在 1~500 之间")
+	}
+	if cfg.PushMaxAttempts <= 0 || cfg.PushMaxAttempts > 20 {
+		return Config{}, fmt.Errorf("PUSH_MAX_ATTEMPTS 必须在 1~20 之间")
+	}
+	if cfg.PushBackoffBase <= 0 {
+		return Config{}, fmt.Errorf("PUSH_BACKOFF_BASE_SECONDS 必须大于 0")
+	}
+	if cfg.PushSendingStaleAfter < time.Minute {
+		return Config{}, fmt.Errorf("PUSH_SENDING_STALE_SECONDS 至少为 60")
 	}
 	return cfg, nil
 }

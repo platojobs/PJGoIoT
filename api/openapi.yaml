@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.17.0
+  version: 0.18.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -62,6 +62,11 @@ info:
       `DELETE /sessions/{id}` 单独吊销指定会话（跨用户/不存在统一 404，重复吊销幂等 204）；
       删除账号时 `tokens` 随账号一并清理。导出任务新增 `failureReason`：
       进程重启后启动对账会把超过 5 分钟仍未完成的任务标记为 `failed`，客户端据此提示重新申请。
+    - 自契约 `0.18.0`（服务 v0.23.0）起新增服务端推送通道：
+      `POST /push/devices` 注册设备令牌（同一用户同一 token 幂等，失效置 `inactive` 不硬删）、
+      `DELETE /push/devices/{deviceId}` 软停用；运营侧 `POST /admin/alerts`（`X-Admin-Token`）
+      在同一事务写告警与投递队列。`GET /scenes` 新增**可选** `limit`/`cursor` 分页，
+      不传参数时返回全量与旧版完全一致。无 FCM/APNs 凭据时 worker 以 dry-run 记录完整载荷。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -81,6 +86,10 @@ tags:
   - name: feedback
   - name: scene
     description: 本人的本地场景（触发条件 + 动作）服务端副本；全部限定本人
+  - name: push
+    description: |
+      服务端推送通道。客户端注册/停用设备令牌；告警由运营侧入口产生并进入投递队列，
+      由服务端 worker 调用 FCM/APNs 适配层。无凭据时 dry-run（记录完整载荷），不静默丢弃。
   - name: admin
     description: 运营侧内部入口；使用独立 admin 凭据，不在公开客户端 SDK 中
 
@@ -102,7 +111,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.22.0"
+                version: "0.23.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -2410,21 +2419,180 @@ paths:
         "503":
           $ref: "#/components/responses/Timeout"
 
+  /push/devices:
+    post:
+      tags: [push]
+      operationId: registerPushDevice
+      summary: 注册设备推送令牌
+      description: |
+        **鉴权：Bearer token（必需）。**
+
+        注册当前用户设备的推送令牌。同一用户同一 `token` 幂等：重复提交会更新
+        `platform` / `appVersion` / `deviceModel`，并把已失效令牌恢复为 `active`，`id` 不变。
+        不同用户使用相同 token 会各自生成独立记录。
+
+        令牌失效（provider 返回 invalid/unregistered）时服务端把 `status` 置为 `inactive`
+        而不是硬删除；客户端可再次注册同一 token 使其恢复 active。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushRegistrationInput"
+            example:
+              platform: android
+              token: "fcm-token-abc"
+              appVersion: "1.4.0"
+              deviceModel: "Pixel 8"
+      responses:
+        "200":
+          description: 注册或幂等更新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushRegistration"
+        "400":
+          description: |
+            `platform` 不是 `android`/`ios`，或 `token` 为空/超过 4096 字符，
+            错误码 `PUSH_DEVICE_INVALID`；请求体非法 JSON 时 `INVALID_JSON`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /push/devices/{deviceId}:
+    delete:
+      tags: [push]
+      operationId: deactivatePushDevice
+      summary: 停用设备推送令牌
+      description: |
+        **鉴权：Bearer token（必需）。**
+
+        把令牌标记为 `inactive`（软停用，不硬删除）；已停用时重复调用幂等返回 204。
+        跨用户或令牌不存在返回 404（不泄露其他用户令牌的存在性）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          description: 推送令牌记录 id（UUID，注册响应中的 `id`）
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: 已停用（幂等）
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/alerts:
+    post:
+      tags: [admin, push]
+      operationId: adminCreateAlert
+      summary: 运营侧创建告警并写入投递队列
+      description: |
+        **鉴权：`X-Admin-Token`（内部接口，不在公开客户端 SDK 中）。**
+        未配置 `ADMIN_TOKEN` 时返回 404；凭据缺失或错误返回 401。
+
+        在同一事务内写入一条告警，并为该用户**所有 active 推送令牌**各写一条 `pending`
+        投递记录（快照 token/title/body/data）。当前服务端没有内建告警产生者，该入口用于
+        打通「告警 → 队列 → worker → 推送适配层」链路；Prometheus 规则仍由 Alertmanager
+        独立路由，两者不共用队列。
+
+        没有 FCM/APNs 凭据时 worker 以 dry-run 处理：日志记录完整载荷，投递标记
+        `dry_run=true` 且 `status=sent`，不会静默丢弃或卡住队列。真实投递以
+        服务端实际配置的凭据为准（本版本未在真实设备上验证）。
+      security:
+        - adminToken: []
+      x-audience: internal
+      x-client-sdk: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlertInput"
+            example:
+              userId: "6f1d0c0e-8f5b-4f0c-9a41-2c0a9a4b7f10"
+              kind: device_offline
+              title: "设备离线"
+              body: "客厅传感器已离线超过 10 分钟"
+              severity: warning
+              payload:
+                externalId: "AA:BB:CC:00:00:01"
+      responses:
+        "201":
+          description: 告警已创建，投递已入队
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertCreated"
+        "400":
+          description: |
+            字段不合法（userId/kind/title 为空或超长、severity 非法、payload 条目过多），
+            错误码 `ALERT_INVALID`；请求体非法 JSON 时 `INVALID_JSON`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 用户不存在，或运营入口未启用（未配置 ADMIN_TOKEN）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /scenes:
     get:
       tags: [scene]
       operationId: listScenes
       summary: 列出本人场景
-      description: 只返回本人未删除（`deletedAt` 为空）的场景，按 `updatedAt` 倒序。
+      description: |
+        只返回本人未删除（`deletedAt` 为空）的场景，按 `updatedAt` 倒序（同一时间按 `id` 升序）。
+
+        **可选游标分页**：不传 `limit` 时返回全量，行为与分页前完全一致（`nextCursor`、
+        `hasMore` 不出现）。传 `limit` 时按 `limit` 返回一页；`nextCursor` 是不透明游标，
+        把上一页响应的 `nextCursor` 原样传回即可取下一页。`limit` 最大 200（超过按 200 处理）。
+        非法 `limit` 或损坏的 `cursor` 返回 `400 BAD_REQUEST`。
       security:
         - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数，正整数；不传则返回全量。最大 200。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页返回的不透明游标；仅在传 `limit` 时有意义。
+          schema:
+            type: string
       responses:
         "200":
-          description: 本人场景列表
+          description: 本人场景列表（未传 limit 时返回全量）
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SceneList"
+        "400":
+          description: "`limit` 非正整数，或 `cursor` 损坏，错误码 `BAD_REQUEST`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
     post:
@@ -4386,15 +4554,146 @@ components:
           maxLength: 2000
           description: 可选内部备注；不对用户回显，空白视为未提供
 
+    PushRegistrationInput:
+      type: object
+      description: POST /push/devices 的请求体。
+      required: [platform, token]
+      properties:
+        platform:
+          type: string
+          enum: [android, ios]
+          description: 推送平台；ios 走 APNs，android 走 FCM
+        token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: 设备推送令牌（FCM registration token 或 APNs device token）
+        appVersion:
+          type: string
+          maxLength: 64
+          description: 客户端版本，便于按版本排查
+        deviceModel:
+          type: string
+          maxLength: 128
+          description: 设备型号，便于排查
+
+    PushRegistration:
+      type: object
+      description: 已注册的推送令牌；同一用户同一 token 只有一条记录。
+      required: [id, platform, token, appVersion, deviceModel, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        platform:
+          type: string
+          enum: [android, ios]
+        token:
+          type: string
+        appVersion:
+          type: string
+        deviceModel:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive]
+          description: inactive 表示令牌失效或被用户停用；保留记录，可重新注册恢复 active
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    AlertInput:
+      type: object
+      description: POST /admin/alerts 的请求体（内部接口）。
+      required: [userId, kind, title]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: 接收告警的用户
+        kind:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: 告警类型，如 device_offline、scene_triggered
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        body:
+          type: string
+          maxLength: 2000
+          description: 通知正文；可空
+        severity:
+          type: string
+          enum: [info, warning, critical]
+          default: info
+        payload:
+          type: object
+          additionalProperties:
+            type: string
+          description: 附加字符串键值，最多 20 个；键最长 64、值最长 1024。最终并入推送 data 载荷。
+
+    Alert:
+      type: object
+      description: 服务端创建的一条告警。
+      required: [id, userId, kind, title, body, severity, payload, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        title:
+          type: string
+        body:
+          type: string
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        payload:
+          type: object
+          additionalProperties:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    AlertCreated:
+      type: object
+      description: 告警创建结果；deliveryCount 为本次入队的投递条数（等于用户 active 令牌数）。
+      required: [alert, deliveryCount]
+      properties:
+        alert:
+          $ref: "#/components/schemas/Alert"
+        deliveryCount:
+          type: integer
+          minimum: 0
+
     SceneList:
       type: object
-      description: GET /scenes 的响应；`items` 恒为数组，不含已软删除场景。
+      description: |
+        GET /scenes 的响应；`items` 恒为数组，不含已软删除场景。
+        不传 `limit` 时只返回 `items`；传 `limit` 时额外返回 `nextCursor`（还有下一页时）
+        与 `hasMore`。
       required: [items]
       properties:
         items:
           type: array
           items:
             $ref: "#/components/schemas/Scene"
+        nextCursor:
+          type: string
+          description: 下一页游标；仅分页响应且还有更多数据时出现。原样传回 `cursor` 参数。
+        hasMore:
+          type: boolean
+          description: 是否还有下一页；仅分页响应出现。
 
     Scene:
       type: object

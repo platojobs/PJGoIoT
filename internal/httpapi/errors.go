@@ -71,6 +71,10 @@ const (
 	CodeSceneDeviceNotFound = "SCENE_DEVICE_NOT_FOUND"
 	// CodeSceneMetricNotSupported 表示指标越界绑定的设备类型不存在或该类型不支持该指标。HTTP 400。
 	CodeSceneMetricNotSupported = "SCENE_METRIC_NOT_SUPPORTED"
+	// CodePushDeviceInvalid 表示推送设备注册参数不合法（platform/token）。HTTP 400。
+	CodePushDeviceInvalid = "PUSH_DEVICE_INVALID"
+	// CodeAlertInvalid 表示运营侧告警内容不合法。HTTP 400。
+	CodeAlertInvalid = "ALERT_INVALID"
 )
 
 type errorBody struct {
@@ -197,6 +201,10 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusBadRequest, CodeSceneDeviceNotFound, last.Error())
 		case errors.Is(last, store.ErrSceneMetricNotSupported):
 			writeError(c.Writer, http.StatusBadRequest, CodeSceneMetricNotSupported, last.Error())
+		case errors.Is(last, store.ErrPushDeviceInvalid):
+			writeError(c.Writer, http.StatusBadRequest, CodePushDeviceInvalid, last.Error())
+		case errors.Is(last, store.ErrBadCursor):
+			writeError(c.Writer, http.StatusBadRequest, CodeBadRequest, "游标不合法")
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
 		case errors.Is(last, store.ErrDuplicateDevice):

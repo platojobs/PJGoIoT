@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.17.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.17.0", got)
+	if got := info["version"]; got != "0.18.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.18.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -350,12 +350,12 @@ func TestOpenAPIDeletionExportContract(t *testing.T) {
 	}
 }
 
-// TestOpenAPISceneContract 校验契约 0.17.0 的场景上云：
+// TestOpenAPISceneContract 校验契约 0.18.0 的场景上云：
 // 路径、鉴权、schema 与模型字段逐项对齐，并确认 change_log 的 scene entity 在契约中有定义。
 func TestOpenAPISceneContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
-	if got := digMap(t, doc, "info")["version"]; got != "0.17.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.17.0", got)
+	if got := digMap(t, doc, "info")["version"]; got != "0.18.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.18.0", got)
 	}
 	paths := digMap(t, doc, "paths")
 	schemas := digMap(t, digMap(t, doc, "components"), "schemas")
@@ -482,7 +482,67 @@ func findParam(t *testing.T, op map[string]any, name string) map[string]any {
 	return nil
 }
 
-// hasSecurityScheme 判断 operation 的 security 列表是否包含指定 scheme。
+// TestOpenAPIPushContract 校验契约 0.18.0 的推送通道：路径、鉴权、schema 与模型字段逐项对齐。
+func TestOpenAPIPushContract(t *testing.T) {
+	doc := loadOpenAPIDoc(t)
+	paths := digMap(t, doc, "paths")
+	schemas := digMap(t, digMap(t, doc, "components"), "schemas")
+
+	for _, path := range []string{"/push/devices", "/push/devices/{deviceId}", "/admin/alerts"} {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("openapi 缺少路径 %s", path)
+		}
+	}
+	registerOp := digMap(t, asMapAny(t, paths["/push/devices"]), "post")
+	deleteOp := digMap(t, asMapAny(t, paths["/push/devices/{deviceId}"]), "delete")
+	alertOp := digMap(t, asMapAny(t, paths["/admin/alerts"]), "post")
+	if !hasSecurityScheme(t, registerOp, "bearerAuth") || !hasSecurityScheme(t, deleteOp, "bearerAuth") {
+		t.Fatal("/push/devices 应使用 bearerAuth")
+	}
+	if !hasSecurityScheme(t, alertOp, "adminToken") {
+		t.Fatal("/admin/alerts 应使用 adminToken")
+	}
+	if alertOp["x-audience"] != "internal" || alertOp["x-client-sdk"] != false {
+		t.Fatalf("/admin/alerts 应标注 internal 且不进 SDK: x-audience=%v x-client-sdk=%v",
+			alertOp["x-audience"], alertOp["x-client-sdk"])
+	}
+	assertRef(t, registerOp, "200", "#/components/schemas/PushRegistration")
+	assertRef(t, alertOp, "201", "#/components/schemas/AlertCreated")
+
+	for _, tc := range []struct {
+		schema string
+		value  any
+	}{
+		{"PushRegistration", model.PushRegistration{}},
+		{"PushRegistrationInput", model.PushRegistrationInput{}},
+		{"Alert", model.Alert{}},
+		{"AlertInput", model.AlertInput{}},
+	} {
+		s := digMap(t, schemas, tc.schema)
+		if got := stringSet(propsOf(digMap(t, s, "properties"))); !reflect.DeepEqual(got, jsonFieldSet(t, tc.value)) {
+			t.Fatalf("%s 字段与模型不一致: %v", tc.schema, got)
+		}
+		if got := stringSet(asStrings(t, s["required"])); !reflect.DeepEqual(got, jsonRequiredSet(t, tc.value)) {
+			t.Fatalf("%s required 与模型不一致: %v", tc.schema, got)
+		}
+	}
+
+	// GET /scenes 的可选分页参数必须存在，且不改变成功响应结构。
+	listOp := digMap(t, asMapAny(t, paths["/scenes"]), "get")
+	params, ok := listOp["parameters"].([]any)
+	if !ok || len(params) != 2 {
+		t.Fatalf("GET /scenes 应有 limit 与 cursor 两个可选参数，实际 %v", listOp["parameters"])
+	}
+	names := map[string]bool{}
+	for _, raw := range params {
+		p := asMapAny(t, raw)
+		names[p["name"].(string)] = true
+	}
+	if !names["limit"] || !names["cursor"] {
+		t.Fatalf("GET /scenes 分页参数缺失: %v", names)
+	}
+}
+
 func hasSecurityScheme(t *testing.T, op map[string]any, scheme string) bool {
 	t.Helper()
 	list, ok := op["security"].([]any)

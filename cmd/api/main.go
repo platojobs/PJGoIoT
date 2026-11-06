@@ -19,6 +19,7 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/config"
 	"github.com/platojobs/PJGoIoT/internal/httpapi"
 	migrateboot "github.com/platojobs/PJGoIoT/internal/migrate"
+	"github.com/platojobs/PJGoIoT/internal/push"
 	"github.com/platojobs/PJGoIoT/internal/store"
 	"github.com/platojobs/PJGoIoT/internal/store/fixture"
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
@@ -117,6 +118,24 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 推送投递 worker：消费告警产生时写入的投递队列。
+	// 没有 FCM/APNs 凭据时适配层自动 dry-run（记录完整载荷并置 sent），队列不会被卡住。
+	// 单实例内只有一个循环；多实例通过 FOR UPDATE SKIP LOCKED 互斥，不会重复消费。
+	if cfg.PushWorkerEnabled {
+		worker := push.NewWorker(st, push.NewService(logger), logger, push.WorkerConfig{
+			Interval:          cfg.PushWorkerInterval,
+			Batch:             cfg.PushWorkerBatch,
+			MaxAttempts:       cfg.PushMaxAttempts,
+			BackoffBase:       cfg.PushBackoffBase,
+			SendingStaleAfter: cfg.PushSendingStaleAfter,
+		})
+		go worker.Run(ctx)
+		logger.Info("推送投递 worker 已启动", "interval", cfg.PushWorkerInterval.String(),
+			"batch", cfg.PushWorkerBatch, "maxAttempts", cfg.PushMaxAttempts)
+	} else {
+		logger.Warn("推送投递 worker 已禁用，告警只入队不投递", "PUSH_WORKER_ENABLED", false)
+	}
 	<-ctx.Done()
 
 	// 优雅下线分两步：

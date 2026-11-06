@@ -2,9 +2,11 @@ package fixture
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,13 +25,13 @@ type sceneRecord struct {
 }
 
 // ListScenes 实现 store.Store。
-func (s *Store) ListScenes(ctx context.Context, userID string) ([]model.Scene, error) {
+func (s *Store) ListScenes(ctx context.Context, userID string, q store.SceneQuery) (model.ScenePage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	data, ok := s.users[userID]
 	if !ok {
-		return nil, store.ErrNotFound
+		return model.ScenePage{}, store.ErrNotFound
 	}
 	out := make([]model.Scene, 0, len(data.scenes))
 	for _, rec := range data.scenes {
@@ -46,7 +48,60 @@ func (s *Store) ListScenes(ctx context.Context, userID string) ([]model.Scene, e
 		}
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
 	})
-	return out, nil
+
+	limit := q.Limit
+	if limit > 200 {
+		limit = 200
+	}
+	if limit <= 0 {
+		return model.ScenePage{Items: out}, nil
+	}
+	if q.Cursor != "" {
+		at, id, err := decodeSceneCursor(q.Cursor)
+		if err != nil {
+			return model.ScenePage{}, err
+		}
+		filtered := out[:0]
+		for _, sc := range out {
+			if sc.UpdatedAt.Before(at) || (sc.UpdatedAt.Equal(at) && sc.ID > id) {
+				filtered = append(filtered, sc)
+			}
+		}
+		out = filtered
+	}
+	page := model.ScenePage{Items: out}
+	if len(out) > limit {
+		page.Items = out[:limit]
+		last := page.Items[limit-1]
+		page.NextCursor = encodeSceneCursor(last.UpdatedAt, last.ID)
+		page.HasMore = true
+	}
+	return page, nil
+}
+
+func encodeSceneCursor(at time.Time, id string) string {
+	raw := at.UTC().Format(time.RFC3339Nano) + "|" + id
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodeSceneCursor(cursor string) (time.Time, string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", store.ErrBadCursor
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", store.ErrBadCursor
+	}
+	at, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", store.ErrBadCursor
+	}
+	parsed, err := uuid.Parse(parts[1])
+	if err != nil {
+		return time.Time{}, "", store.ErrBadCursor
+	}
+	return at.UTC(), parsed.String(), nil
 }
 
 // GetScene 实现 store.Store。

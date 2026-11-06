@@ -1,0 +1,13 @@
+[Unit]
+Description=每日运行 PJGoIoT 数据清理
+Documentation=file:///opt/pjgoiot/docs/runbook.md
+
+[Timer]
+# UTC 04:17，避开整点高峰；随机延迟最多 10 分钟。
+OnCalendar=*-*-* 04:17:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+Unit=pjgoiot-cleanup.service
+
+[Install]
+WantedBy=timers.target

@@ -11,6 +11,12 @@ global:
 rule_files:
   - alerts.yml
 
+# Alertmanager 地址在 compose 内部为 alertmanager:9093；单独部署时改成实际地址。
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: pjgoiot-api
     metrics_path: /metrics

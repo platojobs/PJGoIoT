@@ -1,0 +1,17 @@
+# 容器环境下的定时任务示例（主机 cron + docker compose run）。
+#
+# 安装：把下列两行加入部署机的 crontab（crontab -e）。
+# CRON_TZ=UTC 需要 cron 支持（cronie/vixie-cron 支持；busybox cron 不支持时改为本地时区换算）。
+CRON_TZ=UTC
+
+# 每日 03:30 备份（复用 compose 中的 postgres 服务，避免主机安装 pg_dump）。
+30 3 * * * cd /opt/pjgoiot && docker compose exec -T postgres pg_dump -U pjgoiot -d pjgoiot --format=custom --no-owner --no-privileges | gzip -9 > /var/backups/pjgoiot/pjgoiot-$(date -u +\%Y\%m\%dT\%H\%M\%SZ).dump.gz 2>>/var/log/pjgoiot/backup.log
+
+# 每日 04:17 清理（镜像内已包含 /cleanup；--entrypoint 覆盖默认的 /api）。
+17 4 * * * cd /opt/pjgoiot && docker compose run --rm --entrypoint /cleanup api >> /var/log/pjgoiot/cleanup.log 2>&1
+
+# 说明：
+#   - docker compose run 会读取 compose 中 api 服务的 DATABASE_URL，与 API 使用同一数据库。
+#   - 输出重定向到 /var/log/pjgoiot/*.log 前请确保目录存在且 cron 用户可写：
+#       sudo mkdir -p /var/log/pjgoiot /var/backups/pjgoiot && sudo chown -R pjgoiot:pjgoiot /var/log/pjgoiot /var/backups/pjgoiot
+#   - 本文件与 systemd 单元均「已提供但未在生产环境安装」，安装步骤见 docs/runbook.md。

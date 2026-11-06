@@ -1,0 +1,13 @@
+# 仅用于 scripts/verify-alerting.sh 的本地验证规则：表达式恒为 1，评估后立即触发。
+groups:
+  - name: pjgoiot-verify
+    rules:
+      - alert: VerifyAlertingPipeline
+        expr: vector(1)
+        for: 0m
+        labels:
+          severity: info
+          service: pjgoiot-alert-verify
+          env: local
+        annotations:
+          summary: "本地验证：Prometheus 规则触发后应到达 alert-webhook"

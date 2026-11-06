@@ -80,8 +80,8 @@ func TestPostgresSceneIntegration(t *testing.T) {
 			t.Fatalf("创建结果异常: %+v", created)
 		}
 
-		list, err := st.ListScenes(ctx, ownerID)
-		if err != nil || len(list) != 1 || list[0].ID != created.ID {
+		list, err := st.ListScenes(ctx, ownerID, store.SceneQuery{})
+		if err != nil || len(list.Items) != 1 || list.Items[0].ID != created.ID {
 			t.Fatalf("本人列表异常: items=%+v err=%v", list, err)
 		}
 		if _, err := st.GetScene(ctx, ownerID, created.ID); err != nil {
@@ -90,7 +90,7 @@ func TestPostgresSceneIntegration(t *testing.T) {
 		if _, err := st.GetScene(ctx, otherID, created.ID); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("跨用户读取应为 404，得到 %v", err)
 		}
-		if list, err := st.ListScenes(ctx, otherID); err != nil || len(list) != 0 {
+		if list, err := st.ListScenes(ctx, otherID, store.SceneQuery{}); err != nil || len(list.Items) != 0 {
 			t.Fatalf("跨用户列表应为空: items=%+v err=%v", list, err)
 		}
 		if _, err := st.UpdateScene(ctx, otherID, created.ID, model.ScenePatch{
@@ -305,7 +305,7 @@ func TestPostgresSceneIntegration(t *testing.T) {
 		if _, err := st.GetScene(ctx, userID, created.ID); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("软删后读取应为 404，得到 %v", err)
 		}
-		if list, err := st.ListScenes(ctx, userID); err != nil || len(list) != 0 {
+		if list, err := st.ListScenes(ctx, userID, store.SceneQuery{}); err != nil || len(list.Items) != 0 {
 			t.Fatalf("软删后列表应为空: items=%+v err=%v", list, err)
 		}
 

@@ -1,0 +1,47 @@
+# Alertmanager 配置样例（v0.23.0）。
+#
+# 说明：
+#   - route.group_by 决定「去重」粒度：同一 alertname + service + env 的告警在
+#     group_wait 窗口内合并为一次通知；相同 fingerprint 的重复告警不会重复通知，
+#     直到 repeat_interval（默认 4h，critical 1h）后再次提醒。
+#   - 静默（silence）不在本文件里静态配置，而是通过 Alertmanager API 运行时创建，
+#     见文件末尾的命令示例；静默按 matchers 匹配活动告警，命中后不再触发通知。
+#   - webhook.url 在 compose 内部指向 alert-webhook:8099；单独部署时改成实际地址。
+#   - 本配置「已提供但未在生产环境安装」；本地验证脚本见 scripts/verify-alerting.sh。
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: pjgoiot-webhook
+  group_by: [alertname, service, env]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: pjgoiot-webhook
+      group_wait: 5s
+      repeat_interval: 1h
+
+receivers:
+  - name: pjgoiot-webhook
+    webhook_configs:
+      - url: http://alert-webhook:8099/alerts
+        send_resolved: true
+        max_alerts: 10
+
+# 抑制规则：ApiMetricsAbsent 说明抓取整体失败，此时其它 API 告警大概率是同一原因，
+# 避免一次故障刷出多条通知。equal 表示只有 env 相同才抑制。
+inhibit_rules:
+  - source_matchers: ['alertname="ApiMetricsAbsent"']
+    target_matchers: ['service="pjgoiot-api"']
+    equal: [env]
+
+# 运行时静默示例（1 小时）：
+#   curl -s -X POST http://127.0.0.1:9093/api/v2/silences \
+#     -H 'Content-Type: application/json' \
+#     -d '{"matchers":[{"name":"alertname","value":"ApiP95LatencyHigh","isRegex":false,"isEqual":true}],
+#          "startsAt":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+#          "endsAt":"'$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)'",
+#          "createdBy":"ops","comment":"计划内维护"}'
+# 列表/过期：GET /api/v2/silences；DELETE /api/v2/silence/{silenceID}

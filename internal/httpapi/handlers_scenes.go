@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,22 +14,44 @@ import (
 )
 
 // sceneListResponse 是 GET /scenes 的响应；items 恒为非 null 数组，客户端无需处理 null。
+// 未传 limit 时只返回 items（与分页前完全一致）；传 limit 时额外返回分页字段。
 type sceneListResponse struct {
-	Items []model.Scene `json:"items"`
+	Items      []model.Scene `json:"items"`
+	NextCursor *string       `json:"nextCursor,omitempty"`
+	HasMore    *bool         `json:"hasMore,omitempty"`
 }
 
 // handleListScenes 返回本人未删除的场景，按 updatedAt 倒序。
+// limit/cursor 为可选参数：不传 limit 时返回全量，保持两端现有实现不变。
 func (s *Server) handleListScenes(c *gin.Context) {
-	items, err := s.store.ListScenes(c.Request.Context(), userID(c))
+	q := store.SceneQuery{Cursor: c.Query("cursor")}
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "limit 必须是正整数")
+			return
+		}
+		q.Limit = n
+	}
+	page, err := s.store.ListScenes(c.Request.Context(), userID(c), q)
 	if err != nil {
 		c.Error(err)
 		c.Abort()
 		return
 	}
-	if items == nil {
-		items = []model.Scene{}
+	if page.Items == nil {
+		page.Items = []model.Scene{}
 	}
-	c.JSON(http.StatusOK, sceneListResponse{Items: items})
+	resp := sceneListResponse{Items: page.Items}
+	if q.Limit > 0 {
+		hasMore := page.HasMore
+		resp.HasMore = &hasMore
+		if page.HasMore {
+			next := page.NextCursor
+			resp.NextCursor = &next
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleGetScene 返回本人单个场景；不存在、已删除或属于他人统一 404。
