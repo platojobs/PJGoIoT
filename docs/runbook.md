@@ -79,10 +79,14 @@
 | v0.17.0 契约一致性 | **已验证** | `TestOpenAPIFeedbackContract`：新 schema 字段与模型 JSON 标签一致、枚举对齐、admin 路径 `x-audience: internal` / `x-client-sdk: false`、错误码含 `FEEDBACK_INVALID_TRANSITION` |
 | v0.17.0 迁移 | **已验证** | `000014_feedback_status_workflow` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000013）→ up`，`internal_note`、审计表、`feedback_status_created_idx` 均存在且回滚不破坏反馈表与用户数据 |
 | v0.17.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 0.13.0 |
+| v0.17.0 CI | **已验证** | GitHub Actions [run 42163927951](https://github.com/platojobs/PJGoIoT/actions/runs/42163927951) 四 job 全绿；`TestPostgresFeedbackLifecycleIntegration` 全部子测试执行且 job 成功 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
 | Android/iOS 真机局域网访问 e2e 栈 | **未验证** | 栈绑定 127.0.0.1，仅验证模拟器可用路径；两个客户端仓库本轮未实际执行 |
+| v0.17.0 运营工具联调 | **未验证** | 只提供 HTTP 契约与 curl 级验证，未接入真实运营后台；`ADMIN_TOKEN` 的下发、轮换与吊销流程未落地 |
+| v0.17.0 admin 并发压测 | **未验证** | `SELECT ... FOR UPDATE` 保证同一反馈的审计顺序，但未做多实例并发 PATCH 压测；共享 token 下审计 actor 固定为 `admin`，无法区分具体操作人 |
+| v0.17.0 审计留存 | **未验证** | 审计表随反馈级联删除，未设计独立归档 / 保留期策略；长期增长与清理未评估 |
 
 ## 1. 部署前检查清单
 

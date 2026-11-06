@@ -1438,6 +1438,10 @@ seed 数据来源与边界：
 | v0.17.0 契约一致性 | 通过：`TestOpenAPIFeedbackContract` 比对 `FeedbackDetail` / `AdminFeedbackItem` 的 properties/required 与模型 JSON 字段、`FeedbackCloseRequest` 与 admin 目标状态枚举、admin 路径 `x-audience: internal` / `x-client-sdk: false`、错误码枚举含 `FEEDBACK_INVALID_TRANSITION` |
 | v0.17.0 迁移 | 通过：`000014_feedback_status_workflow` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000013）→ up`，断言 `internal_note`、审计表、`feedback_status_created_idx` 存在且回滚不破坏反馈表与用户数据 |
 | v0.17.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 **0.13.0** |
+| v0.17.0 CI | 通过：GitHub Actions [run 42163927951](https://github.com/platojobs/PJGoIoT/actions/runs/42163927951) 四 job 全绿；日志确认 `TestPostgresFeedbackLifecycleIntegration` 各子测试执行且 job 成功，`OpenAPI 契约校验` 0 error |
+| v0.17.0 运营工具联调 | 未验证：只提供 HTTP 契约与 curl 级验证，未接入真实运营后台；`ADMIN_TOKEN` 的下发、轮换与吊销流程未落地 |
+| v0.17.0 admin 并发压测 | 未验证：`SELECT ... FOR UPDATE` 保证同一反馈的审计顺序，但未做多实例并发 PATCH 压测；共享 token 下审计 actor 固定为 `admin`，无法区分具体操作人 |
+| v0.17.0 审计留存 | 未验证：审计表随反馈级联删除，未设计独立归档 / 保留期策略；长期增长与清理未评估 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
