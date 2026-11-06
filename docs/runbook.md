@@ -119,6 +119,7 @@
 | v0.20.0 软删 tombstone | **已验证** | 真实 PG：`deleted_at` 落库且 `version+1`；GET/列表 404/空；`change_log` delete payload 含 `deletedAt`；本人 `changes` 可见 upsert+delete，他人不可见 |
 | v0.20.0 删除与导出补齐 | **已验证** | 真实 PG：账号删除后 `scenes` 计数 0；导出 `scenes` 只含本人场景（含 tombstone），不含他人场景名/设备/用户 id |
 | v0.20.0 契约一致性 | **已验证** | `TestOpenAPISceneContract`：7 个 schema properties/required 与模型 JSON 标签逐项一致；trigger/action kind 枚举一致；`Change.payload` oneOf 含 `Scene`；错误码枚举含 6 个新码；契约版本 0.16.0 |
+| v0.20.0 CI | **已验证** | GitHub Actions [run 42176171594](https://github.com/platojobs/PJGoIoT/actions/runs/42176171594) 四 job 全绿（`Postgres 集成测试` 含 `TestPostgresSceneIntegration` 五个子测试，`OpenAPI 契约校验` 0 error）；首次 run 42175459061 因纳秒/微秒精度判定失败，修复后通过 |
 | v0.20.0 客户端接入 | **未验证** | 两端 App 仍以本地 SQLite/Room 为执行源，尚未切到 `/scenes`；首次同步、冲突合并与 `deviceMissing` UI 呈现未在真机验证 |
 | v0.20.0 定时调度 | **未验证** | `schedule` 的时区/夏令时在真实客户端本地调度未实测；服务端只做存储与结构校验 |
 | v0.20.0 admin 并发 | **未涉及** | 本轮无 admin 接口；场景写入按用户串行化（与 push 共用 advisory lock），未做跨用户高并发压测 |

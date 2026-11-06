@@ -1583,6 +1583,7 @@ seed 数据来源与边界：
 | v0.20.0 软删与 tombstone | 通过（真实 PostgreSQL）：`deleted_at` 落库、`version+1`；GET/列表 404/空；`change_log` 的 delete payload 含 `deletedAt`；他人 `changes` 不可见、本人可见 upsert+delete |
 | v0.20.0 删除与导出补齐 | 通过（真实 PostgreSQL）：账号删除后 `scenes` 计数为 0；导出含本人场景、不含他人场景/设备 |
 | v0.20.0 契约一致性 | 通过：`TestOpenAPISceneContract` 比对 7 个 schema 的 properties/required 与模型 JSON 字段、kind 枚举、`Change.payload` oneOf 含 `Scene`、6 个错误码；契约版本 **0.16.0** |
+| v0.20.0 CI | 通过：GitHub Actions [run 42176171594](https://github.com/platojobs/PJGoIoT/actions/runs/42176171594) 四 job 全绿（含 `Postgres 集成测试` 的 `TestPostgresSceneIntegration` 五个子测试与 `OpenAPI 契约校验`）；首次 run 42175459061 在 Linux 上暴露纳秒/微秒精度导致的「幂等补丁重复应用」，修复后复跑通过 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
