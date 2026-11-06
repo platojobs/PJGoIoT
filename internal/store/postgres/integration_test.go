@@ -787,3 +787,5 @@ func hashOf(s string) string {
 
 // strPtr 用于构造可缺省字段：非 nil 表示显式上报，nil 表示未上报。
 func strPtr(s string) *string { return &s }
+
+func intPtr(v int) *int { return &v }

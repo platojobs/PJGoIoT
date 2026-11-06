@@ -325,11 +325,26 @@ func (s *Store) BuildPersonalDataExport(ctx context.Context, userID string) (mod
 		return feedback[i].FeedbackID < feedback[j].FeedbackID
 	})
 
+	// 场景包含 tombstone（带 deletedAt），与设备导出的语义一致；deviceMissing 为导出时实时计算。
+	scenes := make([]model.Scene, 0, len(data.scenes))
+	for _, rec := range data.scenes {
+		sc := copyScene(rec.scene)
+		sc.DeviceMissing = sceneDeviceMissingLocked(data, sc.Trigger)
+		scenes = append(scenes, sc)
+	}
+	sort.SliceStable(scenes, func(i, j int) bool {
+		if !scenes[i].UpdatedAt.Equal(scenes[j].UpdatedAt) {
+			return scenes[i].UpdatedAt.After(scenes[j].UpdatedAt)
+		}
+		return scenes[i].ID < scenes[j].ID
+	})
+
 	return model.PersonalDataExport{
 		User:        model.User{ID: userID, Kind: data.kind, CreatedAt: data.createdAt.UTC()},
 		Devices:     devices,
 		Readings:    readings,
 		Households:  households,
+		Scenes:      scenes,
 		Feedback:    feedback,
 		GeneratedAt: time.Now().UTC(),
 	}, nil

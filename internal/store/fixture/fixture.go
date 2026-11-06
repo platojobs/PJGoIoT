@@ -99,6 +99,9 @@ type userData struct {
 
 	readings map[string]*readingRecord // key: reading id
 
+	// scenes 是本人场景；tombstone 保留在 map 中，读取时过滤 DeletedAt。
+	scenes map[string]*sceneRecord
+
 	kind      string
 	createdAt time.Time
 }
@@ -325,6 +328,7 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expir
 		byID:      map[string]*model.UserDevice{},
 		byKey:     map[string]*model.UserDevice{},
 		readings:  map[string]*readingRecord{},
+		scenes:    map[string]*sceneRecord{},
 		kind:      "anonymous",
 		createdAt: time.Now().UTC(),
 	}

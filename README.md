@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.15.0**（v0.19.0 新增账号删除与个人数据导出）；服务版本 **v0.19.0**（账号删除与数据导出）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.16.0**（v0.20.0 新增场景上云）；服务版本 **v0.20.0**（场景服务端化）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -365,6 +365,63 @@ v0.17.0 的 `000014_feedback_status_workflow` 补 `internal_note` 列、`(status
 - `go run ./cmd/cataloggen` 生成迁移 `000015_device_type_catalog`（含 seed）与 down；
 - 真实 PG 测试 `TestPostgresCatalogDeviceTypesIntegration` 把接口返回的 metrics / 特征 UUID /
   GATT 服务与真值表逐项比对，手改迁移或文档漂移会直接测试失败。
+
+### 场景上云（v0.20.0）
+
+两端 App 的本地场景（触发条件 + 动作 + 启用状态 + 冷却）此前只存在本机 SQLite/Room，
+换机、重装、多设备登录即丢失，也不在账号删除与导出范围内。v0.20.0 把它们搬到服务端：
+
+- `GET /scenes`、`POST /scenes`、`GET /scenes/{sceneId}`、`PUT /scenes/{sceneId}`、
+  `DELETE /scenes/{sceneId}`，全部限定本人；跨用户或已软删统一 404。
+- 软删除只写 `deleted_at`，同时向 `change_log` 写 `entity=scene`、`op=delete` 的 tombstone；
+  `scene` 的 `household_id` 恒为 NULL，只对本人可见，其他用户的 `changes` 不会看到。
+- 响应与 `change_log` payload 都是完整 `Scene`（含 `version`、`deviceMissing`、`deletedAt`），
+  可直接重建客户端状态。
+
+**存储形态**：一个场景就是客户端可直接执行的完整规则包，因此用单行 `scenes` 表 +
+`trigger` / `actions` 两个 JSONB 列，而不是 `scene_rules` / `scene_actions` 子表。
+理由：子表会引入没有业务含义的子级 LWW 时间戳；`change_log` 需要一次 payload 完整重建；
+客户端本地也是整体读写。取舍与迁移注释见
+[`000017_scenes.up.sql`](db/migrations/000017_scenes.up.sql)。
+
+**字段级 LWW**：`name`、`enabled`、`cooldown_seconds`、`trigger`、`actions` 各有独立更新时间戳，
+与设备元数据同一套语义。`PUT` 中出现的每个字段都必须自带 `updatedAt`：
+
+- 客户端时间严格更新 → 应用该字段；
+- 时间相同且内容一致 → 幂等 no-op（不改 `version`、不写 `change_log`）；
+- 时间相同但内容不同或客户端更旧 → 服务端较新值静默获胜（不返回冲突）；
+- 客户端时间超前 2 分钟以上 → 按服务端当前时间兜底。
+
+并发修改不同字段互不覆盖；整个请求没有任何字段被应用时不增加 `version`。
+
+**触发条件**（`kind` 决定必填字段，出现无关字段即 400 `SCENE_TRIGGER_INVALID`）：
+
+| kind | 必填 | 可选 / 说明 |
+| --- | --- | --- |
+| `device_offline` | `device` | `offlineSeconds` 60–86400，默认 300 |
+| `rssi_below` | `device`、`rssiThreshold` | 阈值 -100–0 dBm |
+| `metric_threshold` | `device`、`deviceType`、`metric` | `metric` 含 `metric`/`comparator`(lt,lte,gt,gte)/`threshold`/`consecutive`(1–30)；设备类型必须存在于目录且声明该指标 |
+| `schedule` | `timeOfDay`（HH:MM） | `timezone`（IANA，默认 UTC）、`daysOfWeek`（1=周一，省略=每天） |
+
+定时选择「每天固定时刻 + 时区 + 可选星期」而不是 cron：动作由客户端本地调度执行，
+cron 解析与服务端/客户端时区、夏令时差异会让语义漂移。
+
+**动作**（1–4 个、种类不得重复；与两端已有能力对应）：
+
+- `notify`：`title` / `body` 文本模板，由客户端渲染本地通知；
+- `log`：`message` + `level`(info|warn)，写入客户端本地日志；
+- `mark_device`：`mark` 标记名，客户端给触发设备打标。
+
+**引用完整性**：写入时校验设备属于本人且未删除（`SCENE_DEVICE_NOT_FOUND`），
+`metric_threshold` 还要校验目录类型与指标（`SCENE_METRIC_NOT_SUPPORTED`）。
+设备之后被删除时**不级联删场景**，读取时实时计算 `deviceMissing=true`，保留用户配置。
+
+**错误码**（均为 400）：`SCENE_NAME_INVALID`、`SCENE_COOLDOWN_OUT_OF_RANGE`、
+`SCENE_TRIGGER_INVALID`、`SCENE_ACTION_INVALID`、`SCENE_DEVICE_NOT_FOUND`、
+`SCENE_METRIC_NOT_SUPPORTED`；补丁缺 `updatedAt` 或空补丁为 `BAD_REQUEST`。
+
+**账号删除与导出**：`DELETE /me` 的逐表清单已加入 `scenes`；个人数据导出新增
+`scenes`（含 tombstone，带 `deletedAt`，`deviceMissing` 为导出时实时值）。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1321,7 +1378,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.19.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.15.0 不是同一个号 |
+| `APP_VERSION` | `0.20.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.16.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1515,6 +1572,13 @@ seed 数据来源与边界：
 | v0.19.0 下载链接一次性 | 通过（真实 PostgreSQL + HTTP）：pending 不可签发（409）；首次下载成功，重放/过期 410，错误令牌 403；任务过期清理后查询 404 |
 | v0.19.0 HTTP 鉴权与错误码 | 通过（fixture）：删除申请/导出须 Bearer；`DELETE /me` 缺/错令牌 400/403，owner 有成员 409，成功 204，重放 404；下载与任务查询隔离 |
 | v0.19.0 契约一致性 | 通过：`TestOpenAPIDeletionExportContract` 校验 7 个新 schema 的 properties/required、`security: []`、错误码枚举与 `ExportTask` 状态枚举；契约版本 **0.15.0** |
+| v0.20.0 场景 CRUD 与本人限定 | 通过（真实 PostgreSQL）：创建/列表/详情/更新/删除；跨用户读改删均 404，跨用户列表为空 |
+| v0.20.0 字段级 LWW | 通过（真实 PostgreSQL）：并发改 `name` 与 `enabled` 两个字段均保留；过期 `name` + 较新 `cooldown` 只应用后者；同时间同内容幂等不增 `version`、不写 `change_log` |
+| v0.20.0 非法组合 | 通过（真实 PostgreSQL + HTTP）：未知设备 `SCENE_DEVICE_NOT_FOUND`；目录类型不存在或类型不支持指标 `SCENE_METRIC_NOT_SUPPORTED`；RSSI/连续条数/比较符/多余字段/动作组合均 400 |
+| v0.20.0 deviceMissing | 通过（真实 PostgreSQL）：设备删除后场景保留、`deviceMissing=true` 且场景 `version` 不变 |
+| v0.20.0 软删与 tombstone | 通过（真实 PostgreSQL）：`deleted_at` 落库、`version+1`；GET/列表 404/空；`change_log` 的 delete payload 含 `deletedAt`；他人 `changes` 不可见、本人可见 upsert+delete |
+| v0.20.0 删除与导出补齐 | 通过（真实 PostgreSQL）：账号删除后 `scenes` 计数为 0；导出含本人场景、不含他人场景/设备 |
+| v0.20.0 契约一致性 | 通过：`TestOpenAPISceneContract` 比对 7 个 schema 的 properties/required 与模型 JSON 字段、kind 枚举、`Change.payload` oneOf 含 `Scene`、6 个错误码；契约版本 **0.16.0** |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1624,6 +1688,9 @@ git push origin v0.17.0
 
 ## 已知限制与下一步
 
+- 场景已上云，但两端 App **尚未切换到 `/scenes`**：本地 SQLite/Room 仍是实际执行源，首次同步、冲突合并、`deviceMissing` 在 UI 的呈现均未在真实客户端验证；`schedule` 的本地调度也未跨时区/夏令时实测。
+- 场景触发条件中的 `deviceType` 与 `metric` 校验依赖 `device_type_catalog` 当前内容；目录项被删除后，新写入会被拒绝，但已存在场景不会被回改（读取时只计算 `deviceMissing`，不校验指标是否仍受支持）。
+- 场景列表未分页；单用户场景量预计很小，后续若增长再补游标。
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
 - token 已有有效期（默认 180 天）但**没有刷新/滚动续期**；客户端应在 `expiresAt` 前重新登录或配对，且不得在 401 后静默换新匿名账号（会造成 userId 漂移）。
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。

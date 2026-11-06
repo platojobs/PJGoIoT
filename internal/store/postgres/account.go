@@ -151,6 +151,7 @@ func (s *Store) DeleteAccount(ctx context.Context, tokenHash string, now time.Ti
 			WHERE household_id IN (SELECT id FROM households WHERE owner_user_id = $1)`},
 		{"user_devices", `DELETE FROM user_devices WHERE user_id = $1`},
 		{"readings", `DELETE FROM readings WHERE user_id = $1`},
+		{"scenes", `DELETE FROM scenes WHERE user_id = $1`},
 		{"change_log", `DELETE FROM change_log WHERE user_id = $1`},
 		{"idempotency_keys", `DELETE FROM idempotency_keys WHERE user_id = $1`},
 		{"pairing_codes", `DELETE FROM pairing_codes WHERE user_id = $1`},
@@ -222,6 +223,10 @@ func (s *Store) BuildPersonalDataExport(ctx context.Context, userID string) (mod
 	if err != nil {
 		return model.PersonalDataExport{}, err
 	}
+	scenes, err := s.exportScenes(ctx, uid)
+	if err != nil {
+		return model.PersonalDataExport{}, err
+	}
 	feedback, err := s.exportFeedback(ctx, uid)
 	if err != nil {
 		return model.PersonalDataExport{}, err
@@ -231,6 +236,7 @@ func (s *Store) BuildPersonalDataExport(ctx context.Context, userID string) (mod
 		Devices:     devices,
 		Readings:    readings,
 		Households:  households,
+		Scenes:      scenes,
 		Feedback:    feedback,
 		GeneratedAt: time.Now().UTC(),
 	}, nil

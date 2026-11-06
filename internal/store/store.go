@@ -60,6 +60,18 @@ var (
 	ErrExportDownloadInvalid = errors.New("下载令牌无效")
 	// ErrExportDownloadExpired 表示下载令牌已过期或已被使用。HTTP 层映射为 410 EXPORT_DOWNLOAD_EXPIRED。
 	ErrExportDownloadExpired = errors.New("下载链接已过期或已被使用")
+	// ErrSceneInvalidName 表示场景名称为空或超过 60 个字符。HTTP 层映射为 400 SCENE_NAME_INVALID。
+	ErrSceneInvalidName = errors.New("场景名称不合法")
+	// ErrSceneCooldownOutOfRange 表示冷却时间不在 30..86400 秒范围内。HTTP 层映射为 400 SCENE_COOLDOWN_OUT_OF_RANGE。
+	ErrSceneCooldownOutOfRange = errors.New("场景冷却时间超出范围")
+	// ErrSceneInvalidTrigger 表示触发条件的种类、字段组合或取值范围非法。HTTP 层映射为 400 SCENE_TRIGGER_INVALID。
+	ErrSceneInvalidTrigger = errors.New("场景触发条件不合法")
+	// ErrSceneInvalidAction 表示动作种类、字段组合、数量或取值范围非法。HTTP 层映射为 400 SCENE_ACTION_INVALID。
+	ErrSceneInvalidAction = errors.New("场景动作不合法")
+	// ErrSceneDeviceNotFound 表示触发条件引用的设备不存在、已删除或不属于本人。HTTP 层映射为 400 SCENE_DEVICE_NOT_FOUND。
+	ErrSceneDeviceNotFound = errors.New("场景引用的设备不存在或不属于本人")
+	// ErrSceneMetricNotSupported 表示指标越界条件绑定的设备类型不存在，或该类型不支持该指标。HTTP 层映射为 400 SCENE_METRIC_NOT_SUPPORTED。
+	ErrSceneMetricNotSupported = errors.New("场景绑定的设备类型不存在或该类型不支持该指标")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -254,4 +266,17 @@ type Store interface {
 	// 允许 submitted->received、submitted->closed、received->submitted、received->closed；
 	// 同状态视为幂等 no-op（不写审计）；其余跳转返回 ErrFeedbackInvalidTransition。
 	UpdateFeedbackStatus(ctx context.Context, feedbackID string, targetStatus string, note *string) (model.AdminFeedback, error)
+
+	// ListScenes 返回本人未删除的场景，按 updatedAt 倒序。
+	ListScenes(ctx context.Context, userID string) ([]model.Scene, error)
+	// GetScene 返回本人单个场景；不存在、已删除或属于他人统一返回 ErrNotFound。
+	GetScene(ctx context.Context, userID string, sceneID string) (model.Scene, error)
+	// CreateScene 创建场景；触发条件引用的设备必须存在且属于本人，指标必须被目录支持。
+	// 返回的场景 DeviceMissing 恒为 false（引用已在写入时校验）。
+	CreateScene(ctx context.Context, userID string, input model.SceneInput) (model.Scene, error)
+	// UpdateScene 按字段级 LWW 应用 patch：每个出现的字段独立比较 updatedAt。
+	// 没有任何字段被应用时不改 version、不写 change_log，直接返回当前状态。
+	UpdateScene(ctx context.Context, userID string, sceneID string, patch model.ScenePatch, now time.Time) (model.Scene, error)
+	// DeleteScene 软删除场景（保留 tombstone），version 自增并写一条 op=delete 的 change_log。
+	DeleteScene(ctx context.Context, userID string, sceneID string, now time.Time) error
 }

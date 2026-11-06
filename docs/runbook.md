@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.19.0）
+# PJGoIoT 运行手册（v0.20.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -110,6 +110,17 @@
 | v0.19.0 HTTP 错误码矩阵 | **已验证** | `TestExportAsyncAndDownload` / `TestDeleteMeRequiresDeletionToken` / `TestDeleteMeBlockedByOwnedHousehold`：未认证 401、缺/错/过期令牌 400/403/410、冲突 409、重放 404、他人任务 404、下载 403/410 |
 | v0.19.0 迁移与清理 | **已验证** | 真实 PG 执行 `000016_account_deletion_export` up；`cmd/cleanup` 新增 `account_deletion_tokens` 与 `personal_data_export_tasks` 清理；dry-run 输出两个新计数 |
 | v0.19.0 契约一致性 | **已验证** | `TestOpenAPIDeletionExportContract`：7 个新 schema 的 properties/required 与模型 JSON 标签逐项一致；`DELETE /me` 与下载接口 `security: []`；错误码枚举含 7 个新码；契约版本 0.15.0 |
+| v0.20.0 迁移 | **已验证** | 真实 PG `TestMigrationBackfillsLegacyDevices`：`up → down（000016）→ up`；`scenes` 表与 `scenes_user_updated_idx` / `scenes_user_deleted_idx` 增删正确，回滚不破坏用户数据，重新 up 后迁移版本 17 |
+| v0.20.0 场景 CRUD 与本人限定 | **已验证** | 真实 PG `TestPostgresSceneIntegration`：创建/列表/详情/更新/删除；跨用户读改删 404、列表为空；`household_id` 为 NULL 的 `scene` 变更不进入他人 `changes` |
+| v0.20.0 字段级 LWW | **已验证** | 真实 PG：并发修改 `name` 与 `enabled` 两个字段都保留（`version=3`）；过期 `name` + 较新 `cooldown` 只应用后者；同时间同内容 no-op 不增版本、不写 `change_log`（场景变更计数 4） |
+| v0.20.0 非法组合 | **已验证** | 真实 PG + fixture HTTP：未知设备 `SCENE_DEVICE_NOT_FOUND`；目录类型不存在/类型不支持指标 `SCENE_METRIC_NOT_SUPPORTED`；RSSI、比较符、连续条数、多余字段、动作数量/重复/字段组合均 400 且错误码明确 |
+| v0.20.0 deviceMissing | **已验证** | 真实 PG：设备删除后场景仍可读、`deviceMissing=true`、场景 `version` 不变；列表仍返回该场景 |
+| v0.20.0 软删 tombstone | **已验证** | 真实 PG：`deleted_at` 落库且 `version+1`；GET/列表 404/空；`change_log` delete payload 含 `deletedAt`；本人 `changes` 可见 upsert+delete，他人不可见 |
+| v0.20.0 删除与导出补齐 | **已验证** | 真实 PG：账号删除后 `scenes` 计数 0；导出 `scenes` 只含本人场景（含 tombstone），不含他人场景名/设备/用户 id |
+| v0.20.0 契约一致性 | **已验证** | `TestOpenAPISceneContract`：7 个 schema properties/required 与模型 JSON 标签逐项一致；trigger/action kind 枚举一致；`Change.payload` oneOf 含 `Scene`；错误码枚举含 6 个新码；契约版本 0.16.0 |
+| v0.20.0 客户端接入 | **未验证** | 两端 App 仍以本地 SQLite/Room 为执行源，尚未切到 `/scenes`；首次同步、冲突合并与 `deviceMissing` UI 呈现未在真机验证 |
+| v0.20.0 定时调度 | **未验证** | `schedule` 的时区/夏令时在真实客户端本地调度未实测；服务端只做存储与结构校验 |
+| v0.20.0 admin 并发 | **未涉及** | 本轮无 admin 接口；场景写入按用户串行化（与 push 共用 advisory lock），未做跨用户高并发压测 |
 
 ## 1. 部署前检查清单
 

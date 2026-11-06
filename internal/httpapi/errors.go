@@ -59,6 +59,18 @@ const (
 	CodeExportDownloadInvalid = "EXPORT_DOWNLOAD_INVALID"
 	// CodeExportDownloadExpired 表示下载链接已过期或已被使用。HTTP 410。
 	CodeExportDownloadExpired = "EXPORT_DOWNLOAD_EXPIRED"
+	// CodeSceneNameInvalid 表示场景名称为空或超过 60 个字符。HTTP 400。
+	CodeSceneNameInvalid = "SCENE_NAME_INVALID"
+	// CodeSceneCooldownOutOfRange 表示冷却时间不在 30..86400 秒范围内。HTTP 400。
+	CodeSceneCooldownOutOfRange = "SCENE_COOLDOWN_OUT_OF_RANGE"
+	// CodeSceneTriggerInvalid 表示触发条件种类/字段组合/取值范围非法。HTTP 400。
+	CodeSceneTriggerInvalid = "SCENE_TRIGGER_INVALID"
+	// CodeSceneActionInvalid 表示动作种类/字段组合/数量/取值范围非法。HTTP 400。
+	CodeSceneActionInvalid = "SCENE_ACTION_INVALID"
+	// CodeSceneDeviceNotFound 表示触发条件引用的设备不存在、已删除或不属于本人。HTTP 400。
+	CodeSceneDeviceNotFound = "SCENE_DEVICE_NOT_FOUND"
+	// CodeSceneMetricNotSupported 表示指标越界绑定的设备类型不存在或该类型不支持该指标。HTTP 400。
+	CodeSceneMetricNotSupported = "SCENE_METRIC_NOT_SUPPORTED"
 )
 
 type errorBody struct {
@@ -173,6 +185,18 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusForbidden, CodeExportDownloadInvalid, "下载令牌无效或导出任务不可下载")
 		case errors.Is(last, store.ErrExportDownloadExpired):
 			writeError(c.Writer, http.StatusGone, CodeExportDownloadExpired, "下载链接已过期或已被使用，请重新查询导出任务")
+		case errors.Is(last, store.ErrSceneInvalidName):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneNameInvalid, last.Error())
+		case errors.Is(last, store.ErrSceneCooldownOutOfRange):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneCooldownOutOfRange, last.Error())
+		case errors.Is(last, store.ErrSceneInvalidTrigger):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneTriggerInvalid, last.Error())
+		case errors.Is(last, store.ErrSceneInvalidAction):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneActionInvalid, last.Error())
+		case errors.Is(last, store.ErrSceneDeviceNotFound):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneDeviceNotFound, last.Error())
+		case errors.Is(last, store.ErrSceneMetricNotSupported):
+			writeError(c.Writer, http.StatusBadRequest, CodeSceneMetricNotSupported, last.Error())
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
 		case errors.Is(last, store.ErrDuplicateDevice):

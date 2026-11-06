@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.15.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.15.0", got)
+	if got := info["version"]; got != "0.16.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.16.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -343,6 +343,121 @@ func TestOpenAPIDeletionExportContract(t *testing.T) {
 		httpapi.CodeExportNotReady,
 		httpapi.CodeExportDownloadInvalid,
 		httpapi.CodeExportDownloadExpired,
+	} {
+		if _, ok := codeEnum[code]; !ok {
+			t.Fatalf("错误码枚举缺少 %s: %v", code, codeEnum)
+		}
+	}
+}
+
+// TestOpenAPISceneContract 校验契约 0.16.0 的场景上云：
+// 路径、鉴权、schema 与模型字段逐项对齐，并确认 change_log 的 scene entity 在契约中有定义。
+func TestOpenAPISceneContract(t *testing.T) {
+	doc := loadOpenAPIDoc(t)
+	if got := digMap(t, doc, "info")["version"]; got != "0.16.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.16.0", got)
+	}
+	paths := digMap(t, doc, "paths")
+	schemas := digMap(t, digMap(t, doc, "components"), "schemas")
+
+	for _, path := range []string{"/scenes", "/scenes/{sceneId}"} {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("openapi 缺少路径 %s", path)
+		}
+	}
+
+	listOp := digMap(t, asMapAny(t, paths["/scenes"]), "get")
+	createOp := digMap(t, asMapAny(t, paths["/scenes"]), "post")
+	getOp := digMap(t, asMapAny(t, paths["/scenes/{sceneId}"]), "get")
+	updateOp := digMap(t, asMapAny(t, paths["/scenes/{sceneId}"]), "put")
+	deleteOp := digMap(t, asMapAny(t, paths["/scenes/{sceneId}"]), "delete")
+	for name, op := range map[string]map[string]any{
+		"GET /scenes": listOp, "POST /scenes": createOp,
+		"GET /scenes/{id}": getOp, "PUT /scenes/{id}": updateOp, "DELETE /scenes/{id}": deleteOp,
+	} {
+		if !hasSecurityScheme(t, op, "bearerAuth") {
+			t.Fatalf("%s 应使用 bearerAuth", name)
+		}
+	}
+	assertRef(t, listOp, "200", "#/components/schemas/SceneList")
+	assertRef(t, createOp, "201", "#/components/schemas/Scene")
+	assertRef(t, getOp, "200", "#/components/schemas/Scene")
+	assertRef(t, updateOp, "200", "#/components/schemas/Scene")
+	if _, ok := digMap(t, deleteOp, "responses")["204"]; !ok {
+		t.Fatalf("DELETE /scenes/{id} 缺少 204 响应")
+	}
+	for _, op := range []map[string]any{createOp, updateOp} {
+		if _, ok := digMap(t, op, "responses")["400"]; !ok {
+			t.Fatalf("场景写入接口缺少 400 响应")
+		}
+	}
+
+	// Scene 与模型逐项对齐（含 required 集合）。
+	for _, tc := range []struct {
+		schema string
+		model  any
+	}{
+		{"Scene", model.Scene{}},
+		{"SceneInput", model.SceneInput{}},
+		{"ScenePatch", model.ScenePatch{}},
+		{"SceneTrigger", model.SceneTrigger{}},
+		{"SceneDeviceRef", model.SceneDeviceRef{}},
+		{"SceneMetricCondition", model.SceneMetricCondition{}},
+		{"SceneAction", model.SceneAction{}},
+	} {
+		schema := digMap(t, schemas, tc.schema)
+		if got := stringSet(propsOf(digMap(t, schema, "properties"))); !reflect.DeepEqual(got, jsonFieldSet(t, tc.model)) {
+			t.Fatalf("%s properties=%v，模型字段=%v", tc.schema, got, jsonFieldSet(t, tc.model))
+		}
+		var gotRequired map[string]struct{}
+		if raw, ok := schema["required"]; ok {
+			gotRequired = stringSet(asStrings(t, raw))
+		} else {
+			gotRequired = map[string]struct{}{}
+		}
+		if !reflect.DeepEqual(gotRequired, jsonRequiredSet(t, tc.model)) {
+			t.Fatalf("%s required=%v，模型必填字段=%v", tc.schema, gotRequired, jsonRequiredSet(t, tc.model))
+		}
+	}
+
+	// 触发条件/动作的种类枚举必须与实现常量一致。
+	if got := stringSet(enumOf(t, digMap(t, digMap(t, schemas, "SceneTrigger"), "properties", "kind"))); !reflect.DeepEqual(got,
+		stringSet([]string{"device_offline", "rssi_below", "metric_threshold", "schedule"})) {
+		t.Fatalf("SceneTrigger kind enum=%v", got)
+	}
+	if got := stringSet(enumOf(t, digMap(t, digMap(t, schemas, "SceneAction"), "properties", "kind"))); !reflect.DeepEqual(got,
+		stringSet([]string{"notify", "log", "mark_device"})) {
+		t.Fatalf("SceneAction kind enum=%v", got)
+	}
+
+	// change_log 的 scene entity 必须在契约中可发现：实体说明与 payload oneOf 都包含 Scene。
+	changeSchema := digMap(t, schemas, "Change")
+	entityDesc, _ := digMap(t, changeSchema, "properties", "entity")["description"].(string)
+	if !strings.Contains(entityDesc, "`scene`") {
+		t.Fatalf("Change.entity 未说明 scene entity")
+	}
+	oneOf, ok := digMap(t, digMap(t, changeSchema, "properties", "payload"))["oneOf"].([]any)
+	if !ok {
+		t.Fatalf("Change.payload 缺少 oneOf")
+	}
+	found := false
+	for _, raw := range oneOf {
+		if asMapAny(t, raw)["$ref"] == "#/components/schemas/Scene" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Change.payload oneOf 未包含 Scene")
+	}
+
+	codeEnum := stringSet(enumOf(t, digMap(t, digMap(t, schemas, "Error"), "properties", "error", "properties", "code")))
+	for _, code := range []string{
+		httpapi.CodeSceneNameInvalid,
+		httpapi.CodeSceneCooldownOutOfRange,
+		httpapi.CodeSceneTriggerInvalid,
+		httpapi.CodeSceneActionInvalid,
+		httpapi.CodeSceneDeviceNotFound,
+		httpapi.CodeSceneMetricNotSupported,
 	} {
 		if _, ok := codeEnum[code]; !ok {
 			t.Fatalf("错误码枚举缺少 %s: %v", code, codeEnum)

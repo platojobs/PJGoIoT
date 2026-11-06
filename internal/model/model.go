@@ -596,13 +596,102 @@ type ExportFeedback struct {
 
 // PersonalDataExport 是导出产物的内容。
 // 只包含调用账号自己的数据；家庭仅含本人角色与房间，不含其他成员信息。
+// Scenes 包含已软删除的场景（带 deletedAt），与本账号设备 tombstone 的导出语义一致。
 type PersonalDataExport struct {
 	User        User                     `json:"user"`
 	Devices     []UserDevice             `json:"devices"`
 	Readings    []ExportReadingAggregate `json:"readings"`
 	Households  []ExportHousehold        `json:"households"`
+	Scenes      []Scene                  `json:"scenes"`
 	Feedback    []ExportFeedback         `json:"feedback"`
 	GeneratedAt time.Time                `json:"generatedAt"`
+}
+
+// SceneDeviceRef 是场景触发条件绑定的设备（复合键，与同步接口一致）。
+type SceneDeviceRef struct {
+	Platform   string `json:"platform"`
+	ExternalID string `json:"externalId"`
+}
+
+// SceneMetricCondition 是「指标越界」触发条件的判据：
+// 同一指标连续 consecutive 条读数都满足 comparator threshold 时触发。
+type SceneMetricCondition struct {
+	Metric      string  `json:"metric"`
+	Comparator  string  `json:"comparator"`
+	Threshold   float64 `json:"threshold"`
+	Consecutive int     `json:"consecutive"`
+}
+
+// SceneTrigger 是场景触发条件。kind 决定哪些字段必填：
+//   - device_offline：device 必填，offlineSeconds 可选（默认 300 秒）；
+//   - rssi_below：device 与 rssiThreshold 必填；
+//   - metric_threshold：device、deviceType 与 metric 必填，deviceType 必须是目录中存在的类型；
+//   - schedule：timeOfDay 必填，timezone 可选（默认 UTC），daysOfWeek 可选（1=周一，空=每天）。
+type SceneTrigger struct {
+	Kind           string                `json:"kind"`
+	Device         *SceneDeviceRef       `json:"device,omitempty"`
+	OfflineSeconds *int                  `json:"offlineSeconds,omitempty"`
+	RSSIThreshold  *int                  `json:"rssiThreshold,omitempty"`
+	DeviceType     string                `json:"deviceType,omitempty"`
+	Metric         *SceneMetricCondition `json:"metric,omitempty"`
+	TimeOfDay      string                `json:"timeOfDay,omitempty"`
+	Timezone       string                `json:"timezone,omitempty"`
+	DaysOfWeek     []int                 `json:"daysOfWeek,omitempty"`
+}
+
+// SceneAction 是场景触发后客户端可执行的动作。kind 决定哪些字段必填：
+//   - notify：title 与 body 必填（纯文本模板，由客户端渲染）；
+//   - log：message 必填，level 可选（info|warn）；
+//   - mark_device：mark 必填（客户端给设备打的标记名）。
+type SceneAction struct {
+	Kind    string `json:"kind"`
+	Title   string `json:"title,omitempty"`
+	Body    string `json:"body,omitempty"`
+	Message string `json:"message,omitempty"`
+	Level   string `json:"level,omitempty"`
+	Mark    string `json:"mark,omitempty"`
+}
+
+// Scene 是服务端保存的完整场景，也是 GET/PUT 响应与 change_log payload 的结构。
+// DeviceMissing 只读：触发条件绑定的设备已被删除或不属于本人时为 true，场景本身保留。
+type Scene struct {
+	ID              string        `json:"id"`
+	Name            string        `json:"name"`
+	Enabled         bool          `json:"enabled"`
+	CooldownSeconds int           `json:"cooldownSeconds"`
+	Trigger         SceneTrigger  `json:"trigger"`
+	Actions         []SceneAction `json:"actions"`
+	Version         int64         `json:"version"`
+	DeviceMissing   bool          `json:"deviceMissing"`
+	CreatedAt       time.Time     `json:"createdAt"`
+	UpdatedAt       time.Time     `json:"updatedAt"`
+	DeletedAt       *time.Time    `json:"deletedAt,omitempty"`
+}
+
+// SceneInput 是 POST /scenes 的请求体；enabled 与 cooldownSeconds 省略时使用默认值。
+type SceneInput struct {
+	Name            string        `json:"name"`
+	Enabled         *bool         `json:"enabled,omitempty"`
+	CooldownSeconds *int          `json:"cooldownSeconds,omitempty"`
+	Trigger         SceneTrigger  `json:"trigger"`
+	Actions         []SceneAction `json:"actions"`
+}
+
+// SceneField 是 PUT /scenes/{id} 中单个字段的字段级 LWW 包装：
+// value 是新值，updatedAt 是客户端对该字段的修改时间（必填）。
+type SceneField[T any] struct {
+	Value     T         `json:"value"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// ScenePatch 是 PUT /scenes/{id} 的请求体。未出现的字段保持不变；
+// 出现的字段各自按 updatedAt 与当前字段时间戳比较，互不覆盖。
+type ScenePatch struct {
+	Name            *SceneField[string]        `json:"name,omitempty"`
+	Enabled         *SceneField[bool]          `json:"enabled,omitempty"`
+	CooldownSeconds *SceneField[int]           `json:"cooldownSeconds,omitempty"`
+	Trigger         *SceneField[SceneTrigger]  `json:"trigger,omitempty"`
+	Actions         *SceneField[[]SceneAction] `json:"actions,omitempty"`
 }
 
 // StoreCounts 是用于 /metrics 的近似行数，Postgres 通过 pg_class.reltuples 读取。

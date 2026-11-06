@@ -123,6 +123,14 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	adminCatalog.PUT("/:type", s.handleAdminUpdateCatalogDeviceType)
 	adminCatalog.DELETE("/:type", s.handleAdminDeleteCatalogDeviceType)
 
+	// 场景（本地触发条件 + 动作）上云：全部限定本人，软删除参与同步 tombstone。
+	scenesGroup := api.Group("/scenes", s.requireAuth())
+	scenesGroup.GET("", s.handleListScenes)
+	scenesGroup.POST("", s.handleCreateScene)
+	scenesGroup.GET("/:sceneId", s.handleGetScene)
+	scenesGroup.PUT("/:sceneId", s.handleUpdateScene)
+	scenesGroup.DELETE("/:sceneId", s.handleDeleteScene)
+
 	households := api.Group("/households", s.requireAuth())
 	households.GET("", s.handleListHouseholds)
 	households.POST("", s.handleCreateHousehold)

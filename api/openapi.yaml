@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.15.0
+  version: 0.16.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -51,6 +51,11 @@ info:
       owner 的家庭若还有其他成员，删除返回 `409 ACCOUNT_DELETION_BLOCKED`，避免留下孤儿家庭。
       导出统一异步：`POST /me/export` 返回任务 id，`GET /me/export/{id}` 轮询状态并获取
       10 分钟有效、一次性使用的下载链接；产物只含本人数据（读数聚合、家庭不含其他成员、反馈不含内部备注）。
+    - 自契约 `0.16.0`（服务 v0.20.0）起场景（触发条件 + 动作）上云，解决「换机/重装/多设备登录后场景消失」：
+      `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}` 全部限定本人，软删除并写入
+      `change_log` 的 `scene` entity（`household_id` 恒为 NULL，仅本人可见）。
+      `PUT` 为**字段级 LWW**：每个出现的字段自带 `updatedAt`，并发修改不同字段互不覆盖；
+      同一字段冲突时服务端较新值静默获胜。场景引用的设备被删除后场景保留，但 `deviceMissing=true`。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -68,6 +73,8 @@ tags:
   - name: sync
   - name: household
   - name: feedback
+  - name: scene
+    description: 本人的本地场景（触发条件 + 动作）服务端副本；全部限定本人
   - name: admin
     description: 运营侧内部入口；使用独立 admin 凭据，不在公开客户端 SDK 中
 
@@ -89,7 +96,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.19.0"
+                version: "0.20.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -2320,6 +2327,136 @@ paths:
         "503":
           $ref: "#/components/responses/Timeout"
 
+  /scenes:
+    get:
+      tags: [scene]
+      operationId: listScenes
+      summary: 列出本人场景
+      description: 只返回本人未删除（`deletedAt` 为空）的场景，按 `updatedAt` 倒序。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 本人场景列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SceneList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [scene]
+      operationId: createScene
+      summary: 创建场景
+      description: |
+        场景由一个触发条件与 1–4 个动作组成，是客户端可直接执行的完整规则包。
+        触发条件引用的设备必须属于本人且未删除；`metric_threshold` 的 `deviceType` 必须存在于
+        设备类型目录，且目录中该类型必须声明了对应 `metric`，否则返回
+        `400 SCENE_DEVICE_NOT_FOUND` / `400 SCENE_METRIC_NOT_SUPPORTED`。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SceneInput"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scene"
+        "400":
+          description: |
+            参数或组合非法，错误码为 `SCENE_NAME_INVALID`、`SCENE_COOLDOWN_OUT_OF_RANGE`、
+            `SCENE_TRIGGER_INVALID`、`SCENE_ACTION_INVALID`、`SCENE_DEVICE_NOT_FOUND`、
+            `SCENE_METRIC_NOT_SUPPORTED` 或 `BAD_REQUEST`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /scenes/{sceneId}:
+    parameters:
+      - name: sceneId
+        in: path
+        required: true
+        description: 场景 id（UUID）
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [scene]
+      operationId: getScene
+      summary: 获取本人单个场景
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 场景详情（含实时计算的 `deviceMissing`）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scene"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    put:
+      tags: [scene]
+      operationId: updateScene
+      summary: 按字段级 LWW 更新场景
+      description: |
+        请求体中**出现的每个字段**都必须自带 `updatedAt`，未出现的字段保持不变。
+        服务端逐字段独立比较：客户端时间严格更新则应用；相同时间且内容一致视为幂等无操作；
+        其余情况服务端较新的值静默获胜（不返回冲突）。没有任何字段被应用时不增加 `version`、
+        不写 `change_log`。客户端时间超过服务端当前时间 2 分钟以上时按服务端时间兜底。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScenePatch"
+      responses:
+        "200":
+          description: 更新后的完整场景（即使全部字段落败也返回当前状态）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scene"
+        "400":
+          description: 字段缺少 `updatedAt`、空补丁或触发条件/动作非法
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [scene]
+      operationId: deleteScene
+      summary: 软删除场景
+      description: |
+        仅设置 `deletedAt` 与 `version+1`，并向 `change_log` 写入 `entity=scene`、`op=delete`
+        的 tombstone（payload 为完整 `Scene`）。其他设备据此从本地移除场景。
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: 删除成功（重复删除返回 404）
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /metrics:
     servers:
       - url: http://127.0.0.1:8080
@@ -2624,6 +2761,12 @@ components:
                 - EXPORT_NOT_READY
                 - EXPORT_DOWNLOAD_INVALID
                 - EXPORT_DOWNLOAD_EXPIRED
+                - SCENE_NAME_INVALID
+                - SCENE_COOLDOWN_OUT_OF_RANGE
+                - SCENE_TRIGGER_INVALID
+                - SCENE_ACTION_INVALID
+                - SCENE_DEVICE_NOT_FOUND
+                - SCENE_METRIC_NOT_SUPPORTED
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -3197,26 +3340,29 @@ components:
           description: |
             `user_device`：设备变更，payload 为 `UserDevice`；
             `household`（自 `0.11.0`）：家庭结构变更，payload 为 `HouseholdChange`；
-            `room`（自 `0.11.0`）：房间结构变更，payload 为 `RoomChange`。
+            `room`（自 `0.11.0`）：房间结构变更，payload 为 `RoomChange`；
+            `scene`（自 `0.16.0`）：本人场景新增/修改/删除，payload 为完整 `Scene`
+            （含 `version`、`deviceMissing` 与 `deletedAt`），足以重建状态；仅本人可见。
             **客户端必须忽略未知 entity 并照常推进 `nextCursor`。**
           example: user_device
         entityId:
           type: string
           description: |
             `user_device`：`<userId>:<platform>:<externalId>` 派生的稳定字符串；
-            `household`：`<householdId>`；`room`：`<roomId>`。
+            `household`：`<householdId>`；`room`：`<roomId>`；`scene`：`<sceneId>`（UUID）。
             旧变更（000003 迁移前）已在迁移时回填为同一形式。
         op:
           type: string
           enum: [upsert, delete]
         payload:
           description: |
-            按 `entity` 区分：`UserDevice` / `HouseholdChange` / `RoomChange`。
+            按 `entity` 区分：`UserDevice` / `HouseholdChange` / `RoomChange` / `Scene`。
             字段只加不删，客户端应忽略多余字段。
           oneOf:
             - $ref: "#/components/schemas/UserDevice"
             - $ref: "#/components/schemas/HouseholdChange"
             - $ref: "#/components/schemas/RoomChange"
+            - $ref: "#/components/schemas/Scene"
         serverTs:
           type: string
           format: date-time
@@ -3646,7 +3792,7 @@ components:
 
     PersonalDataExport:
       type: object
-      required: [user, devices, readings, households, feedback, generatedAt]
+      required: [user, devices, readings, households, scenes, feedback, generatedAt]
       properties:
         user:
           $ref: "#/components/schemas/ExportUser"
@@ -3665,6 +3811,11 @@ components:
           description: 本人所属家庭，仅含本人角色与房间，不含其他成员身份或联系方式
           items:
             $ref: "#/components/schemas/ExportHousehold"
+        scenes:
+          type: array
+          description: 本人全部场景，含已删除（tombstone，带 `deletedAt`），按 `updatedAt` 倒序
+          items:
+            $ref: "#/components/schemas/Scene"
         feedback:
           type: array
           description: 本人反馈，含本人联系方式与诊断，不含运营内部备注
@@ -4117,3 +4268,267 @@ components:
           nullable: true
           maxLength: 2000
           description: 可选内部备注；不对用户回显，空白视为未提供
+
+    SceneList:
+      type: object
+      description: GET /scenes 的响应；`items` 恒为数组，不含已软删除场景。
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Scene"
+
+    Scene:
+      type: object
+      description: |
+        服务端保存的完整场景，也是场景接口响应与 `change_log` 中 `entity=scene` 的 payload。
+        `version` 仅在真正有字段被应用时自增；`deviceMissing` 是只读的实时计算结果：
+        触发条件绑定的设备被删除或不属于本人时为 true，场景本身保留，不静默删除用户配置。
+      required: [id, name, enabled, cooldownSeconds, trigger, actions, version, deviceMissing, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: 场景名，1–60 字符
+        enabled:
+          type: boolean
+          description: 是否启用；客户端本地调度据此决定是否执行
+        cooldownSeconds:
+          type: integer
+          minimum: 30
+          maximum: 86400
+          description: 冷却时间（秒），默认 300；冷却期内重复触发不会再次执行动作
+        trigger:
+          $ref: "#/components/schemas/SceneTrigger"
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 4
+          description: 动作种类不得重复
+          items:
+            $ref: "#/components/schemas/SceneAction"
+        version:
+          type: integer
+          format: int64
+          description: 场景整体版本号，仅在至少一个字段被应用时 +1
+        deviceMissing:
+          type: boolean
+          description: 触发条件引用的设备已缺失；只读，由服务端实时计算
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        deletedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: 软删除时间；列表与详情不返回已删除场景，但导出与 change_log 会带上
+
+    SceneTrigger:
+      type: object
+      description: |
+        触发条件，`kind` 决定必填字段，其余字段出现即非法（400 SCENE_TRIGGER_INVALID）：
+        - `device_offline`：`device` 必填，`offlineSeconds` 可选（默认 300，60–86400）；
+        - `rssi_below`：`device` 与 `rssiThreshold` 必填（-100–0 dBm）；
+        - `metric_threshold`：`device`、`deviceType` 与 `metric` 必填；
+        - `schedule`：`timeOfDay` 必填（HH:MM），`timezone` 可选（默认 UTC，IANA 名称），
+          `daysOfWeek` 可选（1=周一，省略表示每天）。
+        定时采用「每天固定时刻 + 时区 + 可选星期」而非 cron：由客户端本地调度执行，
+        避免服务端 cron 解析与时区/夏令时差异带来的语义漂移。
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [device_offline, rssi_below, metric_threshold, schedule]
+        device:
+          $ref: "#/components/schemas/SceneDeviceRef"
+        offlineSeconds:
+          type: integer
+          minimum: 60
+          maximum: 86400
+        rssiThreshold:
+          type: integer
+          minimum: -100
+          maximum: 0
+          description: dBm 阈值；读数低于该值时触发
+        deviceType:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,63}$"
+          description: 必须存在于 `GET /catalog/device-types` 且声明了对应指标
+        metric:
+          $ref: "#/components/schemas/SceneMetricCondition"
+        timeOfDay:
+          type: string
+          pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+          description: 本地时间 HH:MM
+        timezone:
+          type: string
+          description: IANA 时区名，例如 Asia/Shanghai
+        daysOfWeek:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 7
+          description: ISO 星期（1=周一）；省略或空数组表示每天
+
+    SceneDeviceRef:
+      type: object
+      required: [platform, externalId]
+      properties:
+        platform:
+          type: string
+          enum: [android, ios]
+        externalId:
+          type: string
+          description: Android 为规范化 MAC，iOS 为系统设备标识
+
+    SceneMetricCondition:
+      type: object
+      description: 同一指标连续 `consecutive` 条读数都满足 `comparator threshold` 时触发。
+      required: [metric, comparator, threshold, consecutive]
+      properties:
+        metric:
+          type: string
+          description: 指标 key，必须被 `deviceType` 在目录中声明
+        comparator:
+          type: string
+          enum: [lt, lte, gt, gte]
+        threshold:
+          type: number
+          format: double
+          description: 阈值绝对值不超过 1e9
+        consecutive:
+          type: integer
+          minimum: 1
+          maximum: 30
+
+    SceneAction:
+      type: object
+      description: |
+        触发后由客户端执行的动作，`kind` 决定必填字段，其余字段出现即非法（400 SCENE_ACTION_INVALID）：
+        `notify` 需要 `title`/`body`（纯文本模板）；`log` 需要 `message`，`level` 可选（info|warn）；
+        `mark_device` 需要 `mark`（客户端给设备打的标记名）。
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [notify, log, mark_device]
+        title:
+          type: string
+          maxLength: 80
+        body:
+          type: string
+          maxLength: 500
+        message:
+          type: string
+          maxLength: 500
+        level:
+          type: string
+          enum: [info, warn]
+        mark:
+          type: string
+          maxLength: 32
+
+    SceneInput:
+      type: object
+      description: POST /scenes 的请求体；`enabled` 与 `cooldownSeconds` 省略时使用默认值（true / 300）。
+      required: [name, trigger, actions]
+      properties:
+        name:
+          type: string
+          maxLength: 60
+        enabled:
+          type: boolean
+        cooldownSeconds:
+          type: integer
+          minimum: 30
+          maximum: 86400
+        trigger:
+          $ref: "#/components/schemas/SceneTrigger"
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: "#/components/schemas/SceneAction"
+
+    ScenePatch:
+      type: object
+      description: |
+        PUT /scenes/{sceneId} 的字段级 LWW 补丁。每个出现的字段都必须自带 `updatedAt`；
+        未出现的字段保持不变，出现字段之间互不覆盖。空补丁返回 400 BAD_REQUEST。
+      properties:
+        name:
+          $ref: "#/components/schemas/SceneStringField"
+        enabled:
+          $ref: "#/components/schemas/SceneBoolField"
+        cooldownSeconds:
+          $ref: "#/components/schemas/SceneIntField"
+        trigger:
+          $ref: "#/components/schemas/SceneTriggerField"
+        actions:
+          $ref: "#/components/schemas/SceneActionsField"
+
+    SceneStringField:
+      type: object
+      required: [value, updatedAt]
+      properties:
+        value:
+          type: string
+          maxLength: 60
+        updatedAt:
+          type: string
+          format: date-time
+          description: 客户端对该字段的修改时间
+
+    SceneBoolField:
+      type: object
+      required: [value, updatedAt]
+      properties:
+        value:
+          type: boolean
+        updatedAt:
+          type: string
+          format: date-time
+
+    SceneIntField:
+      type: object
+      required: [value, updatedAt]
+      properties:
+        value:
+          type: integer
+          minimum: 30
+          maximum: 86400
+        updatedAt:
+          type: string
+          format: date-time
+
+    SceneTriggerField:
+      type: object
+      required: [value, updatedAt]
+      properties:
+        value:
+          $ref: "#/components/schemas/SceneTrigger"
+        updatedAt:
+          type: string
+          format: date-time
+
+    SceneActionsField:
+      type: object
+      required: [value, updatedAt]
+      properties:
+        value:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: "#/components/schemas/SceneAction"
+        updatedAt:
+          type: string
+          format: date-time

@@ -92,6 +92,16 @@ func TestPostgresAccountDeletionExportIntegration(t *testing.T) {
 		if _, err := st.CreateExportTask(ctx, userID, time.Now().UTC().Add(time.Hour)); err != nil {
 			t.Fatalf("创建导出任务: %v", err)
 		}
+		// 场景也必须纳入删除范围。
+		if _, err := st.CreateScene(ctx, userID, model.SceneInput{
+			Name: "注销前场景",
+			Trigger: model.SceneTrigger{Kind: "device_offline", Device: &model.SceneDeviceRef{
+				Platform: "android", ExternalID: "AA:BB:CC:00:00:21",
+			}},
+			Actions: []model.SceneAction{{Kind: "log", Message: "离线", Level: "warn"}},
+		}); err != nil {
+			t.Fatalf("创建场景: %v", err)
+		}
 
 		// 错误令牌与过期令牌必须是明确错误。
 		if err := st.DeleteAccount(ctx, hashOf("no-such-"+uuid.NewString()), time.Now().UTC()); !errors.Is(err, store.ErrDeletionTokenInvalid) {
@@ -114,6 +124,7 @@ func TestPostgresAccountDeletionExportIntegration(t *testing.T) {
 			"tokens":                       countRows(t, db, `SELECT count(*) FROM tokens WHERE user_id = $1`, userID),
 			"user_devices":                 countRows(t, db, `SELECT count(*) FROM user_devices WHERE user_id = $1`, userID),
 			"readings":                     countRows(t, db, `SELECT count(*) FROM readings WHERE user_id = $1`, userID),
+			"scenes":                       countRows(t, db, `SELECT count(*) FROM scenes WHERE user_id = $1`, userID),
 			"change_log":                   countRows(t, db, `SELECT count(*) FROM change_log WHERE user_id = $1`, userID),
 			"idempotency_keys":             countRows(t, db, `SELECT count(*) FROM idempotency_keys WHERE user_id = $1`, userID),
 			"pairing_codes":                countRows(t, db, `SELECT count(*) FROM pairing_codes WHERE user_id = $1`, userID),
@@ -143,6 +154,7 @@ func TestPostgresAccountDeletionExportIntegration(t *testing.T) {
 			"tokens":                       `SELECT count(*) FROM tokens WHERE user_id = $1`,
 			"user_devices":                 `SELECT count(*) FROM user_devices WHERE user_id = $1`,
 			"readings":                     `SELECT count(*) FROM readings WHERE user_id = $1`,
+			"scenes":                       `SELECT count(*) FROM scenes WHERE user_id = $1`,
 			"change_log":                   `SELECT count(*) FROM change_log WHERE user_id = $1`,
 			"idempotency_keys":             `SELECT count(*) FROM idempotency_keys WHERE user_id = $1`,
 			"pairing_codes":                `SELECT count(*) FROM pairing_codes WHERE user_id = $1`,
@@ -311,6 +323,28 @@ func TestPostgresAccountDeletionExportIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// 场景：本人一条、他人一条，导出只能出现本人场景。
+		ownSceneName := "导出场景-" + uuid.NewString()
+		if _, err := st.CreateScene(ctx, exportUser, model.SceneInput{
+			Name: ownSceneName,
+			Trigger: model.SceneTrigger{Kind: "rssi_below", Device: &model.SceneDeviceRef{
+				Platform: "android", ExternalID: "AA:BB:CC:00:00:31",
+			}, RSSIThreshold: intPtr(-70)},
+			Actions: []model.SceneAction{{Kind: "mark_device", Mark: "attention"}},
+		}); err != nil {
+			t.Fatalf("导出用户场景: %v", err)
+		}
+		otherSceneName := "他人场景-" + uuid.NewString()
+		if _, err := st.CreateScene(ctx, otherUser, model.SceneInput{
+			Name: otherSceneName,
+			Trigger: model.SceneTrigger{Kind: "rssi_below", Device: &model.SceneDeviceRef{
+				Platform: "android", ExternalID: "AA:BB:CC:00:00:32",
+			}, RSSIThreshold: intPtr(-80)},
+			Actions: []model.SceneAction{{Kind: "log", Message: "他人设备弱信号", Level: "info"}},
+		}); err != nil {
+			t.Fatalf("他人场景: %v", err)
+		}
+
 		task, err := st.CreateExportTask(ctx, exportUser, time.Now().UTC().Add(24*time.Hour))
 		if err != nil {
 			t.Fatal(err)
@@ -379,12 +413,16 @@ func TestPostgresAccountDeletionExportIntegration(t *testing.T) {
 			got.Feedback[0].Status != "received" {
 			t.Fatalf("反馈导出异常: %+v", got.Feedback)
 		}
+		if len(got.Scenes) != 1 || got.Scenes[0].Name != ownSceneName ||
+			got.Scenes[0].Trigger.Kind != "rssi_below" || got.Scenes[0].DeviceMissing {
+			t.Fatalf("场景导出异常: %+v", got.Scenes)
+		}
 
 		raw, err := json.Marshal(got)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, forbidden := range []string{internalNote, "internalNote", "internal_note", "AA:BB:CC:00:00:32", otherUser} {
+		for _, forbidden := range []string{internalNote, "internalNote", "internal_note", "AA:BB:CC:00:00:32", otherUser, otherSceneName} {
 			if strings.Contains(string(raw), forbidden) {
 				t.Fatalf("导出泄露禁止内容 %q: %s", forbidden, raw)
 			}

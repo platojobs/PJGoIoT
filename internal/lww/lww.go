@@ -73,6 +73,48 @@ func Decide(now time.Time, client model.PushDevice, server *model.UserDevice) De
 	return decision
 }
 
+// FieldDecision 是场景单字段的 LWW 判定结果。
+type FieldDecision struct {
+	// EffectiveUpdatedAt 是最终写入服务端的字段时间戳（可能被服务端时间兜底）。
+	EffectiveUpdatedAt time.Time
+	// Apply 为 true 表示客户端值严格更新，应写入。
+	Apply bool
+	// Noop 为 true 表示时间相同且内容一致，无需写库。
+	Noop bool
+	// Reason 在客户端落败时说明原因。
+	Reason string
+	// ClockClamped 表示客户端时间超前，已用服务端时间兜底。
+	ClockClamped bool
+}
+
+// DecideField 计算场景单字段的 LWW 判定，规则与 Decide 一致：
+// 客户端时间超前 2 分钟以上用服务端当前时间兜底；严格更新则应用；
+// 时间相同且内容一致为幂等无操作；其余情况服务端获胜（静默，不产生冲突回写）。
+func DecideField(now, client, server time.Time, sameContent bool) FieldDecision {
+	now = now.UTC()
+	effective := client.UTC()
+	clamped := false
+	if effective.After(now.Add(MaxClockSkew)) {
+		effective = now
+		clamped = true
+	}
+
+	decision := FieldDecision{EffectiveUpdatedAt: effective, ClockClamped: clamped}
+	if effective.After(server.UTC()) {
+		decision.Apply = true
+		return decision
+	}
+	if effective.Equal(server.UTC()) && sameContent {
+		decision.Noop = true
+		return decision
+	}
+	decision.Reason = ReasonServerNewer
+	if clamped {
+		decision.Reason = ReasonClockClamped
+	}
+	return decision
+}
+
 // SameContent 比较客户端与服务端记录的业务内容（忽略时间与序列号）。
 func SameContent(server *model.UserDevice, client model.PushDevice) bool {
 	if server.Platform != client.Platform || server.ExternalID != client.ExternalID {

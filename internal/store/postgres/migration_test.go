@@ -422,4 +422,41 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if !tableExists("feedback_status_events") || !columnExists("feedback", "internal_note") {
 		t.Fatalf("重新迁移 000014 后结构未恢复")
 	}
+
+	// 000017：scenes 表与两个索引存在；down 删除表但不影响用户数据；随后可再次 up。
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("迁移到 000017 失败: %v", err)
+	}
+	if !tableExists("scenes") {
+		t.Fatalf("000017 迁移后缺少 scenes 表")
+	}
+	for _, col := range []string{"trigger", "actions", "name_updated_at", "enabled_updated_at",
+		"cooldown_updated_at", "trigger_updated_at", "actions_updated_at", "version", "deleted_at"} {
+		if !columnExists("scenes", col) {
+			t.Fatalf("000017 迁移后缺少 scenes.%s", col)
+		}
+	}
+	for _, idx := range []string{"scenes_user_updated_idx", "scenes_user_deleted_idx"} {
+		if !indexExists(idx) {
+			t.Fatalf("000017 迁移后缺少索引 %s", idx)
+		}
+	}
+	if err := m.Migrate(16); err != nil {
+		t.Fatalf("回滚 000017 失败: %v", err)
+	}
+	if tableExists("scenes") {
+		t.Fatalf("回滚 000017 后 scenes 表仍存在")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚 000017 后查询用户失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000017 破坏了用户数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚 000017 后重新迁移失败: %v", err)
+	}
+	if !tableExists("scenes") {
+		t.Fatalf("重新迁移 000017 后 scenes 表未恢复")
+	}
 }
