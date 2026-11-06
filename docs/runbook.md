@@ -134,6 +134,7 @@
 | v0.22.0 导出对账 | **已验证（真实 PG 测试）** | 启动把创建 >5 分钟仍 `pending` 的任务标记 `failed` 并写原因；ready/新任务不受影响；两实例并发对账总条数=1、重复对账=0；`GET /me/export/{id}` 返回 `failureReason`。真实 SIGKILL 联调未重跑 |
 | v0.22.0 token 生命周期 | **已验证（真实 PG 测试）** | 刷新轮换后旧 token 401、新 token 可用、旧 token 二次刷新仍 401；`GET /sessions` 列出有效会话并标记 current；单会话吊销后 token 401、跨用户 404、重复吊销幂等；删除账号 tokens 清空 |
 | v0.22.0 客户端接入 token | **未验证** | 两端 App 尚未接入 `/auth/refresh` 与 `/sessions`；刷新失败后的重新登录体验未测 |
+| v0.22.0 CI | **已验证** | GitHub Actions [run 42186201622](https://github.com/platojobs/PJGoIoT/actions/runs/42186201622) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）`） |
 | v0.22.0 生产环境 | **未验证** | 与 v0.21.0 相同：域名/ACME、告警真实投递、定时器、真机、商店、推送通道均未执行 |
 
 ## 1. 部署前检查清单

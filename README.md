@@ -1677,6 +1677,7 @@ seed 数据来源与边界：
 | v0.22.0 导出对账 | 通过（真实 PostgreSQL）：超时 pending → failed + 可读原因；未超时 pending 与 ready 不受影响；两个 Store 实例并发对账总条数=1、重复对账=0；HTTP 层 `GET /me/export/{id}` 返回 `failureReason` |
 | v0.22.0 token 刷新与吊销 | 通过（真实 PostgreSQL + HTTP）：刷新后旧 token 401、新 token 可用、旧 token 二次刷新 401、新 token 可再次轮换；`GET /sessions` 标记 current；单会话吊销后 token 401 且刷新仍 401；跨用户 404、重复吊销幂等；删除账号后 tokens=0 |
 | v0.22.0 契约一致性 | 通过：`openapi info.version=0.17.0`，新增 `/auth/refresh`、`/sessions`、`/sessions/{id}` 与 `failureReason`；`redocly lint` 0 error |
+| v0.22.0 CI | 通过：GitHub Actions [run 42186201622](https://github.com/platojobs/PJGoIoT/actions/runs/42186201622) 四 job 全绿 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
