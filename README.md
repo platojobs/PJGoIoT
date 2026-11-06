@@ -394,6 +394,9 @@ v0.17.0 的 `000014_feedback_status_workflow` 补 `internal_note` 列、`(status
 
 并发修改不同字段互不覆盖；整个请求没有任何字段被应用时不增加 `version`。
 
+字段时间戳在比较前统一截断到 Postgres `timestamptz` 的微秒精度：客户端带纳秒的
+「同一时间戳」不会被误判为严格更新，重复提交同内容补丁稳定幂等。
+
 **触发条件**（`kind` 决定必填字段，出现无关字段即 400 `SCENE_TRIGGER_INVALID`）：
 
 | kind | 必填 | 可选 / 说明 |
@@ -1574,6 +1577,7 @@ seed 数据来源与边界：
 | v0.19.0 契约一致性 | 通过：`TestOpenAPIDeletionExportContract` 校验 7 个新 schema 的 properties/required、`security: []`、错误码枚举与 `ExportTask` 状态枚举；契约版本 **0.15.0** |
 | v0.20.0 场景 CRUD 与本人限定 | 通过（真实 PostgreSQL）：创建/列表/详情/更新/删除；跨用户读改删均 404，跨用户列表为空 |
 | v0.20.0 字段级 LWW | 通过（真实 PostgreSQL）：并发改 `name` 与 `enabled` 两个字段均保留；过期 `name` + 较新 `cooldown` 只应用后者；同时间同内容幂等不增 `version`、不写 `change_log` |
+| v0.20.0 时间戳精度 | 通过：`TestDecideField` 固定纳秒时间戳与微秒落库值的比较语义——不产生伪严格更新、生效时间截断到微秒、超前时钟兜底 |
 | v0.20.0 非法组合 | 通过（真实 PostgreSQL + HTTP）：未知设备 `SCENE_DEVICE_NOT_FOUND`；目录类型不存在或类型不支持指标 `SCENE_METRIC_NOT_SUPPORTED`；RSSI/连续条数/比较符/多余字段/动作组合均 400 |
 | v0.20.0 deviceMissing | 通过（真实 PostgreSQL）：设备删除后场景保留、`deviceMissing=true` 且场景 `version` 不变 |
 | v0.20.0 软删与 tombstone | 通过（真实 PostgreSQL）：`deleted_at` 落库、`version+1`；GET/列表 404/空；`change_log` 的 delete payload 含 `deletedAt`；他人 `changes` 不可见、本人可见 upsert+delete |

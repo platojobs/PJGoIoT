@@ -166,3 +166,51 @@ func TestDeviceTypeComparison(t *testing.T) {
 		}
 	})
 }
+
+// TestDecideField 固化场景字段级 LWW 的判定规则，重点是跨精度比较：
+// 客户端时间带纳秒、服务端已按 Postgres 微秒精度落库时，同一时间戳不应被
+// 误判为「严格更新」，否则同一个补丁会被反复应用、version 无谓增长。
+func TestDecideField(t *testing.T) {
+	now := time.Date(2026, 11, 6, 6, 0, 0, 0, time.UTC)
+	server := now.Add(-time.Hour).Truncate(time.Microsecond)
+
+	t.Run("纳秒差异不应造成再次应用", func(t *testing.T) {
+		client := server.Add(500 * time.Nanosecond)
+		if d := DecideField(now, client, server, true); d.Apply || !d.Noop {
+			t.Fatalf("同一微秒时间戳 + 同内容应为 no-op，得到 %+v", d)
+		}
+	})
+
+	t.Run("严格更新应用并保留微秒精度", func(t *testing.T) {
+		client := server.Add(time.Second).Add(700 * time.Nanosecond)
+		d := DecideField(now, client, server, false)
+		if !d.Apply {
+			t.Fatalf("较新时间戳应应用，得到 %+v", d)
+		}
+		if got := d.EffectiveUpdatedAt; got.Nanosecond()%1000 != 0 {
+			t.Fatalf("生效时间应截断到微秒，得到 %v", got)
+		}
+	})
+
+	t.Run("过期写入服务端获胜", func(t *testing.T) {
+		client := server.Add(-time.Second)
+		d := DecideField(now, client, server, true)
+		if d.Apply || d.Noop || d.Reason != ReasonServerNewer {
+			t.Fatalf("过期写入应服务端获胜，得到 %+v", d)
+		}
+	})
+
+	t.Run("时钟超前用服务端时间兜底", func(t *testing.T) {
+		client := now.Add(MaxClockSkew + time.Minute)
+		d := DecideField(now, client, server, false)
+		if !d.Apply || !d.ClockClamped {
+			t.Fatalf("超前时钟应兜底后应用，得到 %+v", d)
+		}
+		if !d.EffectiveUpdatedAt.Equal(now) {
+			t.Fatalf("兜底时间应为服务端当前时间，得到 %v", d.EffectiveUpdatedAt)
+		}
+		if d.Reason != "" {
+			t.Fatalf("已应用不应带冲突原因，得到 %q", d.Reason)
+		}
+	})
+}

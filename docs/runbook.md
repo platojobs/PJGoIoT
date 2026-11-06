@@ -113,6 +113,7 @@
 | v0.20.0 迁移 | **已验证** | 真实 PG `TestMigrationBackfillsLegacyDevices`：`up → down（000016）→ up`；`scenes` 表与 `scenes_user_updated_idx` / `scenes_user_deleted_idx` 增删正确，回滚不破坏用户数据，重新 up 后迁移版本 17 |
 | v0.20.0 场景 CRUD 与本人限定 | **已验证** | 真实 PG `TestPostgresSceneIntegration`：创建/列表/详情/更新/删除；跨用户读改删 404、列表为空；`household_id` 为 NULL 的 `scene` 变更不进入他人 `changes` |
 | v0.20.0 字段级 LWW | **已验证** | 真实 PG：并发修改 `name` 与 `enabled` 两个字段都保留（`version=3`）；过期 `name` + 较新 `cooldown` 只应用后者；同时间同内容 no-op 不增版本、不写 `change_log`（场景变更计数 4） |
+| v0.20.0 时间戳精度 | **已验证** | `TestDecideField`：纳秒时间戳与已落库微秒值比较不产生「伪严格更新」；生效时间截断到微秒；超前时钟兜底 |
 | v0.20.0 非法组合 | **已验证** | 真实 PG + fixture HTTP：未知设备 `SCENE_DEVICE_NOT_FOUND`；目录类型不存在/类型不支持指标 `SCENE_METRIC_NOT_SUPPORTED`；RSSI、比较符、连续条数、多余字段、动作数量/重复/字段组合均 400 且错误码明确 |
 | v0.20.0 deviceMissing | **已验证** | 真实 PG：设备删除后场景仍可读、`deviceMissing=true`、场景 `version` 不变；列表仍返回该场景 |
 | v0.20.0 软删 tombstone | **已验证** | 真实 PG：`deleted_at` 落库且 `version+1`；GET/列表 404/空；`change_log` delete payload 含 `deletedAt`；本人 `changes` 可见 upsert+delete，他人不可见 |

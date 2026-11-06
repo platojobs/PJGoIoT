@@ -91,8 +91,11 @@ type FieldDecision struct {
 // 客户端时间超前 2 分钟以上用服务端当前时间兜底；严格更新则应用；
 // 时间相同且内容一致为幂等无操作；其余情况服务端获胜（静默，不产生冲突回写）。
 func DecideField(now, client, server time.Time, sameContent bool) FieldDecision {
-	now = now.UTC()
-	effective := client.UTC()
+	// Postgres timestamptz 只保存到微秒。客户端时间若带纳秒，与已落库的
+	// 截断值比较会凭空「严格更新」，同一补丁被重复应用。这里统一截断到
+	// 数据库精度再比较，保证「同一时间戳 + 同一内容」稳定判定为 no-op。
+	now = microsecond(now)
+	effective := microsecond(client)
 	clamped := false
 	if effective.After(now.Add(MaxClockSkew)) {
 		effective = now
@@ -100,11 +103,11 @@ func DecideField(now, client, server time.Time, sameContent bool) FieldDecision 
 	}
 
 	decision := FieldDecision{EffectiveUpdatedAt: effective, ClockClamped: clamped}
-	if effective.After(server.UTC()) {
+	if effective.After(microsecond(server)) {
 		decision.Apply = true
 		return decision
 	}
-	if effective.Equal(server.UTC()) && sameContent {
+	if effective.Equal(microsecond(server)) && sameContent {
 		decision.Noop = true
 		return decision
 	}
@@ -113,6 +116,11 @@ func DecideField(now, client, server time.Time, sameContent bool) FieldDecision 
 		decision.Reason = ReasonClockClamped
 	}
 	return decision
+}
+
+// microsecond 把时间截断到 Postgres timestamptz 的微秒精度。
+func microsecond(t time.Time) time.Time {
+	return t.UTC().Truncate(time.Microsecond)
 }
 
 // SameContent 比较客户端与服务端记录的业务内容（忽略时间与序列号）。
