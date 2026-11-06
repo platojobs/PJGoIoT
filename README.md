@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.18.0**（v0.23.0 新增推送设备注册与告警投递、`/scenes` 可选分页）；服务版本 **v0.23.0**（服务端推送通道、场景分页、告警 webhook、定时任务文件）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。v0.22.0 修复清单中三项实证问题：`/sync/changes` 可见性下限拆成索引探测（p95 66.28ms → 0.56ms）、导出任务启动对账（`failed` + `failureReason`）、token 滚动刷新与会话吊销（`POST /auth/refresh`、`GET /sessions`、`DELETE /sessions/{id}`），契约升到 **0.17.0**（无 schema 迁移）。v0.23.0 打通服务端推送（`POST /push/devices`、`DELETE /push/devices/{deviceId}`、告警同事务入队、后台 worker、FCM/APNs 适配层与无凭据 dry-run）、`GET /scenes` 可选 `limit`/`cursor`（不传参数行为不变）、Alertmanager 与 webhook 接收端、备份/清理的 systemd timer 与容器 cron；契约升到 **0.18.0**（新增迁移 `000018_push_and_alerts`）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.19.0**（v0.24.0 补 admin 双密钥轮换语义与 `/metrics` 连接池指标）；服务版本 **v0.24.0**（多家庭 sync 下限、场景长稳压测、admin 密钥轮换）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。v0.22.0 修复清单中三项实证问题：`/sync/changes` 可见性下限拆成索引探测（p95 66.28ms → 0.56ms）、导出任务启动对账（`failed` + `failureReason`）、token 滚动刷新与会话吊销（`POST /auth/refresh`、`GET /sessions`、`DELETE /sessions/{id}`），契约升到 **0.17.0**（无 schema 迁移）。v0.23.0 打通服务端推送（`POST /push/devices`、`DELETE /push/devices/{deviceId}`、告警同事务入队、后台 worker、FCM/APNs 适配层与无凭据 dry-run）、`GET /scenes` 可选 `limit`/`cursor`（不传参数行为不变）、Alertmanager 与 webhook 接收端、备份/清理的 systemd timer 与容器 cron；契约升到 **0.18.0**（新增迁移 `000018_push_and_alerts`）。v0.24.0 做三项产品化：`/sync/changes` 可见性下限与主查询改为按分支索引探测 + `DISTINCT ON`（多家庭 16 户 p95 < 1.1ms，主查询 cursor=0 p95 104.9ms → 2.4ms，见 [`docs/perf-baseline.md`](docs/perf-baseline.md)）、场景读/写长稳压测脚本与结果（[`docs/perf-results/`](docs/perf-results/)）、admin 双密钥轮换（`ADMIN_TOKEN_PREVIOUS` + 轮换窗口，到期自动淘汰旧密钥）；契约升到 **0.19.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -324,6 +324,9 @@ v0.17.0 再补上详情、用户关闭与运营受理，使 `submitted → recei
 - **鉴权**：独立凭据 `X-Admin-Token`，由环境变量 `ADMIN_TOKEN` 配置；与客户端 Bearer token 完全独立，
   两者不可互相替代。比较前对两侧取 SHA-256 摘要再用 `crypto/subtle.ConstantTimeCompare`，
   避免按长度提前返回。
+- **密钥轮换**：`ADMIN_TOKEN_PREVIOUS` + `ADMIN_TOKEN_ROTATED_AT`（RFC3339）+
+  `ADMIN_TOKEN_ROTATION_WINDOW_SECONDS`（默认 86400）可在轮换窗口内同时接受新旧两把密钥；
+  窗口结束后上一把自动失效，未知密钥仍返回 `401`。详见 `docs/runbook.md` 的「Admin 凭据轮换」。
 - **默认关闭**：未配置 `ADMIN_TOKEN` 时整组接口返回 `404`（与不存在的路由不可区分，不暴露存在性）；
   配置后凭据缺失或错误返回 `401 UNAUTHORIZED`。
 - **审计**：每次真实状态变更在同一事务内写一条 `feedback_status_events` 记录
@@ -1491,13 +1494,16 @@ PJGoIoT/
 | `FEEDBACK_USER_BURST` | `5` | 反馈提交按账号的令牌桶容量（允许的瞬时连发数） |
 | `FEEDBACK_IP_RATE_PER_MINUTE` | `30` | 反馈提交按来源 IP 的每分钟令牌数 |
 | `FEEDBACK_IP_BURST` | `10` | 反馈提交按来源 IP 的令牌桶容量 |
-| `ADMIN_TOKEN` | 空 | 运营侧 `/admin/feedback` 的独立凭据（请求头 `X-Admin-Token`）；为空表示入口关闭，整组返回 404 |
+| `ADMIN_TOKEN` | 空 | 运营侧 `/admin/feedback`、`/admin/catalog/*` 的独立凭据（请求头 `X-Admin-Token`）；为空表示入口关闭，整组返回 404 |
+| `ADMIN_TOKEN_PREVIOUS` | 空 | 轮换期间保留的上一把运营密钥；设置时必须同时设置 `ADMIN_TOKEN_ROTATED_AT` |
+| `ADMIN_TOKEN_ROTATED_AT` | 空 | 新密钥生效时间（RFC3339，建议 UTC，如 `2026-11-07T08:00:00Z`）；上一把密钥从该时刻开始计时 |
+| `ADMIN_TOKEN_ROTATION_WINDOW_SECONDS` | `86400` | 上一把密钥的保留窗口（秒）；窗口结束后自动失效，未知密钥一律 401 |
 | `METRICS_ENABLED` | `true` | 是否注册根路径 `/metrics`；生产可关闭或仅内网暴露 |
 | `RUN_MIGRATIONS_ON_BOOT` | `true` | postgres 模式下启动时执行迁移；失败进程非零退出（fixture 模式忽略） |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.23.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.18.0 不是同一个号 |
+| `APP_VERSION` | `0.24.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.19.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1732,6 +1738,13 @@ seed 数据来源与边界：
 | v0.23.0 定时任务文件 | 已提供但未在生产安装：`deploy/systemd/pjgoiot-backup.{service,timer}`、`pjgoiot-cleanup.{service,timer}`、`deploy/cron/crontab.example`；安装与验证命令见 [runbook.md §6.2–§6.3](docs/runbook.md) |
 | v0.23.0 契约一致性 | 通过：`openapi info.version=0.18.0`，新增 `/push/devices`、`/push/devices/{deviceId}`、`/admin/alerts` 与 `PushRegistration*`/`Alert*` schema；`/scenes` 增加 `limit`/`cursor`；`redocly lint` 0 error |
 | v0.23.0 CI | 通过：GitHub Actions [run 42261314233](https://github.com/platojobs/PJGoIoT/actions/runs/42261314233) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验` 含 `verify-alerting.sh` shellcheck、`构建镜像`、`压测门槛（smoke）` 1m8s） |
+| v0.24.0 多家庭 sync 下限 | 通过（本机真实 PostgreSQL）：16 家庭、`change_log` 108 万行，floor p95 0.632 → **1.035ms**；主查询 cursor=0 p95 **104.9 → 2.4ms**、buffers 16,282 → 121；见 [perf-baseline.md §5](docs/perf-baseline.md) |
+| v0.24.0 多家庭语义 | 通过（真实 PostgreSQL）：`TestChangesMultiHouseholdPaginationPostgres` 覆盖本人/家庭重复行去重、跨页严格递增、与旧 OR/IN 可见集合完全一致、`nextCursor` 正确 |
+| v0.24.0 场景长稳 | 通过（本机 20 分钟）：GET 2,170,840 请求 p95 **20ms**/p99 39ms；PUT 1,106,619 请求 p95 **37ms**/p99 48ms；0 错误、全 200；连接池 20/20 饱和但未出现 503/超时；见 [perf-baseline.md §6](docs/perf-baseline.md) |
+| v0.24.0 admin 双密钥轮换 | 通过（单元 + HTTP）：窗口内新旧密钥并存 200、未知/空 401、窗口过期后旧密钥 401 而当前仍 200、未配置 404 |
+| v0.24.0 单测与 e2e | 通过：`go test ./...`（含 `TEST_DATABASE_URL` 真实 PG）**107 个顶层测试 + 194 子测试全 PASS，0 FAIL**；`scripts/stack-for-e2e.sh` + `seed-for-e2e.sh` 在 Docker PostgreSQL 上 `applied=1 skipped=0 conflicts=0`、readings=24 |
+| v0.24.0 契约一致性 | 通过：`openapi info.version=0.19.0`；`/metrics` 新增连接池指标、admin 双密钥轮换语义写入契约；`redocly lint` **0 error**（14 条非阻断 warning） |
+| v0.24.0 未验证 | 未验证：>40 并发 / 单段 >20 分钟 / 多实例 / 跨主机 TLS；把池排队推到请求预算以上观察 503；场景数上千；真实 FCM/APNs 状态同 v0.23.0 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1740,7 +1753,7 @@ seed 数据来源与边界：
 
 ```bash
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
-  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestPostgresCatalogDeviceTypesIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold|TestPostgresSceneIntegration|TestPostgresPushIntegration|TestPostgresScenePaginationIntegration' -v
+  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestPostgresCatalogDeviceTypesIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold|TestPostgresSceneIntegration|TestPostgresPushIntegration|TestPostgresScenePaginationIntegration|TestChangesMultiHousehold' -v
 ```
 
 ## 多实例部署（v0.11.0）
@@ -1850,7 +1863,7 @@ git push origin v0.17.0
 - `cmd/loadgen` 新增的 changes / scenes / feedback / catalog 场景**未纳入 CI `-smoke`**（短跑造数与阈值缺失）；CI 仍只回归 devices / push / series 三场景。
 - 本轮压测为**单机回环、30s/项**，未覆盖跨主机网络/TLS、长稳压、多实例混合负载与默认限流下的端到端吞吐；这些已列入 [preflight.md](docs/preflight.md) 的分级清单。
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
-- token 已有有效期（默认 180 天）与 `POST /auth/refresh` 滚动轮换、`GET /sessions` / `DELETE /sessions/{id}` 会话管理；两端 App 尚未接入刷新流程。客户端不得在 401 后静默换新匿名账号（会造成 userId 漂移）。`ADMIN_TOKEN` 仍是单一静态密钥，未支持多密钥轮换。
+- token 已有有效期（默认 180 天）与 `POST /auth/refresh` 滚动轮换、`GET /sessions` / `DELETE /sessions/{id}` 会话管理；两端 App 尚未接入刷新流程。客户端不得在 401 后静默换新匿名账号（会造成 userId 漂移）。`ADMIN_TOKEN` 支持当前 + 上一把密钥的窗口化轮换（v0.24.0），但运营后台的密钥下发与吊销仍依赖部署侧环境变量。
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
 - 读数、`change_log`、幂等键与过期 token 的保留期删除均由 `cmd/cleanup` 负责，API 内不做后台定时清理；生产环境需自行配置 cron / systemd timer / CronJob，否则数据无限增长。
 - `change_log` 被清理后，落后超过保留期的客户端会收到 `410 RESYNC_REQUIRED`；客户端必须实现“清本地 + `cursor=0` 全量拉取”，否则会卡在 410。

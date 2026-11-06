@@ -57,6 +57,9 @@ type config struct {
 	seedReadings   int
 	reportPath     string
 	requestTimeout time.Duration
+	// window > 0 时按固定时间窗输出分窗统计，用于长稳压测观察随时间的漂移；
+	// 0 表示只输出整段汇总（保持原有行为）。
+	window time.Duration
 
 	smoke         bool
 	maxErrorRate  float64
@@ -124,6 +127,43 @@ func percentileLocked(latencies []time.Duration, p float64) time.Duration {
 	return sorted[idx]
 }
 
+func percentilesOf(latencies []time.Duration) (p50, p95, p99 time.Duration) {
+	if len(latencies) == 0 {
+		return 0, 0, 0
+	}
+	sorted := append([]time.Duration(nil), latencies...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted[int(float64(len(sorted)-1)*0.50)],
+		sorted[int(float64(len(sorted)-1)*0.95)],
+		sorted[int(float64(len(sorted)-1)*0.99)]
+}
+
+// takeWindow 原子地把当前统计桶清空并返回快照，供分窗压测使用。
+func (s *stats) takeWindow() (total, errors int, p50, p95, p99 time.Duration, statuses map[int]int, latencies []time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	latencies = s.latencies
+	s.latencies = nil
+	s.errors = 0
+	statuses = s.statuses
+	s.statuses = map[int]int{}
+	total = len(latencies)
+	errors = countErrors(statuses)
+	p50, p95, p99 = percentilesOf(latencies)
+	return
+}
+
+// countErrors 与 record 的判定保持一致：网络错误计为 status 0，其余按 <200 或 >=400 计错。
+func countErrors(statuses map[int]int) int {
+	n := 0
+	for status, cnt := range statuses {
+		if status < 200 || status >= 400 {
+			n += cnt
+		}
+	}
+	return n
+}
+
 func main() {
 	cfg := config{}
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:8080", "API 基地址（Docker Compose 经 Caddy 时为 https://localhost）")
@@ -147,6 +187,7 @@ func main() {
 	flag.BoolVar(&cfg.insecure, "insecure-skip-verify", true, "跳过 TLS 校验（自签证书场景）")
 	flag.StringVar(&cfg.reportPath, "report", "", "可选：把 Markdown 结果写入文件")
 	flag.DurationVar(&cfg.requestTimeout, "request-timeout", 10*time.Second, "单请求超时")
+	flag.DurationVar(&cfg.window, "window", 0, "可选：长稳压测分窗统计的窗口长度（如 1m），0 表示不分窗")
 
 	flag.BoolVar(&cfg.smoke, "smoke", false, "CI 短跑模式：10s、低并发（devices 20 / push 5 / series 10），并按阈值断言")
 	flag.Float64Var(&cfg.maxErrorRate, "max-error-rate", 0, "smoke 模式允许的错误率上限（百分比，0 表示必须为 0）")
@@ -302,36 +343,27 @@ func main() {
 	lines = append(lines, "| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 	var results []scenarioResult
 	for _, sc := range list {
-		runWarmup(cfg, sc.concurrency, sc.run)
-		st := &stats{statuses: map[int]int{}}
-		start := time.Now()
-		var wg sync.WaitGroup
-		deadline := start.Add(cfg.duration)
-		for i := 0; i < sc.concurrency; i++ {
-			wg.Add(1)
-			go func(worker int) {
-				defer wg.Done()
-				for time.Now().Before(deadline) {
-					sc.run(st, worker)
-				}
-			}(i)
+		res, windows := runScenario(cfg, sc.name, sc.concurrency, sc.run)
+		results = append(results, res)
+		lines = append(lines, fmt.Sprintf("| %s | %d | %s | %d | %.1f | %s | %s | %s | %.2f%% |",
+			res.name, res.conc, cfg.duration, res.total, res.rps,
+			res.p50.Round(time.Millisecond), res.p95.Round(time.Millisecond),
+			res.p99.Round(time.Millisecond), res.rate))
+		fmt.Printf("%s rps=%.1f errors=%.2f%%\n", res.name, res.rps, res.rate)
+		if len(windows) > 0 {
+			lines = append(lines, "")
+			lines = append(lines,
+				fmt.Sprintf("### %s 分窗稳定性（window=%s）", res.name, cfg.window),
+				"",
+				"| 窗口 | 起点 | 请求数 | RPS | p50 | p95 | p99 | 错误率 | 状态码 |",
+				"| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+			for _, w := range windows {
+				lines = append(lines, fmt.Sprintf("| %d | %s | %d | %.1f | %s | %s | %s | %.2f%% | %s |",
+					w.index, w.at.Round(time.Second), w.total, w.rps,
+					w.p50.Round(time.Millisecond), w.p95.Round(time.Millisecond),
+					w.p99.Round(time.Millisecond), w.rate, formatStatuses(w.statuses)))
+			}
 		}
-		wg.Wait()
-		elapsed := time.Since(start)
-		total, errs, p50, p95, p99, statuses := st.snapshot()
-		rps := float64(total) / elapsed.Seconds()
-		rate := 0.0
-		if total > 0 {
-			rate = float64(errs) / float64(total) * 100
-		}
-		line := fmt.Sprintf("| %s | %d | %s | %d | %.1f | %s | %s | %s | %.2f%% |",
-			sc.name, sc.concurrency, cfg.duration, total, rps, p50.Round(time.Millisecond), p95.Round(time.Millisecond), p99.Round(time.Millisecond), rate)
-		lines = append(lines, line)
-		results = append(results, scenarioResult{
-			name: sc.name, conc: sc.concurrency, total: total,
-			rps: rps, rate: rate, p50: p50, p95: p95, p99: p99,
-		})
-		fmt.Printf("%s rps=%.1f errors=%.2f%% statuses=%v\n", sc.name, rps, rate, statuses)
 	}
 
 	report := join(lines)
@@ -348,6 +380,125 @@ func main() {
 		}
 		fmt.Println("SMOKE PASS: 全部场景满足错误率与 p95 阈值")
 	}
+}
+
+// windowRow 是一个分窗统计快照，供长稳压测报告展示随时间的漂移。
+type windowRow struct {
+	index    int
+	at       time.Duration
+	total    int
+	rps      float64
+	p50      time.Duration
+	p95      time.Duration
+	p99      time.Duration
+	rate     float64
+	statuses map[int]int
+}
+
+func formatStatuses(statuses map[int]int) string {
+	if len(statuses) == 0 {
+		return "-"
+	}
+	codes := make([]int, 0, len(statuses))
+	for code := range statuses {
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+	parts := make([]string, 0, len(codes))
+	for _, code := range codes {
+		parts = append(parts, fmt.Sprintf("%d:%d", code, statuses[code]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// runScenario 运行单个场景。window>0 时持续按窗口清空统计桶并保留分窗结果，
+// 全部样本另存一份用于整段 p50/p95/p99；window<=0 保持原有的一次性汇总行为。
+func runScenario(cfg config, name string, concurrency int, run func(*stats, int)) (scenarioResult, []windowRow) {
+	runWarmup(cfg, concurrency, run)
+	st := &stats{statuses: map[int]int{}}
+	start := time.Now()
+	deadline := start.Add(cfg.duration)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				run(st, worker)
+			}
+		}(i)
+	}
+
+	if cfg.window <= 0 {
+		wg.Wait()
+		elapsed := time.Since(start)
+		total, errs, p50, p95, p99, _ := st.snapshot()
+		rate := errorRate(total, errs)
+		return scenarioResult{
+			name: name, conc: concurrency, total: total,
+			rps: float64(total) / elapsed.Seconds(), rate: rate,
+			p50: p50, p95: p95, p99: p99,
+		}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	ticker := time.NewTicker(cfg.window)
+	defer ticker.Stop()
+
+	var (
+		rows       []windowRow
+		all        []time.Duration
+		totalAll   int
+		errAll     int
+		lastFlush  = start
+		windowSeen int
+	)
+	flush := func(now time.Time) {
+		total, errs, p50, p95, p99, statuses, latencies := st.takeWindow()
+		if total == 0 {
+			lastFlush = now
+			return
+		}
+		all = append(all, latencies...)
+		totalAll += total
+		errAll += errs
+		windowSeen++
+		rows = append(rows, windowRow{
+			index: windowSeen, at: now.Sub(start), total: total,
+			rps: float64(total) / now.Sub(lastFlush).Seconds(),
+			p50: p50, p95: p95, p99: p99,
+			rate:     errorRate(total, errs),
+			statuses: statuses,
+		})
+		lastFlush = now
+	}
+
+	for {
+		select {
+		case now := <-ticker.C:
+			flush(now)
+		case <-done:
+			flush(time.Now())
+			elapsed := time.Since(start)
+			p50, p95, p99 := percentilesOf(all)
+			return scenarioResult{
+				name: name, conc: concurrency, total: totalAll,
+				rps: float64(totalAll) / elapsed.Seconds(), rate: errorRate(totalAll, errAll),
+				p50: p50, p95: p95, p99: p99,
+			}, rows
+		}
+	}
+}
+
+func errorRate(total, errors int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(errors) / float64(total) * 100
 }
 
 // assertSmoke 校验 smoke 结果：请求数非 0、错误率不超阈值、各场景 p95 不超阈值。
@@ -758,7 +909,7 @@ func runFeedbackWrite(client *http.Client, base, token string, st *stats) {
 		"kind": "experience",
 		"body": fmt.Sprintf("loadgen feedback %d at %s", seq, time.Now().UTC().Format(time.RFC3339Nano)),
 		"context": map[string]any{
-			"platform": "android", "appVersion": "0.23.0", "buildType": "release",
+			"platform": "android", "appVersion": "0.24.0", "buildType": "release",
 			"osVersion": "14", "deviceModel": "loadgen",
 		},
 	})

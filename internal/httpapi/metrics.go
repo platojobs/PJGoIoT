@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"database/sql"
 	"fmt"
 	"sort"
 	"strconv"
@@ -74,7 +75,7 @@ func (m *metricsRegistry) incDBErrors() {
 	m.mu.Unlock()
 }
 
-func (m *metricsRegistry) render(counts model.StoreCounts) string {
+func (m *metricsRegistry) render(counts model.StoreCounts, pool *sql.DBStats) string {
 	m.mu.Lock()
 	requests := make(map[requestKey]uint64, len(m.requests))
 	for k, v := range m.requests {
@@ -151,6 +152,27 @@ func (m *metricsRegistry) render(counts model.StoreCounts) string {
 	b.WriteString("# HELP pjgoiot_readings_approx 读数行数近似值（pg_class.reltuples）。\n")
 	b.WriteString("# TYPE pjgoiot_readings_approx gauge\n")
 	fmt.Fprintf(&b, "pjgoiot_readings_approx %d\n", counts.Readings)
+
+	if pool != nil {
+		b.WriteString("# HELP pjgoiot_db_pool_max_open 连接池最大连接数。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_max_open gauge\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_max_open %d\n", pool.MaxOpenConnections)
+		b.WriteString("# HELP pjgoiot_db_pool_open 已打开的连接数（使用中 + 空闲）。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_open gauge\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_open %d\n", pool.OpenConnections)
+		b.WriteString("# HELP pjgoiot_db_pool_in_use 使用中的连接数。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_in_use gauge\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_in_use %d\n", pool.InUse)
+		b.WriteString("# HELP pjgoiot_db_pool_idle 空闲连接数。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_idle gauge\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_idle %d\n", pool.Idle)
+		b.WriteString("# HELP pjgoiot_db_pool_wait_total 因池满而等待获取连接的累计次数。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_wait_total counter\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_wait_total %d\n", pool.WaitCount)
+		b.WriteString("# HELP pjgoiot_db_pool_wait_seconds_total 等待获取连接的累计耗时（秒）。\n")
+		b.WriteString("# TYPE pjgoiot_db_pool_wait_seconds_total counter\n")
+		fmt.Fprintf(&b, "pjgoiot_db_pool_wait_seconds_total %s\n", strconv.FormatFloat(pool.WaitDuration.Seconds(), 'f', 6, 64))
+	}
 	return b.String()
 }
 

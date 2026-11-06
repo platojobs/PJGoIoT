@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/platojobs/PJGoIoT/internal/auth"
 	"github.com/platojobs/PJGoIoT/internal/config"
 	"github.com/platojobs/PJGoIoT/internal/store"
 )
@@ -24,6 +25,9 @@ type Server struct {
 	feedbackUserLimiter rateLimiter
 	feedbackIPLimiter   rateLimiter
 	metrics             *metricsRegistry
+	// adminKeys 在构造时固化当前/上一把运营凭据及上一把的过期时间，
+	// 避免每个请求重复解析配置时间。
+	adminKeys auth.AdminKeySet
 	// draining 为 true 时 readiness 立即返回 503，用于滚动发布时先摘流量再退出。
 	draining *atomic.Bool
 }
@@ -47,6 +51,8 @@ func New(cfg config.Config, st store.Store, logger *slog.Logger, draining *atomi
 			cfg.FeedbackIPBurst, st, logger),
 		metrics:  newMetricsRegistry(),
 		draining: draining,
+		adminKeys: auth.NewAdminKeySet(cfg.AdminToken, cfg.AdminPreviousToken,
+			cfg.AdminRotatedAt, cfg.AdminRotationWindow),
 	}
 
 	r := gin.New()

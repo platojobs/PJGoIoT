@@ -79,6 +79,10 @@ func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 // Close 实现 store.Store。
 func (s *Store) Close() error { return s.db.Close() }
 
+// DBStats 返回 database/sql 连接池快照，供 /metrics 暴露池占用与等待情况。
+// 不属于 store.Store 接口：fixture 等实现没有真实连接池，指标端点按可选能力探测。
+func (s *Store) DBStats() sql.DBStats { return s.db.Stats() }
+
 // GetPublicDevice 实现 store.Store。
 func (s *Store) GetPublicDevice(ctx context.Context, mac string) (model.PublicDevice, error) {
 	row, err := s.q.GetPublicDevice(ctx, mac)
@@ -1260,7 +1264,8 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	defer cancel()
 	// 保留边界检查：若该用户最早保留的 seq 比 cursor+1 还大，说明中间的行已被清理，
 	// 静默返回空页会让客户端永久丢数据，因此返回 ErrCursorExpired。
-	// cursor=0 表示客户端从未同步过，此时从头拉取剩余变更即可，不构成数据缺口。
+	// cursor=0 表示客户端从未同步过，此时从头拉取剩余变更即可，不构成数据缺口，
+	// 因此直接跳过下限查询（多家庭用户可省掉 1 + H 次索引探测）。
 	//
 	// 下限查询必须走索引：可见范围是「本人行 ∪ 所属家庭行」，若写成
 	// `user_id = $1 OR household_id IN (...)`，优化器无法分别利用两个复合索引的
@@ -1269,29 +1274,60 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	// 改写为「本人分支 MIN + 每个家庭分支 MIN」后，每个分支都是 LIMIT 1 的
 	// Index Only Scan，代价只与分支数有关，与全局行数无关。
 	// 语义不变：MIN 对集合并取最小值，等价于先取各分支最小值再取整体最小值。
-	var minSeq sql.NullInt64
-	if err := s.db.QueryRowContext(qctx, `
-		SELECT min(x) FROM (
-			SELECT min(seq) AS x FROM change_log WHERE user_id = $1
-			UNION ALL
-			SELECT (SELECT min(seq) FROM change_log WHERE household_id = m.household_id) AS x
-			FROM household_members m WHERE m.user_id = $1
-		) s`, uid).Scan(&minSeq); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return model.ChangesPage{}, store.ErrTimeout
+	if cursor > 0 {
+		var minSeq sql.NullInt64
+		if err := s.db.QueryRowContext(qctx, `
+			SELECT min(x) FROM (
+				SELECT min(seq) AS x FROM change_log WHERE user_id = $1
+				UNION ALL
+				SELECT (SELECT min(seq) FROM change_log WHERE household_id = m.household_id) AS x
+				FROM household_members m WHERE m.user_id = $1
+			) s`, uid).Scan(&minSeq); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return model.ChangesPage{}, store.ErrTimeout
+			}
+			return model.ChangesPage{}, fmt.Errorf("查询变更保留边界失败: %w", err)
 		}
-		return model.ChangesPage{}, fmt.Errorf("查询变更保留边界失败: %w", err)
+		if minSeq.Valid && cursor < minSeq.Int64-1 {
+			return model.ChangesPage{}, store.ErrCursorExpired
+		}
 	}
-	if cursor > 0 && minSeq.Valid && cursor < minSeq.Int64-1 {
-		return model.ChangesPage{}, store.ErrCursorExpired
-	}
+	// 主查询同样按「本人分支 + 每个家庭分支」拆分，每个分支用
+	// (user_id/household_id, seq) 复合索引定位 cursor 之后的前 limit+1 行，
+	// 再由外层按 seq 归并、去重、截断。这样最坏成本是
+	// O(H * log N + H * limit)，不再随全局 change_log 行数增长。
+	//
+	// 说明：
+	//   - 本人分支额外写的 `(c.user_id, c.seq) > ($1, $2)` 是等价的冗余条件，
+	//     仅用于把规划器锁定到 change_log_user_seq_idx。若只写
+	//     `user_id = $1 AND seq > $2`，在 UNION ALL + Merge Append 场景下，
+	//     规划器有时会改走 change_log_pkey + Filter（多家庭实测 65 ms）。
+	//   - 家庭分支会同时命中「本人写在自己家庭里的行」，因此外层用
+	//     DISTINCT ON (seq) 去重；seq 是 change_log 唯一键，同 seq 的行完全相同，
+	//     去重不会丢弃不同记录。
+	//   - 每个分支最多取 limit+1 行，足以覆盖全局前 limit+1 条可见变更：
+	//     任一条全局前 N 的可见行必然是该分支前 N 行之一。
 	rows, err := s.db.QueryContext(qctx, `
-		SELECT c.seq, c.entity, c.entity_id, c.op, c.payload, c.server_ts
-		FROM change_log c
-		WHERE (c.user_id = $1 OR c.household_id IN (
-			SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1))
-		  AND c.seq > $2
-		ORDER BY c.seq
+		SELECT DISTINCT ON (x.seq)
+			x.seq, x.entity, x.entity_id, x.op, x.payload, x.server_ts
+		FROM (
+			(SELECT c.seq, c.entity, c.entity_id, c.op, c.payload, c.server_ts
+			 FROM change_log c
+			 WHERE c.user_id = $1 AND (c.user_id, c.seq) > ($1::uuid, $2::bigint)
+			 ORDER BY c.seq
+			 LIMIT $3)
+			UNION ALL
+			(SELECT c2.seq, c2.entity, c2.entity_id, c2.op, c2.payload, c2.server_ts
+			 FROM (SELECT household_id FROM household_members WHERE user_id = $1) m
+			 CROSS JOIN LATERAL (
+				SELECT seq, entity, entity_id, op, payload, server_ts
+				FROM change_log
+				WHERE household_id = m.household_id AND seq > $2
+				ORDER BY seq
+				LIMIT $3
+			 ) c2)
+		) x
+		ORDER BY x.seq
 		LIMIT $3`, uid, cursor, limit+1)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {

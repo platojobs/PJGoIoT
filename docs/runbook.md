@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.23.0）
+# PJGoIoT 运行手册（v0.24.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -144,6 +144,16 @@
 | v0.23.0 真实告警通道 | **未验证** | 未接入电话/短信/邮件/Slack；未在生产部署 Alertmanager |
 | v0.23.0 定时任务文件 | **已提供但未安装** | `deploy/systemd/*.{service,timer}` 与 `deploy/cron/crontab.example` 已入库；本机无生产宿主，未安装、未由 timer 触发过 |
 | v0.23.0 契约与 CI | **已验证** | `openapi info.version=0.18.0`、redocly lint 0 error；GitHub Actions [run 42261314233](https://github.com/platojobs/PJGoIoT/actions/runs/42261314233) 四 job 全绿（含 `Postgres 集成测试`、新增脚本 shellcheck、`构建镜像`、`压测门槛（smoke）` 1m8s） |
+| v0.24.0 多家庭 sync 下限与主查询 | **已验证（本机真实 PG）** | 16 家庭、`change_log` 108 万行：floor p95 0.632 → **1.035 ms**（家庭 ×16，p95 仅 ×1.64）；主查询 cursor=0 p95 **104.9 → 2.4 ms**、buffers 16,282 → 121。见 [`perf-baseline.md`](perf-baseline.md) §5 |
+| v0.24.0 多家庭语义 | **已验证（真实 PG 测试）** | `TestChangesMultiHouseholdPaginationPostgres`：5 个共享家庭、本人/家庭重复行按 `seq` 去重、跨页严格递增、与旧 OR/IN 可见集合完全一致、`nextCursor` 正确 |
+| v0.24.0 场景长稳 | **已验证（本机 20 分钟）** | GET 2,170,840 请求 p95 **20 ms** / p99 39 ms；PUT 1,106,619 请求 p95 **37 ms** / p99 48 ms；**0 错误、全 200**；连接池 20/20 饱和、等待 6,626,377 次（均值 3.4 ms），**未出现 503 或超时**。见 [`perf-baseline.md`](perf-baseline.md) §6 |
+| v0.24.0 admin 双密钥 | **已验证（单元 + HTTP 测试）** | `TestAdminKeyRotationHTTP`：当前密钥与上一把在窗口内均 200；未知/空密钥 401；过期后上一把 401 而当前仍 200；未配置 404。`internal/auth/adminkeys_test.go` 覆盖窗口边界与无 previous 场景 |
+| v0.24.0 配置校验 | **已验证（单元测试）** | `TestLoadAdminRotationConfig`：RFC3339 时间与窗口解析；previous 缺 current、与 current 相同、缺 `rotatedAt`、非法时间、窗口 0 均启动失败 |
+| v0.24.0 单测与集成 | **已验证** | `go test ./...`（`TEST_DATABASE_URL` 指向真实 PostgreSQL）：**107 个顶层测试 + 194 个子测试全部 PASS，0 FAIL、0 SKIP** |
+| v0.24.0 e2e 栈 | **已验证（Docker PG + 本地 API）** | `scripts/stack-for-e2e.sh` + `seed-for-e2e.sh`：push `applied=1 skipped=0 conflicts=0`；`user_devices=1`、`readings=24`、`device_types=5`，firmware/accessory/public_model 校验通过 |
+| v0.24.0 契约 | **已验证** | `openapi info.version=0.19.0`；`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；health 示例版本 0.24.0 |
+| v0.24.0 校验 job 等价项 | **已验证（本机）** | YAML 解析（compose/alerts/scrape）、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（新脚本 0 告警）全部通过 |
+| v0.24.0 未验证 | **未验证** | >40 并发 / 单段 >20 分钟 / 多实例 / 跨主机 TLS；把池排队推到请求预算以上观察 503 的边界；场景数上千；真实 FCM/APNs 与生产部署状态同 v0.23.0 |
 
 ## 1. 部署前检查清单
 
@@ -331,6 +341,63 @@ RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoi
 
 演练验收：行数摘要与备份时点一致、`dirty=false`、API 指向临时库时 `/api/v1/health` 为 200。
 本轮已在真实 compose 栈上实测 docker 模式：备份 8 193 bytes，恢复后 `version=7 dirty=f`、行数 `1/1/0/1/0`，API 重新 `healthy` 且原设备仍可查。
+
+### 5.3 Admin 凭据轮换（v0.24.0）
+
+运营入口（`/admin/feedback`、`/admin/catalog/*`）使用独立的 `X-Admin-Token`。
+v0.24.0 起支持「当前密钥 + 上一把密钥」并行，上一把在固定窗口结束后自动失效。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ADMIN_TOKEN` | 空 | 当前密钥；为空时整组运营入口返回 404 |
+| `ADMIN_TOKEN_PREVIOUS` | 空 | 上一把密钥；仅在轮换窗口内有效 |
+| `ADMIN_TOKEN_ROTATED_AT` | 空 | 新密钥生效时间，RFC3339；所有实例必须写**同一个值** |
+| `ADMIN_TOKEN_ROTATION_WINDOW_SECONDS` | `86400` | 上一把密钥的保留窗口（秒），必须 > 0 |
+
+配置校验：设置 `ADMIN_TOKEN_PREVIOUS` 时必须同时提供 `ADMIN_TOKEN` 与合法的
+`ADMIN_TOKEN_ROTATED_AT`；上一把不能与当前相同；窗口不能为负。任一不满足进程启动失败，
+避免「以为在轮换、实际只认一把」的静默状态。
+
+推荐步骤（`api1` / `api2` 双实例为例）：
+
+```bash
+# 1) 生成新密钥（只保存到部署侧密钥管理，不写入日志）
+NEW_KEY="$(openssl rand -hex 32)"
+ROTATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # 两个实例使用同一个值
+
+# 2) 更新 .env（两个实例共享同一份环境变量）
+ADMIN_TOKEN="$NEW_KEY"
+ADMIN_TOKEN_PREVIOUS="<old-key>"
+ADMIN_TOKEN_ROTATED_AT="$ROTATED_AT"
+ADMIN_TOKEN_ROTATION_WINDOW_SECONDS=86400
+
+# 3) 滚动重启，先摘一个实例再重启，等待 healthy 后处理下一个
+docker compose up -d --no-deps --force-recreate api1
+docker compose ps api1
+docker compose up -d --no-deps --force-recreate api2
+
+# 4) 轮换窗口内新旧密钥都应 200，未知密钥应 401
+curl -s -o /dev/null -w '%{http_code}\n' -H "X-Admin-Token: $NEW_KEY" \
+  https://localhost/api/v1/admin/feedback
+curl -s -o /dev/null -w '%{http_code}\n' -H "X-Admin-Token: <old-key>" \
+  https://localhost/api/v1/admin/feedback
+curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Admin-Token: unknown' \
+  https://localhost/api/v1/admin/feedback
+```
+
+说明与回滚：
+
+- 上一把密钥的失效是**按请求时间计算**的，窗口结束即生效，不依赖重启；清理
+  `ADMIN_TOKEN_PREVIOUS` / `ADMIN_TOKEN_ROTATED_AT` 只是让配置更干净。
+- 若新密钥下发有误，先把 `ADMIN_TOKEN` 改回旧值并清空 `ADMIN_TOKEN_PREVIOUS` /
+  `ADMIN_TOKEN_ROTATED_AT`，滚动重启即可；在窗口内旧值本来也仍然有效，不会中断。
+- 未配置 `ADMIN_TOKEN` 时运营入口返回 `404`（不暴露存在性）；配置后凭据缺失或错误一律
+  `401 UNAUTHORIZED`，未知密钥不会因为「像上一把」而被接受。
+- 验证覆盖：`go test ./internal/auth -run TestAdminKeySet`（当前/上一把并存、窗口边界、
+  过期失效、未知拒绝）与 `go test ./internal/httpapi -run TestAdminKeyRotationHTTP`
+  （HTTP 200/401/404 矩阵）、`go test ./internal/config -run TestLoadAdminRotationConfig`
+  （配置校验）。
+
 
 ## 6. 清理任务（保留期与游标失效）
 

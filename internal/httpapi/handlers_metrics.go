@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"time"
 
@@ -24,5 +25,10 @@ func (s *Server) handleMetrics(c *gin.Context) {
 		counts = model.StoreCounts{}
 	}
 	c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	c.String(http.StatusOK, s.metrics.render(counts))
+	var pool *sql.DBStats
+	if provider, ok := s.store.(interface{ DBStats() sql.DBStats }); ok {
+		stats := provider.DBStats()
+		pool = &stats
+	}
+	c.String(http.StatusOK, s.metrics.render(counts, pool))
 }

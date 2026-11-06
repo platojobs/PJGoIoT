@@ -29,7 +29,14 @@ type Config struct {
 	FeedbackIPBurst    int
 	// AdminToken 是运营侧受理入口的独立凭据（请求头 X-Admin-Token）。
 	// 为空表示运维入口整体关闭：相关路由一律返回 404，不暴露接口是否存在。
-	AdminToken          string
+	AdminToken string
+	// AdminPreviousToken 是轮换期间仍然有效的上一把密钥；为空表示不启用轮换窗口。
+	AdminPreviousToken string
+	// AdminRotatedAt 是新密钥生效（开始轮换）的时间；上一把密钥在
+	// AdminRotatedAt + AdminRotationWindow 之后自动失效。
+	AdminRotatedAt time.Time
+	// AdminRotationWindow 是上一把密钥的保留窗口，默认 24 小时。
+	AdminRotationWindow time.Duration
 	MetricsEnabled      bool
 	RunMigrationsOnBoot bool
 	CORSAllowedOrigins  []string
@@ -69,6 +76,8 @@ func Load() (Config, error) {
 		FeedbackIPPerMin:      getEnvInt("FEEDBACK_IP_RATE_PER_MINUTE", 30),
 		FeedbackIPBurst:       getEnvInt("FEEDBACK_IP_BURST", 10),
 		AdminToken:            getEnv("ADMIN_TOKEN", ""),
+		AdminPreviousToken:    getEnv("ADMIN_TOKEN_PREVIOUS", ""),
+		AdminRotationWindow:   time.Duration(getEnvInt("ADMIN_TOKEN_ROTATION_WINDOW_SECONDS", 86400)) * time.Second,
 		MetricsEnabled:        getEnvBool("METRICS_ENABLED", true),
 		RunMigrationsOnBoot:   getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
 		LogLevel:              parseLogLevel(getEnv("LOG_LEVEL", "info")),
@@ -76,7 +85,7 @@ func Load() (Config, error) {
 		ShutdownDrain:         time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
 		InstanceID:            getEnv("INSTANCE_ID", ""),
 		TokenTTLDays:          getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:               getEnv("APP_VERSION", "0.23.0"),
+		Version:               getEnv("APP_VERSION", "0.24.0"),
 		PushWorkerEnabled:     getEnvBool("PUSH_WORKER_ENABLED", true),
 		PushWorkerInterval:    time.Duration(getEnvInt("PUSH_WORKER_INTERVAL_SECONDS", 5)) * time.Second,
 		PushWorkerBatch:       getEnvInt("PUSH_WORKER_BATCH", 50),
@@ -89,6 +98,31 @@ func Load() (Config, error) {
 	for _, part := range strings.Split(origins, ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, p)
+		}
+	}
+
+	if raw := os.Getenv("ADMIN_TOKEN_ROTATED_AT"); raw != "" {
+		rotatedAt, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("ADMIN_TOKEN_ROTATED_AT 必须是 RFC3339 时间（例如 2026-11-07T08:00:00Z），当前为 %q", raw)
+		}
+		cfg.AdminRotatedAt = rotatedAt
+	}
+	if cfg.AdminRotationWindow < 0 {
+		return Config{}, fmt.Errorf("ADMIN_TOKEN_ROTATION_WINDOW_SECONDS 不能为负数")
+	}
+	if cfg.AdminPreviousToken != "" {
+		if cfg.AdminToken == "" {
+			return Config{}, fmt.Errorf("设置 ADMIN_TOKEN_PREVIOUS 时必须同时设置 ADMIN_TOKEN")
+		}
+		if cfg.AdminPreviousToken == cfg.AdminToken {
+			return Config{}, fmt.Errorf("ADMIN_TOKEN_PREVIOUS 不能与 ADMIN_TOKEN 相同")
+		}
+		if cfg.AdminRotatedAt.IsZero() {
+			return Config{}, fmt.Errorf("设置 ADMIN_TOKEN_PREVIOUS 时必须提供 ADMIN_TOKEN_ROTATED_AT（RFC3339）")
+		}
+		if cfg.AdminRotationWindow <= 0 {
+			return Config{}, fmt.Errorf("设置 ADMIN_TOKEN_PREVIOUS 时 ADMIN_TOKEN_ROTATION_WINDOW_SECONDS 必须大于 0")
 		}
 	}
 

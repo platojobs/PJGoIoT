@@ -1,8 +1,6 @@
 package httpapi
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"net/http"
 	"regexp"
@@ -251,20 +249,18 @@ func routeLabel(c *gin.Context) string {
 //   - 未配置 ADMIN_TOKEN：返回 404，与不存在的路由一致，不暴露运维入口是否存在；
 //   - 已配置但凭据缺失/错误：返回 401，明确需要正确凭据。
 //
-// 比较前先把两侧各自 SHA-256 成等长摘要，再用 subtle.ConstantTimeCompare，
-// 避免按字符串长度提前返回而泄露凭据长度。
+// 轮换期间当前密钥与上一把密钥同时有效；上一把仅在
+// ADMIN_TOKEN_ROTATED_AT + ADMIN_TOKEN_ROTATION_WINDOW_SECONDS 之前有效。
+// 摘要与常量时间比较由 auth.AdminKeySet 完成。
 func (s *Server) requireAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		expected := s.cfg.AdminToken
-		if expected == "" {
+		if !s.adminKeys.Enabled() {
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "接口不存在")
 			c.Abort()
 			return
 		}
 		provided := c.GetHeader("X-Admin-Token")
-		sumProvided := sha256.Sum256([]byte(provided))
-		sumExpected := sha256.Sum256([]byte(expected))
-		if subtle.ConstantTimeCompare(sumProvided[:], sumExpected[:]) != 1 {
+		if !s.adminKeys.Accept(provided, time.Now()) {
 			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "admin 凭据缺失或无效")
 			c.Abort()
 			return

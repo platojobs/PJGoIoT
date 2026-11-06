@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.18.0
+  version: 0.19.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -67,6 +67,13 @@ info:
       `DELETE /push/devices/{deviceId}` 软停用；运营侧 `POST /admin/alerts`（`X-Admin-Token`）
       在同一事务写告警与投递队列。`GET /scenes` 新增**可选** `limit`/`cursor` 分页，
       不传参数时返回全量与旧版完全一致。无 FCM/APNs 凭据时 worker 以 dry-run 记录完整载荷。
+    - 自契约 `0.19.0`（服务 v0.24.0）起运营侧凭据支持**双密钥轮换**：
+      `ADMIN_TOKEN`（当前密钥）与可选的 `ADMIN_TOKEN_PREVIOUS`（上一把密钥）在轮换窗口内同时有效，
+      窗口由 `ADMIN_TOKEN_ROTATED_AT` + `ADMIN_TOKEN_ROTATION_WINDOW_SECONDS` 决定；窗口过期后旧密钥立即失效，
+      未知密钥始终 `401`。`/metrics` 新增数据库连接池指标（见该端点说明），便于容量与超时排障。
+      `/sync/changes` 仅调整可见性下限与主查询的**内部实现**：非零游标的 `410 CURSOR_EXPIRED`
+      判定与响应结构不变；`cursor=0` 按既有约定始终从最老保留行开始返回（不再做无意义的
+      下限探测，也不会因历史清理而误报 410）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -111,7 +118,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.23.0"
+                version: "0.24.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -2725,7 +2732,11 @@ paths:
         - `pjgoiot_http_request_duration_seconds_bucket{method,le}` / `_sum` / `_count`：请求延迟直方图（秒）；
         - `pjgoiot_db_errors_total`：存储层错误计数；
         - `pjgoiot_users_approx` / `pjgoiot_devices_approx` / `pjgoiot_readings_approx`：
-          用户/设备/读数行数近似值，读取 `pg_class.reltuples`，不对大表执行 `COUNT`。
+          用户/设备/读数行数近似值，读取 `pg_class.reltuples`，不对大表执行 `COUNT`；
+        - `pjgoiot_db_pool_max_open` / `pjgoiot_db_pool_open` / `pjgoiot_db_pool_in_use` /
+          `pjgoiot_db_pool_idle`：`database/sql` 连接池上限、已打开、使用中与空闲连接数（gauge）；
+        - `pjgoiot_db_pool_wait_total` / `pjgoiot_db_pool_wait_seconds_total`：
+          因连接池耗尽而等待的累计次数与累计等待秒数（counter），用于判断是否出现池等待/超时。
 
         部署建议：仅在监听内网或由反向代理限制访问的实例上暴露本端点。
       security: []
@@ -2754,6 +2765,18 @@ paths:
                 pjgoiot_devices_approx 5
                 # TYPE pjgoiot_readings_approx gauge
                 pjgoiot_readings_approx 140
+                # TYPE pjgoiot_db_pool_max_open gauge
+                pjgoiot_db_pool_max_open 20
+                # TYPE pjgoiot_db_pool_open gauge
+                pjgoiot_db_pool_open 6
+                # TYPE pjgoiot_db_pool_in_use gauge
+                pjgoiot_db_pool_in_use 2
+                # TYPE pjgoiot_db_pool_idle gauge
+                pjgoiot_db_pool_idle 4
+                # TYPE pjgoiot_db_pool_wait_total counter
+                pjgoiot_db_pool_wait_total 0
+                # TYPE pjgoiot_db_pool_wait_seconds_total counter
+                pjgoiot_db_pool_wait_seconds_total 0.000000
         "404":
           description: 未注册该路由（`METRICS_ENABLED=false`）
 
@@ -2771,6 +2794,9 @@ components:
       description: |
         运营侧内部凭据，由服务端环境变量 `ADMIN_TOKEN` 配置，与客户端 Bearer token 完全独立。
         未配置 `ADMIN_TOKEN` 时所有 admin 接口返回 404；配置后凭据缺失或错误返回 401。
+        自契约 0.19.0 起支持双密钥轮换：可额外配置 `ADMIN_TOKEN_PREVIOUS` 作为上一把密钥，
+        它与当前密钥在轮换窗口（`ADMIN_TOKEN_ROTATED_AT` + `ADMIN_TOKEN_ROTATION_WINDOW_SECONDS`）内同时有效；
+        窗口过期后旧密钥立即失效，无需重启服务。未知密钥始终返回 401。
         该凭据不得下发到客户端，也不得写入公开 SDK。
 
   parameters:
