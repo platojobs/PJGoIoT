@@ -269,5 +269,5 @@ Alertmanager 部署与外部可达性。服务端自身的告警（`Post /admin/
 - 本机真实 PostgreSQL 上的备份/恢复、迁移往返、硬杀重启、双实例共享限流、7 条路径压测全部可复现（命令见上、`docs/perf-baseline.md`）。
 - v0.22.0 三项修复的代码与测试均在真实 PG `pjgoiot_test` 上执行通过；性能对比在 111 万行 `change_log` / 21,600 设备库上实测。
 - v0.23.0 推送链路（注册幂等、跨用户隔离、告警同事务入队、抢占/完成/退避/停用/回收、cleanup）在真实 PG 上通过；`/scenes` 分页在真实 PG + HTTP 上通过；`scripts/verify-alerting.sh` 在本机实跑 ALL PASS（规则→webhook、去重、静默）。
-- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint；CI 结果待填。
+- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint；CI 四 job 在 [run 42261314233](https://github.com/platojobs/PJGoIoT/actions/runs/42261314233) 全绿。
 - **生产环境未验证**：真实域名/ACME、真实 FCM/APNs 投递与真机收通知、真实告警接收通道（仅验证到 webhook）、systemd/cron 在生产机安装、真机客户端、商店上架。

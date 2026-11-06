@@ -143,7 +143,7 @@
 | v0.23.0 告警链路（本地） | **已验证（本机 Docker）** | `scripts/verify-alerting.sh` ALL PASS：规则触发→Alertmanager→webhook 收到 1 条；重复告警去重为 1 次；silence 命中后 0 次。**只验证到 webhook 收到** |
 | v0.23.0 真实告警通道 | **未验证** | 未接入电话/短信/邮件/Slack；未在生产部署 Alertmanager |
 | v0.23.0 定时任务文件 | **已提供但未安装** | `deploy/systemd/*.{service,timer}` 与 `deploy/cron/crontab.example` 已入库；本机无生产宿主，未安装、未由 timer 触发过 |
-| v0.23.0 契约与 CI | **待填** | `openapi info.version=0.18.0`、redocly lint 0 error；CI run 链接待回填 |
+| v0.23.0 契约与 CI | **已验证** | `openapi info.version=0.18.0`、redocly lint 0 error；GitHub Actions [run 42261314233](https://github.com/platojobs/PJGoIoT/actions/runs/42261314233) 四 job 全绿（含 `Postgres 集成测试`、新增脚本 shellcheck、`构建镜像`、`压测门槛（smoke）` 1m8s） |
 
 ## 1. 部署前检查清单
 
@@ -343,7 +343,7 @@ RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoi
 | `idempotency_keys` | 7 天（按 `created_at`） | `-idempotency-retention-days` | `IDEMPOTENCY_RETENTION_DAYS` |
 | `tokens` | 过期即删（`expires_at < now()`） | 无 | 无 |
 | `pairing_codes` | 过期即删（`expires_at < now()`） | 无 | 无 |
-| `push_deliveries`（v0.23.0） | 7 天（按 `created_at`） | `-push-delivery-retention-days` | 无（仅命令行参数） |
+| `push_deliveries`（v0.23.0） | 7 天（按 `created_at`，仅 `sent`/`failed`） | `-push-delivery-retention-days` | 无（仅命令行参数） |
 | `push_devices` 的 `inactive` 行（v0.23.0） | 30 天（按 `updated_at`） | `-push-device-retention-days` | 无（仅命令行参数） |
 
 `-operation-timeout`（默认 30s）为每类操作单独的超时；`-dry-run` 只打印时间边界与计数。

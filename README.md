@@ -1731,7 +1731,7 @@ seed 数据来源与边界：
 | v0.23.0 真实告警通道 | 未验证：未接入电话/短信/邮件/Slack，未在生产部署 Alertmanager |
 | v0.23.0 定时任务文件 | 已提供但未在生产安装：`deploy/systemd/pjgoiot-backup.{service,timer}`、`pjgoiot-cleanup.{service,timer}`、`deploy/cron/crontab.example`；安装与验证命令见 [runbook.md §6.2–§6.3](docs/runbook.md) |
 | v0.23.0 契约一致性 | 通过：`openapi info.version=0.18.0`，新增 `/push/devices`、`/push/devices/{deviceId}`、`/admin/alerts` 与 `PushRegistration*`/`Alert*` schema；`/scenes` 增加 `limit`/`cursor`；`redocly lint` 0 error |
-| v0.23.0 CI | 待填：提交后回填 run 链接 |
+| v0.23.0 CI | 通过：GitHub Actions [run 42261314233](https://github.com/platojobs/PJGoIoT/actions/runs/42261314233) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验` 含 `verify-alerting.sh` shellcheck、`构建镜像`、`压测门槛（smoke）` 1m8s） |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
