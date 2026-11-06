@@ -1663,6 +1663,7 @@ seed 数据来源与边界：
 | v0.21.0 备份与恢复 | 通过：`pg_dump -Fc` 9.958s / 138MB，`pg_restore -j 4` 15.403s，15 张表行数与 `hashtext` 校验和完全一致（含 199 万读数） |
 | v0.21.0 迁移往返（有数据） | 通过：17→16→17 在 1.7 GB 真实库上执行；核心表计数不变，`scenes` 被 down 删除（60→0），已在 [preflight.md](docs/preflight.md) 记录为回滚风险 |
 | v0.21.0 硬杀重启 | 通过：SIGKILL 后 advisory lock 0.4s 内释放、游标 seq 连续、push 恢复 0 错误；导出任务崩溃后停留 `pending`（未修复，列入上线前清单） |
+| v0.21.0 CI | 通过：GitHub Actions [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）` 1m9s） |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |

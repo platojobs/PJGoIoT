@@ -171,5 +171,5 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ## 三、本轮事实状态（供评审引用，不代表生产已验证）
 
 - 本机真实 PostgreSQL 上的备份/恢复、迁移往返、硬杀重启、双实例共享限流、7 条路径压测全部可复现（命令见上、`docs/perf-baseline.md`）。
-- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint；**CI 四 job 结果在推送后回填到 README「测试与验证」的 v0.21.0 行**。
+- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint；CI 四 job 在 [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 全绿。
 - 生产环境（域名、证书、告警投递、定时任务、真机、商店、推送通道）**一项都未执行**。

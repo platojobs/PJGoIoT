@@ -129,6 +129,7 @@
 | v0.21.0 迁移往返（有数据） | **已验证（本机）** | 1.7GB 真实库 17→16→17：核心表计数不变；`scenes` 被 down 删除（60→0）。生产回滚前必须先导出场景或只前滚 |
 | v0.21.0 硬杀重启 | **已验证（本机）** | SIGKILL 后 advisory lock 0.4s 内释放、重启后 push 0 错误、游标 seq 连续；导出任务崩溃后仍 `pending`（无对账，列入上线前清单） |
 | v0.21.0 生产环境 | **未验证** | 真实域名/ACME、告警真实投递、备份与清理定时器、客户端真机、BLE 真机、签名与上架、推送通道，均未执行。分级清单见 [`preflight.md`](preflight.md) |
+| v0.21.0 CI | **已验证** | GitHub Actions [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）`） |
 
 ## 1. 部署前检查清单
 
