@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.22.0）
+# PJGoIoT 运行手册（v0.23.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -136,6 +136,14 @@
 | v0.22.0 客户端接入 token | **未验证** | 两端 App 尚未接入 `/auth/refresh` 与 `/sessions`；刷新失败后的重新登录体验未测 |
 | v0.22.0 CI | **已验证** | GitHub Actions [run 42186201622](https://github.com/platojobs/PJGoIoT/actions/runs/42186201622) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）`） |
 | v0.22.0 生产环境 | **未验证** | 与 v0.21.0 相同：域名/ACME、告警真实投递、定时器、真机、商店、推送通道均未执行 |
+| v0.23.0 推送令牌与队列 | **已验证（真实 PG 测试）** | `TestPostgresPushIntegration`：同用户同 token 注册幂等（单行、`active`）、跨用户隔离、非法参数 `PUSH_DEVICE_INVALID`；告警同事务入队；抢占 `attempts=1`/`sending`；dry-run `sent`+`dry_run=true`；退避写入 `next_attempt_at`；终态错误令牌 `inactive`；`sending` 超时回收；两个 cleanup 计数 |
+| v0.23.0 推送适配层与 worker | **已验证（单元测试 / httptest）** | FCM 分类（NotRegistered/InvalidRegistration → 停用，503/429 → 可重试，401/403 → 终态）；APNs 分类（200/410/500/403，自生成 P-256 密钥）；网络错误可重试；worker 退避 30s→60s、达到最大次数后失败、未知平台终态 |
+| v0.23.0 真实 FCM/APNs | **未验证** | 无账号与凭据；未在真机收到任何通知；dry-run 仅证明「本应发送」载荷已记录 |
+| v0.23.0 `/scenes` 分页 | **已验证（真实 PG + HTTP）** | 不传参数返回全量且响应无 `nextCursor`/`hasMore`；`limit=1` 游标遍历顺序与条数正确；`limit=0`/`abc`/非法 cursor 400 |
+| v0.23.0 告警链路（本地） | **已验证（本机 Docker）** | `scripts/verify-alerting.sh` ALL PASS：规则触发→Alertmanager→webhook 收到 1 条；重复告警去重为 1 次；silence 命中后 0 次。**只验证到 webhook 收到** |
+| v0.23.0 真实告警通道 | **未验证** | 未接入电话/短信/邮件/Slack；未在生产部署 Alertmanager |
+| v0.23.0 定时任务文件 | **已提供但未安装** | `deploy/systemd/*.{service,timer}` 与 `deploy/cron/crontab.example` 已入库；本机无生产宿主，未安装、未由 timer 触发过 |
+| v0.23.0 契约与 CI | **待填** | `openapi info.version=0.18.0`、redocly lint 0 error；CI run 链接待回填 |
 
 ## 1. 部署前检查清单
 
@@ -326,7 +334,7 @@ RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoi
 
 ## 6. 清理任务（保留期与游标失效）
 
-所有保留期删除都依赖 `cmd/cleanup`，**不是** API 自动执行。一次运行处理五类数据：
+所有保留期删除都依赖 `cmd/cleanup`，**不是** API 自动执行。一次运行处理七类数据：
 
 | 数据 | 默认保留 | 参数 | 环境变量（compose） |
 | --- | --- | --- | --- |
@@ -335,8 +343,10 @@ RESTORE_MODE=docker ./deploy/scripts/restore.sh --confirm --file ./backups/pjgoi
 | `idempotency_keys` | 7 天（按 `created_at`） | `-idempotency-retention-days` | `IDEMPOTENCY_RETENTION_DAYS` |
 | `tokens` | 过期即删（`expires_at < now()`） | 无 | 无 |
 | `pairing_codes` | 过期即删（`expires_at < now()`） | 无 | 无 |
+| `push_deliveries`（v0.23.0） | 7 天（按 `created_at`） | `-push-delivery-retention-days` | 无（仅命令行参数） |
+| `push_devices` 的 `inactive` 行（v0.23.0） | 30 天（按 `updated_at`） | `-push-device-retention-days` | 无（仅命令行参数） |
 
-`-operation-timeout`（默认 30s）为每类操作单独的超时；`-dry-run` 只打印五个时间边界。
+`-operation-timeout`（默认 30s）为每类操作单独的超时；`-dry-run` 只打印时间边界与计数。
 
 ### 6.1 compose profile
 
@@ -355,48 +365,71 @@ docker compose --profile maintenance run --rm cleanup -dry-run
 > 生产上限建议：`change_log` 保留期**不要短于客户端最长离线时间**。客户端离线超过保留期后
 > 再同步会收到 `410 RESYNC_REQUIRED`（§7.6），必须全量重拉。
 
-### 6.2 systemd timer 示例（未验证）
+### 6.2 systemd timer（文件已提供，未在生产安装）
 
-`/etc/systemd/system/pjgoiot-cleanup.service`：
+仓库内单元文件：
 
-```ini
-[Unit]
-Description=PJGoIoT retention cleanup
-After=docker.service
-Requires=docker.service
+| 文件 | 作用 |
+| --- | --- |
+| [`deploy/systemd/pjgoiot-cleanup.service`](../deploy/systemd/pjgoiot-cleanup.service) | `ExecStart=/opt/pjgoiot/bin/cleanup`，`EnvironmentFile=/etc/pjgoiot/cleanup.env` |
+| [`deploy/systemd/pjgoiot-cleanup.timer`](../deploy/systemd/pjgoiot-cleanup.timer) | 每日 UTC 04:17，`Persistent=true`，随机延迟最多 10 分钟 |
+| [`deploy/systemd/pjgoiot-backup.service`](../deploy/systemd/pjgoiot-backup.service) | `ExecStart=/opt/pjgoiot/deploy/scripts/backup.sh`，`EnvironmentFile=/etc/pjgoiot/backup.env` |
+| [`deploy/systemd/pjgoiot-backup.timer`](../deploy/systemd/pjgoiot-backup.timer) | 每日 UTC 03:30（早于清理），`Persistent=true`，随机延迟最多 15 分钟 |
 
-[Service]
-Type=oneshot
-WorkingDirectory=/opt/pjgoiot
-# 加 flock 防止上一轮未结束时重入
-ExecStart=/usr/bin/flock -n /var/lock/pjgoiot-cleanup.lock \
-  /usr/bin/docker compose --profile maintenance run --rm cleanup
-TimeoutStartSec=10min
+安装步骤（在目标主机执行，**需 root**）：
+
+```bash
+# 1) 目录与账号
+sudo useradd --system --home /opt/pjgoiot --shell /usr/sbin/nologin pjgoiot
+sudo mkdir -p /etc/pjgoiot /var/backups/pjgoiot /var/log/pjgoiot
+sudo chown -R pjgoiot:pjgoiot /opt/pjgoiot /var/backups/pjgoiot /var/log/pjgoiot
+
+# 2) 环境变量（权限 0600；至少 DATABASE_URL / BACKUP_DIR）
+sudo install -m 600 -o pjgoiot -g pjgoiot /dev/null /etc/pjgoiot/cleanup.env
+sudo install -m 600 -o pjgoiot -g pjgoiot /dev/null /etc/pjgoiot/backup.env
+# 编辑两个文件后写入：DATABASE_URL='postgres://...?sslmode=disable' / BACKUP_DIR=/var/backups/pjgoiot
+
+# 3) 安装单元并校验
+sudo cp deploy/systemd/pjgoiot-*.service deploy/systemd/pjgoiot-*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pjgoiot-backup.timer pjgoiot-cleanup.timer
+
+# 4) 验证
+systemctl list-timers --all | grep pjgoiot          # NEXT/LAST 时间应出现
+sudo systemctl start pjgoiot-cleanup.service        # 立即跑一次
+journalctl -u pjgoiot-cleanup.service -n 30 --no-pager   # 应输出六/七类计数
+sudo systemctl start pjgoiot-backup.service
+journalctl -u pjgoiot-backup.service -n 20 --no-pager
+ls -lh /var/backups/pjgoiot/                        # 应出现 .dump.gz 与 .sha256
 ```
 
-`/etc/systemd/system/pjgoiot-cleanup.timer`：
+> **状态**：上述文件已入库，但**未在任何生产机安装**，也没有由 timer 触发过的真实记录。
 
-```ini
-[Unit]
-Description=Daily PJGoIoT cleanup
+### 6.3 容器环境 cron（文件已提供，未在生产安装）
 
-[Timer]
-OnCalendar=*-*-* 03:15:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-启用：`systemctl enable --now pjgoiot-cleanup.timer`（本机未验证）。
-
-### 6.3 cron 示例（未验证）
+[`deploy/cron/crontab.example`](../deploy/cron/crontab.example) 提供主机 cron +
+`docker compose` 方案（无需在主机装 `pg_dump`）：
 
 ```cron
-15 3 * * * cd /opt/pjgoiot && docker compose --profile maintenance run --rm cleanup >> /var/log/pjgoiot-cleanup.log 2>&1
+CRON_TZ=UTC
+30 3 * * * cd /opt/pjgoiot && docker compose exec -T postgres pg_dump -U pjgoiot -d pjgoiot --format=custom --no-owner --no-privileges | gzip -9 > /var/backups/pjgoiot/pjgoiot-$(date -u +\%Y\%m\%dT\%H\%M\%SZ).dump.gz 2>>/var/log/pjgoiot/backup.log
+17 4 * * * cd /opt/pjgoiot && docker compose run --rm --entrypoint /cleanup api >> /var/log/pjgoiot/cleanup.log 2>&1
 ```
 
-Kubernetes 用 `CronJob` 同镜像、`command: ["/cleanup"]`、`concurrencyPolicy: Forbid`。
+安装与验证：
+
+```bash
+sudo mkdir -p /var/log/pjgoiot /var/backups/pjgoiot
+sudo chown -R pjgoiot:pjgoiot /var/log/pjgoiot /var/backups/pjgoiot
+crontab -e        # 粘贴上面两行（注意 CRON_TZ 支持情况）
+crontab -l | grep pjgoiot                       # 应看到两行
+# 立即验证命令本体可用（不等到点）：
+cd /opt/pjgoiot && docker compose run --rm --entrypoint /cleanup api -dry-run
+```
+
+> busybox cron 不支持 `CRON_TZ`，需按本地时区换算；两种方案都要求 cron 用户能执行
+> `docker`（加入 `docker` 组）。**状态**：已提供，未在生产安装。
+
 
 ### 6.4 执行结果与核对
 
@@ -911,7 +944,36 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   `pjgoiot_http_request_duration_seconds_bucket{route="..."}`；
 - 访问日志字段：`request_id`、`method`、`path`、`status`、`duration_ms`、`ip`、`user_id`（不打印 token/配对码）。
 
-## 9. 本机实际验证记录（v0.7.1 / v0.8.0 / v0.9.0 / v0.10.0 / v0.11.0 / v0.12.0）
+### 8.1 Alertmanager 接入（v0.23.0，未在生产部署）
+
+- 配置：[`deploy/alertmanager/alertmanager.yml`](../deploy/alertmanager/alertmanager.yml)。
+  `route.group_by: [alertname, service, env]`（去重粒度）、`group_wait: 10s`、
+  `repeat_interval: 4h`（critical 5s/1h）、receiver 指向 `http://alert-webhook:8099/alerts`。
+- 接收端：[`cmd/alert-webhook/main.go`](../cmd/alert-webhook/main.go)，把每批告警逐条写成
+  JSON 行（`receivedAt`/`alertname`/`severity`/`service`/`env`/`fingerprint`/`summary`/`startsAt`/`endsAt`）。
+  默认 `:8099`，`ALERT_WEBHOOK_ADDR` / `ALERT_WEBHOOK_LOG` 可覆盖。
+- `deploy/prometheus/scrape.yml` 已加 `alerting.alertmanagers` 指向 `alertmanager:9093`。
+- 静默（silence）按 matchers 在运行时创建，命令模板见配置文件末尾；
+  列表/过期：`GET /api/v2/silences`、`DELETE /api/v2/silence/{id}`。
+- **未验证**：真实电话/短信/邮件/Slack 接收通道；生产 Alertmanager 部署与外部可达性。
+
+### 8.2 本地验证告警链路（可复现）
+
+```bash
+./scripts/verify-alerting.sh
+# 输出结尾应为：
+# PASS: 规则触发后 webhook 收到 VerifyAlertingPipeline
+# PASS: 重复告警去重生效（webhook 收到 1 次）
+# PASS: 静默生效（webhook 收到 0 次）
+# ALL PASS: ...；未验证真实电话/短信/邮件通道。
+```
+
+依赖 Docker（`host.docker.internal` 可解析）与 Go；脚本会构建 `cmd/alert-webhook`、
+起 `prom/alertmanager:v0.27.0` 与 `prom/prometheus:v2.55.0`，结束时清理容器与临时目录。
+**验证边界：只到 webhook 收到。**
+
+
+## 9. 本机实际验证记录（v0.7.1 … v0.23.0）
 
 ### 9.1 构建与启动
 
@@ -1404,6 +1466,44 @@ SIGKILL：advisory lock 1 → +0.4s 0 → +3.4s 0；重启 health 200；游标 1
 # 迁移：本次不需要（下限查询改用 000001/000011 已建的组合索引）
 ```
 
+### 9.14 v0.23.0 推送通道、分页与告警链路（真实输出）
+
+```text
+# 1. 真实 PG 集成测试（pjgoiot_test）
+$ TEST_DATABASE_URL='postgres://.../pjgoiot_test?sslmode=disable' \
+    go test ./internal/store/postgres -run 'TestPostgresPushIntegration|TestPostgresScenePaginationIntegration' -v
+=== RUN   TestPostgresPushIntegration
+=== RUN   TestPostgresPushIntegration/注册幂等与跨用户隔离
+=== RUN   TestPostgresPushIntegration/告警入队与投递状态机
+--- PASS: TestPostgresPushIntegration (0.07s)
+    --- PASS: TestPostgresPushIntegration/注册幂等与跨用户隔离 (0.03s)
+    --- PASS: TestPostgresPushIntegration/告警入队与投递状态机 (0.02s)
+=== RUN   TestPostgresScenePaginationIntegration
+--- PASS: TestPostgresScenePaginationIntegration (0.03s)
+ok  	github.com/platojobs/PJGoIoT/internal/store/postgres	0.759s
+
+# 2. 告警链路（./scripts/verify-alerting.sh，本机 Docker）
+PASS: 规则触发后 webhook 收到 VerifyAlertingPipeline
+PASS: 重复告警去重生效（webhook 收到 1 次）
+PASS: 静默生效（webhook 收到 0 次）
+{"receivedAt":"2026-11-06T17:20:43.038263Z","status":"firing","alertname":"VerifyAlertingPipeline",
+ "severity":"info","service":"pjgoiot-alert-verify","env":"local","fingerprint":"e39275674f5b2004",
+ "summary":"本地验证：Prometheus 规则触发后应到达 alert-webhook",
+ "startsAt":"2026-11-06T17:19:34.442Z","endsAt":"0001-01-01T00:00:00Z"}
+{"receivedAt":"2026-11-06T17:20:44.55296Z","status":"firing","alertname":"DedupProbe","severity":"info",
+ "service":"verify","env":"local","fingerprint":"49e822a70cc66101","summary":"dedup probe",
+ "startsAt":"2026-11-06T17:19:32Z","endsAt":"0001-01-01T00:00:00Z"}
+ALL PASS: 规则触发 -> Alertmanager -> webhook 链路在本地可用；未验证真实电话/短信/邮件通道。
+
+# 3. dry-run 载荷（无 FCM/APNs 凭据时的日志，字段为结构化日志键）
+push dry-run：未配置凭据，本应发送
+  provider=fcm-dry-run platform=android userId=<uuid> alertId=<uuid> pushDeviceId=<uuid>
+  token=<device-token>
+  payload={"to":"<device-token>","notification":{"title":"...","body":"..."},
+           "data":{"alertId":"<uuid>","kind":"..."},"priority":"high"}
+  → 对应 push_deliveries 行：status=sent, dry_run=true, provider=fcm-dry-run
+```
+
 ## 10. 本地栈自检步骤（可复现）
 
 ```bash
@@ -1472,7 +1572,29 @@ go run ./cmd/loadgen -base-url https://localhost -scenario push    -concurrency 
 go run ./cmd/loadgen -base-url https://localhost -scenario series  -concurrency 50  -duration 30s
 RATE_LIMIT_PER_MINUTE=120 docker compose up -d api1 api2               # 恢复默认限流
 
-# 12) 收尾（保留卷）
+# 12) v0.23.0 推送注册 / 告警入队 / dry-run（无凭据时）
+AUTH=$(curl -k -sS -X POST https://localhost/api/v1/auth/anonymous)
+TOKEN=$(echo "$AUTH" | jq -r .token)
+USER_ID=$(echo "$AUTH" | jq -r .userId)
+curl -k -sS -X POST https://localhost/api/v1/push/devices \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"platform":"android","token":"local-verify-token","appVersion":"1.0.0","deviceModel":"verify"}' | jq .
+curl -k -sS -X POST https://localhost/api/v1/admin/alerts \
+  -H "X-Admin-Token: ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+  -d "{\"userId\":\"$USER_ID\",\"kind\":\"verify\",\"title\":\"本地验证\",\"severity\":\"info\"}" | jq '{deliveryCount,alert}'
+# worker 5s 内消费；日志应出现 push dry-run 完整载荷，投递行 status=sent / dry_run=true
+docker compose logs api1 api2 | grep 'push dry-run' | tail -2
+docker compose exec -T postgres psql -U pjgoiot -d pjgoiot -c \
+  "SELECT status, dry_run, attempts, provider FROM push_deliveries ORDER BY created_at DESC LIMIT 2;"
+
+# 13) v0.23.0 场景分页（不传参数仍全量）
+curl -k -sS "https://localhost/api/v1/scenes" -H "Authorization: Bearer $TOKEN" | jq 'keys'
+curl -k -sS "https://localhost/api/v1/scenes?limit=1" -H "Authorization: Bearer $TOKEN" | jq '{n:(.items|length),hasMore,nextCursor}'
+
+# 14) v0.23.0 告警链路（Prometheus → Alertmanager → webhook）
+./scripts/verify-alerting.sh
+
+# 15) 收尾（保留卷）
 docker compose down
 ```
 

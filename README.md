@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.17.0**（v0.22.0 新增 token 刷新/会话吊销与导出失败原因）；服务版本 **v0.22.0**（下限查询性能、导出对账、token 生命周期）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。v0.22.0 修复清单中三项实证问题：`/sync/changes` 可见性下限拆成索引探测（p95 66.28ms → 0.56ms）、导出任务启动对账（`failed` + `failureReason`）、token 滚动刷新与会话吊销（`POST /auth/refresh`、`GET /sessions`、`DELETE /sessions/{id}`），契约升到 **0.17.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.18.0**（v0.23.0 新增推送设备注册与告警投递、`/scenes` 可选分页）；服务版本 **v0.23.0**（服务端推送通道、场景分页、告警 webhook、定时任务文件）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。v0.22.0 修复清单中三项实证问题：`/sync/changes` 可见性下限拆成索引探测（p95 66.28ms → 0.56ms）、导出任务启动对账（`failed` + `failureReason`）、token 滚动刷新与会话吊销（`POST /auth/refresh`、`GET /sessions`、`DELETE /sessions/{id}`），契约升到 **0.17.0**（无 schema 迁移）。v0.23.0 打通服务端推送（`POST /push/devices`、`DELETE /push/devices/{deviceId}`、告警同事务入队、后台 worker、FCM/APNs 适配层与无凭据 dry-run）、`GET /scenes` 可选 `limit`/`cursor`（不传参数行为不变）、Alertmanager 与 webhook 接收端、备份/清理的 systemd timer 与容器 cron；契约升到 **0.18.0**（新增迁移 `000018_push_and_alerts`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -428,6 +428,39 @@ cron 解析与服务端/客户端时区、夏令时差异会让语义漂移。
 
 **账号删除与导出**：`DELETE /me` 的逐表清单已加入 `scenes`；个人数据导出新增
 `scenes`（含 tombstone，带 `deletedAt`，`deviceMissing` 为导出时实时值）。
+
+**分页（v0.23.0）**：`GET /scenes` 支持可选 `?limit=1..200&cursor=...`。**不传参数时返回全量，
+响应体只有 `items`**，与 v0.22.0 完全一致；传 `limit` 时响应追加 `hasMore`，还有下一页时
+追加 `nextCursor`。游标是不透明字符串（`updated_at|id` 的 Base64 编码），按
+`updated_at DESC, id ASC` 稳定遍历；`limit<=0`、非数字或非法游标返回 400 `BAD_REQUEST`。
+
+### 服务端推送与告警投递（v0.23.0）
+
+服务端现在可以主动发起推送，而不是只能由客户端本地通知：
+
+- `POST /push/devices`（Bearer，本人）：注册设备令牌，字段 `platform`（`android`/`ios`）、
+  `token`、可选 `appVersion`、`deviceModel`；同一用户同一 token **幂等更新**（唯一键
+  `(user_id, token)`，重新注册会把 `inactive` 重置为 `active`）。
+- `DELETE /push/devices/{deviceId}`：把令牌标记 `inactive`，**不硬删**；`cmd/cleanup` 在 30 天后
+  才删除失效行。跨用户或不存在统一 404。
+- `POST /admin/alerts`（`X-Admin-Token`）：写入一条告警，并在**同一事务**内为每个 active
+  设备写一条投递记录（`alerts` + `push_deliveries`）；返回 `{alert, deliveryCount}`。
+
+投递链路：`push_deliveries` 行由后台 worker 以 `FOR UPDATE SKIP LOCKED` 抢占（多实例安全），
+调用 `internal/push` 适配层；成功或 dry-run → `sent`，可重试错误 → 指数退避
+（`PUSH_BACKOFF_BASE_SECONDS` × 2^(attempt-1)，上限 30m），终态错误 → `failed`；provider 明确
+判定令牌无效/unregistered 时直接把对应 `push_devices` 置 `inactive`。`sending` 超过
+`PUSH_SENDING_STALE_SECONDS` 未完成的行会被下一轮回收为 `pending`。
+
+**dry-run**：未配置凭据时不会静默吞掉，也不会卡队列——适配层把「本应发送」的完整载荷
+（provider/platform/userId/alertId/pushDeviceId/token/payload）写入日志，worker 把投递标记
+`sent` + `dry_run=true`。凭据（`FCM_SERVER_KEY`、`APNS_KEY_FILE`/`APNS_KEY_PEM`、`APNS_KEY_ID`、
+`APNS_TEAM_ID`、`APNS_TOPIC`）通过环境变量注入；`FCM_ENDPOINT` / `APNS_ENDPOINT` 可指向测试服务。
+**真实 FCM/APNs 投递与真机收到通知尚未验证。**
+
+**告警链路**：Prometheus 规则 → Alertmanager（[`deploy/alertmanager/alertmanager.yml`](deploy/alertmanager/alertmanager.yml)，
+`group_by` 去重、runtime silence）→ [`cmd/alert-webhook`](cmd/alert-webhook/main.go) 逐条写 JSON 行。
+本地复现：`./scripts/verify-alerting.sh`（已验证到 webhook 收到，含去重与静默；未接入真实电话/短信/邮件）。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1464,7 +1497,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.22.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.17.0 不是同一个号 |
+| `APP_VERSION` | `0.23.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.18.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1472,8 +1505,20 @@ PJGoIoT/
 | `READING_RETENTION_DAYS` | `90` | **仅 cleanup 容器**：读数保留天数，映射到 `-retention-days` |
 | `CHANGE_LOG_RETENTION_DAYS` | `90` | **仅 cleanup 容器/命令**：变更日志保留天数 |
 | `IDEMPOTENCY_RETENTION_DAYS` | `7` | **仅 cleanup 容器/命令**：幂等键保留天数 |
+| `PUSH_WORKER_ENABLED` | `true` | postgres 模式下是否启动推送投递 worker；关闭时告警只入队不消费 |
+| `PUSH_WORKER_INTERVAL_SECONDS` | `5` | worker 轮询间隔（>0） |
+| `PUSH_WORKER_BATCH` | `50` | 每轮最多抢占的投递条数（1–500） |
+| `PUSH_MAX_ATTEMPTS` | `5` | 可重试错误的最大尝试次数（1–20），超过后置 `failed` |
+| `PUSH_BACKOFF_BASE_SECONDS` | `30` | 指数退避基数：`base × 2^(attempt-1)`，上限 30 分钟 |
+| `PUSH_SENDING_STALE_SECONDS` | `300` | `sending` 超过该秒数未完成的投递会被回收为 `pending`（≥60） |
+| `FCM_SERVER_KEY` | 空 | FCM legacy server key；为空时 Android 走 dry-run |
+| `FCM_ENDPOINT` | 空 | 覆盖 FCM 发送地址（测试/代理用） |
+| `APNS_KEY_FILE` / `APNS_KEY_PEM` | 空 | APNs `.p8` 私钥路径或内联 PEM（二选一）；缺失时 iOS 走 dry-run |
+| `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` | 空 | APNs Key ID、Team ID、Bundle ID（topic）；任一项缺失即 dry-run |
+| `APNS_ENDPOINT` | 空 | 覆盖 APNs 地址（默认 `https://api.push.apple.com`，测试可用 sandbox） |
 
-> 清理工具不在 API 进程中运行，API 侧无需配置以上三个保留期变量。
+> 清理工具不在 API 进程中运行，API 侧无需配置保留期变量。v0.23.0 新增的推送投递/失效设备保留期
+> 只有命令行参数（`-push-delivery-retention-days` 默认 7、`-push-device-retention-days` 默认 30）。
 
 ## 迁移与 seed
 
@@ -1678,6 +1723,15 @@ seed 数据来源与边界：
 | v0.22.0 token 刷新与吊销 | 通过（真实 PostgreSQL + HTTP）：刷新后旧 token 401、新 token 可用、旧 token 二次刷新 401、新 token 可再次轮换；`GET /sessions` 标记 current；单会话吊销后 token 401 且刷新仍 401；跨用户 404、重复吊销幂等；删除账号后 tokens=0 |
 | v0.22.0 契约一致性 | 通过：`openapi info.version=0.17.0`，新增 `/auth/refresh`、`/sessions`、`/sessions/{id}` 与 `failureReason`；`redocly lint` 0 error |
 | v0.22.0 CI | 通过：GitHub Actions [run 42186201622](https://github.com/platojobs/PJGoIoT/actions/runs/42186201622) 四 job 全绿 |
+| v0.23.0 推送令牌与队列 | 通过（真实 PostgreSQL）：`TestPostgresPushIntegration` 覆盖同用户同 token 注册幂等（唯一行、`active`）、跨用户隔离、非法参数 `PUSH_DEVICE_INVALID`、告警同事务入队、抢占 `attempts=1`/`sending`、dry-run `sent`+`dry_run=true`、退避 `next_attempt_at`、终态错误令牌 `inactive`、`sending` 超时回收、投递/失效设备清理 |
+| v0.23.0 推送适配层与 worker | 通过（单元测试 / httptest）：FCM 分类（NotRegistered/InvalidRegistration→停用、503/429→可重试、401/403→终态）；APNs 分类（200/410/500/403，自生成 P-256 密钥）；网络错误可重试；worker 退避 30s→60s、最大次数失败、未知平台终态 |
+| v0.23.0 真实 FCM/APNs | 未验证：无账号与凭据、未在真机收到通知；dry-run 仅记录「本应发送」的完整载荷 |
+| v0.23.0 `/scenes` 分页 | 通过（真实 PostgreSQL + HTTP）：不传参数返回全量且响应无 `nextCursor`/`hasMore`；`limit=1` 游标遍历顺序与条数正确；`limit=0`/`abc`/非法 cursor 均 400 |
+| v0.23.0 告警链路本地验证 | 通过（本机 Docker）：`scripts/verify-alerting.sh` ALL PASS——规则触发后 webhook 收到 1 条；重复告警去重为 1 次；silence 命中后 0 次。**只验证到 webhook 收到** |
+| v0.23.0 真实告警通道 | 未验证：未接入电话/短信/邮件/Slack，未在生产部署 Alertmanager |
+| v0.23.0 定时任务文件 | 已提供但未在生产安装：`deploy/systemd/pjgoiot-backup.{service,timer}`、`pjgoiot-cleanup.{service,timer}`、`deploy/cron/crontab.example`；安装与验证命令见 [runbook.md §6.2–§6.3](docs/runbook.md) |
+| v0.23.0 契约一致性 | 通过：`openapi info.version=0.18.0`，新增 `/push/devices`、`/push/devices/{deviceId}`、`/admin/alerts` 与 `PushRegistration*`/`Alert*` schema；`/scenes` 增加 `limit`/`cursor`；`redocly lint` 0 error |
+| v0.23.0 CI | 待填：提交后回填 run 链接 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1686,7 +1740,7 @@ seed 数据来源与边界：
 
 ```bash
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
-  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestPostgresCatalogDeviceTypesIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold' -v
+  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestPostgresCatalogDeviceTypesIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold|TestPostgresSceneIntegration|TestPostgresPushIntegration|TestPostgresScenePaginationIntegration' -v
 ```
 
 ## 多实例部署（v0.11.0）
@@ -1789,8 +1843,8 @@ git push origin v0.17.0
 
 - 场景已上云，但两端 App **尚未切换到 `/scenes`**：本地 SQLite/Room 仍是实际执行源，首次同步、冲突合并、`deviceMissing` 在 UI 的呈现均未在真实客户端验证；`schedule` 的本地调度也未跨时区/夏令时实测。
 - 场景触发条件中的 `deviceType` 与 `metric` 校验依赖 `device_type_catalog` 当前内容；目录项被删除后，新写入会被拒绝，但已存在场景不会被回改（读取时只计算 `deviceMissing`，不校验指标是否仍受支持）。
-- 场景列表未分页；单用户场景量预计很小，后续若增长再补游标。
-- **服务端没有任何推送通道**：无 `push token` 表、无 FCM/APNs 集成、无发送队列；场景的 `notify` 只由客户端本地通知执行。若产品承诺「设备离线也能收到提醒」，这是**阻塞上线**项（见 [preflight.md](docs/preflight.md)）。
+- 场景列表 v0.23.0 起支持可选 `limit`/`cursor`；不传参数仍返回全量，客户端未接入分页也不受影响。
+- **服务端推送链路已具备（v0.23.0）**：`push_devices` 表与注册/停用接口、告警同事务入队、后台 worker、FCM/APNs 适配层、无凭据 dry-run、指数退避与失效停用、cleanup 保留期。**真实 FCM/APNs 投递与真机收到通知未验证**（无账号/凭据/设备）；场景的 `notify` 仍由客户端本地通知执行。若产品承诺「设备离线也能收到提醒」，需补齐凭据后再验（见 [preflight.md](docs/preflight.md)）。
 - `/sync/changes` 的 `MIN(seq)` 可见性下限已在 v0.22.0 改为索引探测（≈1.11M 行时 p95 0.56 ms / 10 buffers）；多家庭用户与生产级数据量仍待补测。详见 [perf-baseline.md §3.6](docs/perf-baseline.md)。
 - 个人数据导出任务在 API 进程内以 goroutine 执行：进程崩溃后由**启动对账**把超过 5 分钟仍 `pending` 的任务标记为 `failed` 并写 `failureReason`；真实 SIGKILL 重启联调未重跑。见 [preflight.md](docs/preflight.md) §1.4.2。
 - `cmd/loadgen` 新增的 changes / scenes / feedback / catalog 场景**未纳入 CI `-smoke`**（短跑造数与阈值缺失）；CI 仍只回归 devices / push / series 三场景。
@@ -1818,8 +1872,8 @@ git push origin v0.17.0
 - 完整栈已在本地 `docker compose up` 实测（Caddy 自签 HTTPS、非 root、只读根文件系统、启动迁移、卷持久化、docker 模式备份恢复均通过）；**真实域名 / ACME 证书 / 云主机仍未验证**，仓库未开通任何云账号。
 - distroless 镜像没有 shell、`id`、`curl`，容器内排查请用 `docker top` / `docker inspect` / `docker compose exec api /api -healthcheck`；健康检查已使用二进制自带的 `-healthcheck`，无需额外工具。
 - 备份脚本默认 `host` 模式，需要本机有 `pg_dump`/`pg_restore`；容器内执行用 `BACKUP_MODE=docker`/`RESTORE_MODE=docker`，本轮已实测。
-- 告警规则已用容器内 `promtool check rules` + `check config` 做过语义校验；阈值仍需按真实流量基线调整。压测为 30s/场景的短时压测，未做数小时长稳压、故障注入与多实例集群验证。
-- systemd timer 仅提供示例，未在目标主机安装验证。
+- 告警规则已用容器内 `promtool check rules` + `check config` 做过语义校验；v0.23.0 提供 Alertmanager 配置与 `cmd/alert-webhook`，`scripts/verify-alerting.sh` 本机验证到 webhook 收到（含去重与静默）。**未接入真实电话/短信/邮件/Slack 通道，未在生产部署 Alertmanager**；阈值仍需按真实流量基线调整。
+- `deploy/systemd/pjgoiot-{backup,cleanup}.{service,timer}` 与 `deploy/cron/crontab.example` 已提供，但**未在生产主机安装**；安装与验证命令见 [runbook.md §6.2–§6.3](docs/runbook.md)。
 
 ## 开发命令
 
