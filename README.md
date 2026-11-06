@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.16.0**（v0.20.0 新增场景上云）；服务版本 **v0.21.0**（压测基线与上线前演练，不改契约）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.17.0**（v0.22.0 新增 token 刷新/会话吊销与导出失败原因）；服务版本 **v0.22.0**（下限查询性能、导出对账、token 生命周期）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）；v0.19.0 新增 `POST /me/deletion-request` + `DELETE /me`（一次性令牌二次确认、单事务硬删除、owner 有成员 409）与异步个人数据导出 `POST /me/export`、`GET /me/export/{id}`、一次性下载链接，契约升到 **0.15.0**（新增迁移 `000016_account_deletion_export`）；v0.20.0 把客户端本地场景（触发条件 + 动作）搬到服务端，新增 `GET|POST /scenes`、`GET|PUT|DELETE /scenes/{sceneId}`、字段级 LWW 更新、`change_log` 的 `scene` entity 以及场景纳入账号删除与导出，契约升到 **0.16.0**（新增迁移 `000017_scenes`）。v0.21.0 **不做功能变更**，只做压测容量基线（[`docs/perf-baseline.md`](docs/perf-baseline.md)）与故障恢复 / 上线前清单演练（[`docs/preflight.md`](docs/preflight.md)），契约保持 **0.16.0**。v0.22.0 修复清单中三项实证问题：`/sync/changes` 可见性下限拆成索引探测（p95 66.28ms → 0.56ms）、导出任务启动对账（`failed` + `failureReason`）、token 滚动刷新与会话吊销（`POST /auth/refresh`、`GET /sessions`、`DELETE /sessions/{id}`），契约升到 **0.17.0**（无 schema 迁移）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -72,6 +72,9 @@ make dev-postgres   # Postgres 模式启动 API
 | POST | `/auth/anonymous` | 否 | 201 | 创建匿名用户，返回 `userId` 与不透明 `token` |
 | POST | `/auth/login` | 否 | 501 | 预留账号密码登录，当前明确未实现 |
 | POST | `/auth/logout` | Bearer | 204 | 吊销当前 token |
+| POST | `/auth/refresh` | Bearer | 200 | 滚动刷新 token；旧 token 立即失效，返回新 `token` 与 `expiresAt` |
+| GET | `/sessions` | Bearer | 200 | 列出当前账号有效登录会话；`current=true` 标记本次会话 |
+| DELETE | `/sessions/{id}` | Bearer | 204 | 吊销指定会话；跨用户/不存在 404，重复吊销幂等 |
 | POST | `/auth/pairing-code` | Bearer | 201 | 生成一次性配对码，`{code,expiresAt}`；10 分钟有效，新码使旧码失效 |
 | POST | `/auth/pairing-code/claim` | 否 | 200 | 用配对码换取**同一 userId** 的新 token，`{userId,token}`；按 IP 独立限流 |
 | POST | `/me/deletion-request` | Bearer | 201 | 签发一次性删除令牌 `{token,expiresAt}`；10 分钟有效，只存哈希，再次申请作废旧令牌 |
@@ -632,6 +635,8 @@ down 迁移直接删除该表，不影响 `user_devices` 与公共元数据。
 
 1. `POST /me/export`（Bearer）→ `202`，返回 `{id,status:"pending",createdAt,expiresAt}`；
 2. 轮询 `GET /me/export/{id}`；`status` 为 `pending` / `ready` / `failed`；
+   `failed` 时响应带 `failureReason`（例如进程重启后启动对账把超过 5 分钟仍未完成的任务标记失败），
+   客户端应提示用户重新发起导出；
 3. `ready` 时响应带 `downloadUrl`（含一次性令牌，10 分钟有效）与 `downloadExpiresAt`；
    每次查询都会签发**新**链接并让旧链接立即失效；
 4. `GET /me/export/{id}/download?token=…` 不使用 Bearer；首次下载即失效，重放/过期 `410`，
@@ -910,9 +915,10 @@ A 轮逐路径结果（30s + 3s 预热，`RATE_LIMIT_PER_MINUTE=0`）：
   单用户吞吐天花板 ≈42–49 RPS（≈4,200–4,900 设备行/s + ≈8,400–9,800 读数行/s），加并发只增排队。
 - **多用户可线性放大**：5 个进程 × 各自用户 × 10 并发，合计 **≈158.9 RPS**，API CPU ≈2.38 核，
   证明单用户上限不是数据库全局上限。API 单进程 CPU ≈2.4 核是当前同机压测的再上一个拐点。
-- **`/sync/changes` 成本随全局 `change_log` 行数增长**：≈387k 行时单查询 71–86 ms / 72,542 buffers；
-  ≈1.11M 行时**每个请求**先做 `MIN(seq)` 可见性下限，warm **347.7 ms / 233k buffers**
-  （`Index Scan using change_log_pkey`）。这是待办项，v0.21.0 未改代码。
+- **`/sync/changes` 下限查询已修（v0.22.0）**：原 `MIN(seq)` 用 `user_id OR household_id IN (...)`
+  导致主键前缀扫描（≈1.11M 行时 warm **347.7 ms / 233k buffers**）；改为「本人 MIN + 每家庭 MIN」后，
+  同库同用户实测 p95 **66.28 ms → 0.56 ms**、buffers **87,928 → 10**（`Index Only Scan ... LIMIT 1`）。
+  多家庭用户与生产级数据量仍待补测。
 - 反馈写入 30s 造 38 万行，库增长快；保留期清理（`cmd/cleanup`）必须定时化。
 
 多实例限流单独一轮（`RATE_LIMIT_PER_MINUTE=20`、`BURST=5`，同一 IP 在两个实例间交替 40 次）：
@@ -1343,9 +1349,12 @@ PostgreSQL
 
 - 不使用全局 API Key，也不使用 JWT。
 - token 为不透明随机串：`pjiot_` + 32 字节随机数的 base64url 编码。
-- 数据库只存 SHA-256 哈希；`tokens.revoked_at` 支持吊销（`/auth/logout`）。
+- 数据库只存 SHA-256 哈希；`tokens.revoked_at` 支持吊销（`/auth/logout`、`DELETE /sessions/{id}`）。
 - 私有接口用 `Authorization: Bearer <token>`，服务端按 token 哈希查出 `userId` 后再执行查询。
-- 服务端不会自动签发、轮换或续期 token；只有显式调用 `/auth/anonymous` 才会创建新账号与新 token。
+- **刷新与多设备会话（v0.22.0）**：`POST /auth/refresh` 用当前有效 token 换新 token，**旧 token 同一事务内立即吊销**
+  （滚动 180 天 TTL），刷新不能复活已吊销 token；`GET /sessions` 列出账号有效会话并用 `current` 标记本次会话，
+  `DELETE /sessions/{id}` 可单独吊销丢失设备。服务端不会自动轮换；只有显式调用 `/auth/refresh` 才会轮换。
+  刷新本身要求当前 token 有效，因此客户端收到 401 时仍应走「用户显式重新登录」，不能靠刷新自救。
 
 ### 401 语义（客户端必须遵守）
 
@@ -1455,7 +1464,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.21.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.16.0 不是同一个号 |
+| `APP_VERSION` | `0.22.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.17.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1664,6 +1673,10 @@ seed 数据来源与边界：
 | v0.21.0 迁移往返（有数据） | 通过：17→16→17 在 1.7 GB 真实库上执行；核心表计数不变，`scenes` 被 down 删除（60→0），已在 [preflight.md](docs/preflight.md) 记录为回滚风险 |
 | v0.21.0 硬杀重启 | 通过：SIGKILL 后 advisory lock 0.4s 内释放、游标 seq 连续、push 恢复 0 错误；导出任务崩溃后停留 `pending`（未修复，列入上线前清单） |
 | v0.21.0 CI | 通过：GitHub Actions [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）` 1m9s） |
+| v0.22.0 可见性下限性能 | 通过（本机真实 PG，1,112,155 行 `change_log` / 21,600 设备）：p50 62.77ms → 0.35ms、p95 66.28ms → 0.56ms、buffers 87,928 → 10；计划由 `change_log_pkey` 前缀扫描变为两次 `Index Only Scan ... LIMIT 1`。见 [perf-baseline.md §3.6](docs/perf-baseline.md) |
+| v0.22.0 导出对账 | 通过（真实 PostgreSQL）：超时 pending → failed + 可读原因；未超时 pending 与 ready 不受影响；两个 Store 实例并发对账总条数=1、重复对账=0；HTTP 层 `GET /me/export/{id}` 返回 `failureReason` |
+| v0.22.0 token 刷新与吊销 | 通过（真实 PostgreSQL + HTTP）：刷新后旧 token 401、新 token 可用、旧 token 二次刷新 401、新 token 可再次轮换；`GET /sessions` 标记 current；单会话吊销后 token 401 且刷新仍 401；跨用户 404、重复吊销幂等；删除账号后 tokens=0 |
+| v0.22.0 契约一致性 | 通过：`openapi info.version=0.17.0`，新增 `/auth/refresh`、`/sessions`、`/sessions/{id}` 与 `failureReason`；`redocly lint` 0 error |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1777,12 +1790,12 @@ git push origin v0.17.0
 - 场景触发条件中的 `deviceType` 与 `metric` 校验依赖 `device_type_catalog` 当前内容；目录项被删除后，新写入会被拒绝，但已存在场景不会被回改（读取时只计算 `deviceMissing`，不校验指标是否仍受支持）。
 - 场景列表未分页；单用户场景量预计很小，后续若增长再补游标。
 - **服务端没有任何推送通道**：无 `push token` 表、无 FCM/APNs 集成、无发送队列；场景的 `notify` 只由客户端本地通知执行。若产品承诺「设备离线也能收到提醒」，这是**阻塞上线**项（见 [preflight.md](docs/preflight.md)）。
-- `/sync/changes` 每次请求都先做 `MIN(seq)` 可见性下限，成本随 `change_log` **全局行数**增长（≈1.11M 行时 warm 347.7 ms / 233k buffers）；待拆 `household_id IS NULL` 与家庭成员两个分支。详见 [perf-baseline.md §3.5](docs/perf-baseline.md)。
-- 个人数据导出任务在 API 进程内以 goroutine 执行：进程崩溃后任务**永久停在 `pending`**，没有启动对账或 `failed` 状态，直到 24h 过期。见 [preflight.md](docs/preflight.md) §1.3。
+- `/sync/changes` 的 `MIN(seq)` 可见性下限已在 v0.22.0 改为索引探测（≈1.11M 行时 p95 0.56 ms / 10 buffers）；多家庭用户与生产级数据量仍待补测。详见 [perf-baseline.md §3.6](docs/perf-baseline.md)。
+- 个人数据导出任务在 API 进程内以 goroutine 执行：进程崩溃后由**启动对账**把超过 5 分钟仍 `pending` 的任务标记为 `failed` 并写 `failureReason`；真实 SIGKILL 重启联调未重跑。见 [preflight.md](docs/preflight.md) §1.4.2。
 - `cmd/loadgen` 新增的 changes / scenes / feedback / catalog 场景**未纳入 CI `-smoke`**（短跑造数与阈值缺失）；CI 仍只回归 devices / push / series 三场景。
 - 本轮压测为**单机回环、30s/项**，未覆盖跨主机网络/TLS、长稳压、多实例混合负载与默认限流下的端到端吞吐；这些已列入 [preflight.md](docs/preflight.md) 的分级清单。
 - `/auth/login` 仍为 501，只有匿名账号；后续可加账号密码 / OAuth 与匿名账号绑定。
-- token 已有有效期（默认 180 天）但**没有刷新/滚动续期**；客户端应在 `expiresAt` 前重新登录或配对，且不得在 401 后静默换新匿名账号（会造成 userId 漂移）。
+- token 已有有效期（默认 180 天）与 `POST /auth/refresh` 滚动轮换、`GET /sessions` / `DELETE /sessions/{id}` 会话管理；两端 App 尚未接入刷新流程。客户端不得在 401 后静默换新匿名账号（会造成 userId 漂移）。`ADMIN_TOKEN` 仍是单一静态密钥，未支持多密钥轮换。
 - `/my/devices/{mac}` 仅适合 Android；iOS 使用 `/my/devices/{platform}/{externalId}` 单台查询（已提供），或使用 `/my/devices` 列表。
 - 读数、`change_log`、幂等键与过期 token 的保留期删除均由 `cmd/cleanup` 负责，API 内不做后台定时清理；生产环境需自行配置 cron / systemd timer / CronJob，否则数据无限增长。
 - `change_log` 被清理后，落后超过保留期的客户端会收到 `410 RESYNC_REQUIRED`；客户端必须实现“清本地 + `cursor=0` 全量拉取”，否则会卡在 410。

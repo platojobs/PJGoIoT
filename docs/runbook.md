@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.21.0）
+# PJGoIoT 运行手册（v0.22.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -127,9 +127,14 @@
 | v0.21.0 多实例限流 | **已验证** | `RATE_LIMIT_BACKEND=postgres` 两实例交替 40 请求放行 5 次（额度共享）；`memory` 对照放行 9 次（≈2×）。注意 `docker-compose.yml` 默认仍是 `memory` |
 | v0.21.0 备份与恢复 | **已验证（本机）** | `pg_dump -Fc` 9.958s / 138MB；`pg_restore -j 4` 15.403s；15 张表行数与 `hashtext` 校验和完全一致。生产库未执行 |
 | v0.21.0 迁移往返（有数据） | **已验证（本机）** | 1.7GB 真实库 17→16→17：核心表计数不变；`scenes` 被 down 删除（60→0）。生产回滚前必须先导出场景或只前滚 |
-| v0.21.0 硬杀重启 | **已验证（本机）** | SIGKILL 后 advisory lock 0.4s 内释放、重启后 push 0 错误、游标 seq 连续；导出任务崩溃后仍 `pending`（无对账，列入上线前清单） |
+| v0.21.0 硬杀重启 | **已验证（本机）** | SIGKILL 后 advisory lock 0.4s 内释放、重启后 push 0 错误、游标 seq 连续；导出任务崩溃后仍 `pending`（v0.21.0 无对账，v0.22.0 已修复） |
 | v0.21.0 生产环境 | **未验证** | 真实域名/ACME、告警真实投递、备份与清理定时器、客户端真机、BLE 真机、签名与上架、推送通道，均未执行。分级清单见 [`preflight.md`](preflight.md) |
 | v0.21.0 CI | **已验证** | GitHub Actions [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验`、`构建镜像`、`压测门槛（smoke）`） |
+| v0.22.0 可见性下限 | **已验证（本机）** | 1,112,155 行 `change_log` / 21,600 设备：p95 66.28ms → **0.56ms**、buffers 87,928 → **10**；计划从 `change_log_pkey` 前缀扫描改为两次 `Index Only Scan ... LIMIT 1`。见 [`perf-baseline.md`](perf-baseline.md) §3.6 |
+| v0.22.0 导出对账 | **已验证（真实 PG 测试）** | 启动把创建 >5 分钟仍 `pending` 的任务标记 `failed` 并写原因；ready/新任务不受影响；两实例并发对账总条数=1、重复对账=0；`GET /me/export/{id}` 返回 `failureReason`。真实 SIGKILL 联调未重跑 |
+| v0.22.0 token 生命周期 | **已验证（真实 PG 测试）** | 刷新轮换后旧 token 401、新 token 可用、旧 token 二次刷新仍 401；`GET /sessions` 列出有效会话并标记 current；单会话吊销后 token 401、跨用户 404、重复吊销幂等；删除账号 tokens 清空 |
+| v0.22.0 客户端接入 token | **未验证** | 两端 App 尚未接入 `/auth/refresh` 与 `/sessions`；刷新失败后的重新登录体验未测 |
+| v0.22.0 生产环境 | **未验证** | 与 v0.21.0 相同：域名/ACME、告警真实投递、定时器、真机、商店、推送通道均未执行 |
 
 ## 1. 部署前检查清单
 
@@ -1369,13 +1374,34 @@ pg_restore -j4 15.403s → 15 张表 count + hashtext 校验和 diff 为空
 16→17 up 0.125s：version=17 dirty=false，scenes 60→0
 
 SIGKILL：advisory lock 1 → +0.4s 0 → +3.4s 0；重启 health 200；游标 1,086,355 后续 100 条 seq 连续
-导出任务：重启后仍 pending，直到 24h 过期（无启动对账）
+导出任务：重启后仍 pending，直到 24h 过期（v0.21.0 无启动对账；v0.22.0 已修复）
 ```
 
 #### 9.12.3 上线前清单
 
 阻塞项、上线前应完成项与可延后项的完整表格见 [`preflight.md`](preflight.md) §二；
 本机可复现不等于生产已验证（域名、证书、告警投递、定时器、真机、商店、推送通道均未执行）。
+
+### 9.13 v0.22.0 三项修复（真实输出）
+
+```text
+# 1. /sync/changes 可见性下限（pjgoiot_load，1,112,155 行 change_log / 21,600 设备）
+改造前  Index Scan using change_log_pkey，Rows Removed by Filter: 225,355
+        p50 62.77ms  p95 66.28ms  buffers 87,928
+改造后  Index Only Scan ... LIMIT 1（本人分支 + 家庭分支），Heap Fetches: 0
+        p50 0.35ms   p95 0.56ms   buffers 10
+
+# 2. 导出对账（真实 PG 集成测试）
+        pending 且 created_at < now()-5min → failed + failureReason
+        两实例并发：对账总条数 1（无重复）；重复对账 0；ready 与新 pending 不受影响
+
+# 3. token 刷新与吊销（真实 PG 集成测试）
+        refresh 后旧 token 401、新 token 可用；旧 token 二次 refresh 仍 401
+        sessions 列出 2 条（current 1 条）；吊销 1 条后对应 token 401
+        跨用户吊销 404；重复吊销幂等；删除账号后 tokens=0
+
+# 迁移：本次不需要（下限查询改用 000001/000011 已建的组合索引）
+```
 
 ## 10. 本地栈自检步骤（可复现）
 

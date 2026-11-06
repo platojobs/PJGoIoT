@@ -1,4 +1,4 @@
-# 服务端压测基线（v0.21.0）
+# 服务端压测基线（v0.21.0 基线 + v0.22.0 下限优化）
 
 > 本文件只记录**本机真实执行过**的数字。未执行的路径不列入结果表，只出现在「未覆盖」一节。
 > 压测工具与 API 在同一台机器上运行，数字是**单机天花板**，不代表跨主机 + 真实网络的表现。
@@ -132,15 +132,86 @@ postgres 后端写入的单行 `rate_limit_buckets`（key=`127.0.0.1`）在测�
 - 在 ≈387k 行 `change_log`、`cursor=1000` 时，`/sync/changes` 的主查询计划为 `Index Scan using change_log_pkey`，扫 **72,542 shared buffers（含 15,386 物理读）**，单查询 71–86ms。
 - 在 ≈1.11M 行 `change_log`、用户首条变更位于 seq≈1,071,256 时，**可见性下限**查询（`MIN(seq)`）warm 执行 **347.7ms**、命中 **148,539 buffer + 84,734 物理读**；即每个 `/sync/changes` 请求都要先付这笔固定成本。
 
-**结论**：`/sync/changes` 的成本由**全局 seq 位置**决定，而不仅是该用户自己的 backlog。上线前需要：
+**结论**：`/sync/changes` 的成本由**全局 seq 位置**决定，而不仅是该用户自己的 backlog。v0.22.0 已按第 1 条完成下限查询改造，结果见 §3.6；第 2、3 条仍待办。
 
-1. 把 `MIN(seq)` 与主查询拆成 `household_id IS NULL` / 家庭成员两个分支（或在 SQL 层用 `UNION ALL`），让 `(user_id, seq)` 索引可用；
-2. 上线后按 `change_log` 总量设置清理/分区，否则新用户的首次同步耗时会随全局行数线性上升；
-3. 客户端 `limit` 从 100 起，不要一次性拉大页。
+### 3.6 v0.22.0 可见性下限查询改造（同一库、同一用户、前后对比）
 
-本轮**未改代码**（v0.21.0 不做功能变更），以上为待办项。
+**根因（为什么原来的写法必须扫）**
 
-### 3.6 已知拐点小结
+可见性下限是「本人行 ∪ 所属家庭行」中的最小 seq。原 SQL 写成：
+
+```sql
+SELECT MIN(c.seq) FROM change_log c
+WHERE c.user_id = $1 OR c.household_id IN (
+  SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1)
+```
+
+`change_log` 上其实**早已存在** `change_log_user_seq_idx (user_id, seq)`（000001）与
+`change_log_household_seq_idx (household_id, seq)`（000011），但 `OR` 把两个来源合并在一个
+过滤条件里：优化器无法对「两个索引的并集」直接做 `MIN` 的 `LIMIT 1` 短路，只能选一条有序路径
+（这里是 `change_log_pkey (seq)`）从 seq 最小端开始逐行 `Filter`，直到遇到第一条满足
+`user_id/household_id` 条件的行。**代价因此正比于「全局最老行到该用户首条可见行」的距离**，
+而不是该用户自己的数据量：全局行数越多，这段前缀越长，buffer 访问越多。实测计划中
+`Rows Removed by Filter: 225,355`，即为一个用户的下限白白读了 22.5 万条索引项。
+
+**改法：把并集拆成「各来源各取 MIN，再取整体 MIN」**
+
+```sql
+SELECT min(x) FROM (
+  SELECT min(seq) AS x FROM change_log WHERE user_id = $1
+  UNION ALL
+  SELECT (SELECT min(seq) FROM change_log WHERE household_id = m.household_id) AS x
+  FROM household_members m WHERE m.user_id = $1
+) s
+```
+
+`MIN` 对集合并取最小值，等价于先对每个来源取最小值再取全局最小值——语义完全一致：
+- 不改变 410 语义（仍以同一个下限值与 `cursor` 比较）；
+- 不改变返回顺序（主查询 SQL 未动）；
+- 不漏判可见性（本人行与全部家庭行仍是并集）。
+
+每个分支都由 `(user_id, seq)` / `(household_id, seq)` 的有序前缀做 `Index Only Scan ... LIMIT 1`，
+代价只与家庭数有关（本例 1 个家庭 → 2 个分支），与 `change_log` 全局行数无关。
+
+**未选「物化每用户最老可见 seq」的原因**
+
+物化表需要在写入时同步维护：一次 push 的家庭行要更新**所有家庭成员**的 floor（扇出），
+清理任务删除旧行时 floor 又要前移；成员加入/退出、账号删除还需按历史重算；多实例下要与
+push 走进同一事务或引入额外锁，否则会出现「行已写入但 floor 未更新」的漏判。
+相比之下，索引探测是纯读、无写放大、无需回填，也不会因崩溃/并发产生不一致。
+因此选择索引改写，而不是新增物化表（本次**不需要迁移**，索引在既有迁移中已具备）。
+
+**同一环境 / 同一数据规模的实测**
+
+环境：M1 Max 10 核 / 32 GB，PostgreSQL 16.15（Homebrew），库 `pjgoiot_load`；
+`change_log` **1,112,155 行**、`user_devices` **21,600 台**、19 个家庭；代表性用户本人行 325,531、
+家庭行 94,235。测法：`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`，5 次预热后连续 30 次取
+`Execution Time` 与 `shared hit+read` 中位数。
+
+| 版本 | 下限查询形态 | p50 | p95 | buffers/次（中位） | 代表性计划 |
+| --- | --- | --- | --- | --- | --- |
+| 改造前 | `user_id OR household_id IN (...)` | **62.77ms** | **66.28ms** | **87,928** | `Index Scan using change_log_pkey`，`Rows Removed by Filter: 225,355` |
+| 改造后 | 本人 MIN + 每家庭 MIN 的 `UNION ALL` | **0.35ms** | **0.56ms** | **10** | 两次 `Index Only Scan ... (actual rows=1)`，`Heap Fetches: 0` |
+
+p95 从 66.28ms 降到 0.56ms（**约 118×**），buffer 访问从 87,928 降到 10（**约 8,800×**），
+满足「≥100 万行 + ≥2 万设备下 p95 < 30ms」。
+
+复现命令（同一 DSN 下替换用户 id 即可）：
+
+```bash
+psql "$DB" -c "EXPLAIN (ANALYZE, BUFFERS)
+SELECT min(x) FROM (
+  SELECT min(seq) AS x FROM change_log WHERE user_id = '$UID'
+  UNION ALL
+  SELECT (SELECT min(seq) FROM change_log WHERE household_id = m.household_id) AS x
+  FROM household_members m WHERE m.user_id = '$UID') s"
+```
+
+**未验证的部分**：多家庭（>10 个）用户的 p95 未单独压测；探测分支数随家庭数线性增长，
+但每个分支仍是 O(log n)，预计远低于 30ms。跨主机网络与真实生产数据量（>1 亿行）未测。
+
+
+### 3.7 已知拐点小结
 
 | 拐点 | 现象 | 证据 |
 | --- | --- | --- |

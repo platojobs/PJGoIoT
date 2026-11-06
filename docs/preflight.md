@@ -1,8 +1,11 @@
-# 上线前检查与故障演练（v0.21.0）
+# 上线前检查与故障演练（v0.22.0）
 
 > 只写**事实状态**，不写「已完成」。演练数字均为本机真实执行，环境见
 > [`docs/perf-baseline.md`](perf-baseline.md) 第 1 节（M1 Max 10 核 / 32 GB、PostgreSQL 16.15、
 > 库 `pjgoiot_load`，迁移 000001–000017）。
+>
+> v0.22.0 修掉 v0.21.0 清单中「上线前应完成」的三项（`/sync/changes` 下限性能、导出任务崩溃对账、
+> token 刷新与吊销）。逐项结论见第 1.4 节，原始性能对比见 `perf-baseline.md` §3.6。
 
 ## 一、故障与恢复演练（三项）
 
@@ -121,7 +124,41 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | 杀前写入是否丢失 | 无：`change_log.max(seq)` 继续增长，seq 唯一约束未报冲突 |
 | pending 导出任务 | **重启后仍为 `pending`**，`GET /me/export/{id}` 返回 200 + `status=pending`，直到 24h `expiresAt` 都没有任何重试/失败标记 |
 
-**结论（事实）**：advisory lock 与游标在硬杀后自愈；**导出任务是进程内 goroutine，进程死亡后永久停在 `pending`**，没有启动时对账（当前没有任何重试或 `failed` 状态改写）。用户会看到一个永远「处理中」、最终过期的任务。
+**结论（事实）**：advisory lock 与游标在硬杀后自愈；v0.21.0 演练时**导出任务是进程内 goroutine，进程死亡后永久停在 `pending`**。v0.22.0 已加入启动对账（第 1.4.2 节），本节数字保留为修复前基线。
+
+### 1.4 v0.22.0 修复三项的验证结果
+
+#### 1.4.1 `/sync/changes` 可见性下限查询
+
+- 改法：把 `user_id OR household_id IN (...)` 拆成「本人 MIN + 每个家庭 MIN」的 `UNION ALL`，
+  每个分支走 `(user_id, seq)` / `(household_id, seq)` 的 `Index Only Scan LIMIT 1`。
+  语义（410 判定、返回顺序、可见性并集）不变；**无需迁移**（两个组合索引在 000001/000011 已存在）。
+- 同库同用户实测（1,112,155 行 `change_log`、21,600 台设备）：p50 **62.77ms → 0.35ms**、
+  p95 **66.28ms → 0.56ms**、buffers **87,928 → 10**。完整计划与复现命令见 `perf-baseline.md` §3.6。
+- 未验证：多家庭（>10 个）用户的 p95、生产级数据量（>1 亿行）、跨主机网络。
+
+#### 1.4.2 导出任务崩溃对账
+
+- 选择「标记 failed」而非重新入队：任务执行体没有持久队列/领取协议，重新入队需要额外实现
+  防重复与产物写回；导出可随时重新申请且产物有 24h TTL，直接收敛并给出可读原因更简单可靠。
+- 启动时以单条 `UPDATE ... WHERE status='pending' AND created_at < now()-5min` 对账；
+  多实例并发启动时只有一次会推进状态，幂等；不触碰 `ready`/`failed`。
+- `GET /me/export/{id}` 对 `failed` 返回 `failureReason`（「导出任务因服务重启中断，请重新发起导出」）。
+- 测试（真实 PG）：超时 pending → failed 且带原因；未超时 pending 与 ready 不受影响；
+  两个 Store 实例并发对账总条数 = 1；重复对账 = 0。
+- 未验证：对账在**真实 SIGKILL 后重启**的完整客户端联调未重跑（用回拨 `created_at` 等价模拟）。
+
+#### 1.4.3 token 刷新与吊销
+
+- `POST /auth/refresh`：同一事务内 `SELECT ... FOR UPDATE` 校验旧 token 仍有效 → 吊销旧 token →
+  写入新 token（滚动 180 天 TTL）。旧 token 立即 401，且刷新无法复活已吊销 token；
+  并发刷新同一 token 只有一个成功。
+- `GET /sessions`：列出未吊销、未过期的会话（不返回 token 本身），`current` 标记本次会话。
+- `DELETE /sessions/{id}`：按账号范围吊销；跨用户/不存在统一 404，重复吊销幂等 204。
+- 删除账号沿用既有单事务硬删除，`tokens` 随账号级联清理。
+- 测试（真实 PG）：刷新后旧 token 401 / 新 token 可用 / 旧 token 二次刷新 401 / 二次刷新再轮换；
+  吊销指定会话后该 token 401 且刷新仍 401；跨用户吊销 404；重复吊销幂等；删除账号后 tokens=0。
+- 未验证：客户端在刷新失败时的重新登录体验；`ADMIN_TOKEN` 仍是单一静态密钥（不在本项范围）。
 
 ## 二、上线前清单（按分级）
 
@@ -144,11 +181,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | 事项 | 为什么重要 | 当前状态（事实） | 补齐需要什么 |
 | --- | --- | --- | --- |
 | 多实例限流后端设为 postgres | `memory` 后端下额度随实例数放大，限流失效 | 本轮实测：`postgres` 2 实例交替 40 请求只放行 5 次（额度共享）；`memory` 2 实例放行 9 次（≈2 倍）。但 `docker-compose.yml` 默认仍是 `RATE_LIMIT_BACKEND=memory` | 部署时显式设置 `RATE_LIMIT_BACKEND=postgres`（要求 `STORE=postgres`）；写进部署清单与验收脚本 |
-| `change_log` 可见性下限查询性能 | 新用户每次增量同步都要先付这笔成本，随全局行数线性变慢 | ≈1.11M 行时 `MIN(seq)` warm **347.7ms / 233k buffer 访问**（`Index Scan using change_log_pkey`）；≈387k 行时主查询 71–86ms / 72.5k buffers。详见 `perf-baseline.md` §3.5 | 拆 `household_id IS NULL` 与家庭成员两个分支（或 `UNION ALL`）让 `(user_id, seq)` 索引生效；改后按同一脚本复测 |
-| 导出任务崩溃对账 | 崩溃后用户看到永久 `pending`，且无失败提示 | 演练中 `pending` 任务在重启后**仍为 pending**，直到 24h 过期；没有启动对账、没有 `failed` 状态 | 启动时扫描超时 `pending` 并重试或标记失败；或改为可重入的队列 |
+| `change_log` 可见性下限查询性能 | 新用户每次增量同步都要先付这笔成本，随全局行数线性变慢 | **v0.22.0 已修复（本机实测）**：同库 1,112,155 行 / 21,600 设备下 p95 66.28ms → **0.56ms**、buffers 87,928 → **10**；计划由 `change_log_pkey` 前缀扫描变为两个 `Index Only Scan ... LIMIT 1`。详见 `perf-baseline.md` §3.6 | 多家庭用户与生产级数据量（>1 亿行）补测 |
+| 导出任务崩溃对账 | 崩溃后用户看到永久 `pending`，且无失败提示 | **v0.22.0 已修复**：启动时把创建超过 5 分钟仍 `pending` 的任务标记 `failed` 并写可读原因；多实例并发幂等；真实 PG 测试覆盖超时/新任务/ready/重复对账。真实 SIGKILL 重启联调未重跑 | 在生产同规格环境做一次真实杀进程 → 重启 → 客户端提示的完整演练 |
 | 清理任务定时化 | 反馈/变更/幂等/限流桶持续增长，本机 30s 压测写入 38 万条反馈 | `cmd/cleanup` 已实现（默认保留 90 天、幂等 7 天），**未安装定时器**；仅本机手工执行过 | 与备份同一个 systemd timer / cron 安装与一次真实执行记录 |
 | 限流其实会让压测数字更差 | 生产默认 120/min + burst 40，客户端批量推送会被限 | 压测全部在限流关闭下完成；未测「开启默认限流」时的端到端吞吐与 429 比例 | 用默认限流跑一轮 push/changes，记录 429 比例与 `Retry-After` |
-| token 生命周期 | token 泄露后无法吊销，只能等过期；admin 单密钥无轮换 | 事实：token 有 180 天有效期（`TOKEN_TTL_DAYS`），但**没有刷新/滚动续期、没有吊销/轮换接口**；`ADMIN_TOKEN` 是单一静态密钥，审计 actor 固定为 `admin`，无法区分操作人 | 设计吊销与轮换（含 admin 多密钥）、一次安全评审；如需缩短有效期需同步客户端重登流程 |
+| token 生命周期 | token 泄露后无法吊销，只能等过期；admin 单密钥无轮换 | **v0.22.0 已补齐用户侧**：`POST /auth/refresh` 滚动轮换（旧 token 立即失效）、`GET /sessions`、`DELETE /sessions/{id}`；删除账号级联清理。**未覆盖**：`ADMIN_TOKEN` 仍是单一静态密钥，无多密钥轮换/吊销 | 用户侧客户端接入刷新流程；admin 多密钥与审计 actor 方案 |
 | `scenes` 列表分页 | 场景多时响应无上界 | `GET /scenes` 无分页参数；本轮只测 50 个场景（7,174 RPS） | 增加 `limit/cursor`（或明确上限 200 并返回 400） |
 | 长稳压与多实例混合负载 | 30s 短跑看不出内存/连接泄漏 | 未执行：本轮最长 30s/项；多实例只在限流专项起过 2 个 postgres 实例 | 1–4 小时混合负载（push/changes/scenes/feedback 同时），观察 RSS、连接池、GC、PG 连接数 |
 | 反馈审计留存 | 审计表随反馈级联删除，运营追溯会一起消失 | 未改：`feedback_status_events` 随反馈删除；未评估保留期 | 决定是否独立归档/软删反馈，或延长保留期 |
@@ -171,5 +208,6 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ## 三、本轮事实状态（供评审引用，不代表生产已验证）
 
 - 本机真实 PostgreSQL 上的备份/恢复、迁移往返、硬杀重启、双实例共享限流、7 条路径压测全部可复现（命令见上、`docs/perf-baseline.md`）。
-- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint；CI 四 job 在 [run 42181697527](https://github.com/platojobs/PJGoIoT/actions/runs/42181697527) 全绿。
+- v0.22.0 三项修复的代码与测试均在真实 PG `pjgoiot_test` 上执行通过；性能对比在 111 万行 `change_log` / 21,600 设备库上实测。
+- 代码与文档在提交前通过了 `gofmt`、`go vet`、全量测试（含真实 PG）与 OpenAPI lint。
 - 生产环境（域名、证书、告警投递、定时任务、真机、商店、推送通道）**一项都未执行**。
