@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.20.0）
+# PJGoIoT 运行手册（v0.21.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -123,6 +123,12 @@
 | v0.20.0 客户端接入 | **未验证** | 两端 App 仍以本地 SQLite/Room 为执行源，尚未切到 `/scenes`；首次同步、冲突合并与 `deviceMissing` UI 呈现未在真机验证 |
 | v0.20.0 定时调度 | **未验证** | `schedule` 的时区/夏令时在真实客户端本地调度未实测；服务端只做存储与结构校验 |
 | v0.20.0 admin 并发 | **未涉及** | 本轮无 admin 接口；场景写入按用户串行化（与 push 共用 advisory lock），未做跨用户高并发压测 |
+| v0.21.0 容量基线 | **已验证（本机）** | 真实 PG 16.15：9 条路径 p50/p95/p99 + RPS 全部实跑；push 单用户 10/50/100 并发拐点与 5 用户合计 ≈158.9 RPS；数据规模、机器规格与原始表见 [`perf-baseline.md`](perf-baseline.md) |
+| v0.21.0 多实例限流 | **已验证** | `RATE_LIMIT_BACKEND=postgres` 两实例交替 40 请求放行 5 次（额度共享）；`memory` 对照放行 9 次（≈2×）。注意 `docker-compose.yml` 默认仍是 `memory` |
+| v0.21.0 备份与恢复 | **已验证（本机）** | `pg_dump -Fc` 9.958s / 138MB；`pg_restore -j 4` 15.403s；15 张表行数与 `hashtext` 校验和完全一致。生产库未执行 |
+| v0.21.0 迁移往返（有数据） | **已验证（本机）** | 1.7GB 真实库 17→16→17：核心表计数不变；`scenes` 被 down 删除（60→0）。生产回滚前必须先导出场景或只前滚 |
+| v0.21.0 硬杀重启 | **已验证（本机）** | SIGKILL 后 advisory lock 0.4s 内释放、重启后 push 0 错误、游标 seq 连续；导出任务崩溃后仍 `pending`（无对账，列入上线前清单） |
+| v0.21.0 生产环境 | **未验证** | 真实域名/ACME、告警真实投递、备份与清理定时器、客户端真机、BLE 真机、签名与上架、推送通道，均未执行。分级清单见 [`preflight.md`](preflight.md) |
 
 ## 1. 部署前检查清单
 
@@ -990,7 +996,7 @@ GitHub Actions（run 41962617787，commit ef0c7af）：`构建与测试`、`构�
 
 - 真实域名 / ACME 证书签发（未开通任何云账号）；
 - systemd timer / 真实 cron 安装；
-- 数小时长稳压、故障注入、多实例限流；
+- 数小时长稳压、故障注入（`RATE_LIMIT_BACKEND=postgres` 的多实例共享额度已在 v0.21.0 实测，见 §9.11）；
 - `shfmt`（本机与 CI runner 均无）。
 
 ### 9.7 v0.8.0 生命周期与压测（真实输出）
@@ -1328,6 +1334,47 @@ shellcheck 对 `trap` 清理函数报 SC2317（不可达）与 SC2329（未调�
 并对 `multi-instance-check.sh` 中未使用的 `APPLIED_IDS` 报 SC2034。
 修复方式：删除无用命令替换、在脚本头部声明
 `# shellcheck disable=SC2317,SC2329`（仅屏蔽 trap 回调误报）。
+
+### 9.12 v0.21.0 容量基线与故障演练（真实输出）
+
+> 环境：Apple M1 Max 10 核 / 32 GB、PostgreSQL 16.15、库 `pjgoiot_load`（迁移 17）；
+> 完整命令与原始表见 [`perf-baseline.md`](perf-baseline.md) 与 [`preflight.md`](preflight.md)。
+
+#### 9.12.1 压测（7 条路径 + push 拐点 + 多实例限流）
+
+```text
+GET /my/devices            50c  5,773.9 RPS   p50 8ms   p95 16ms   p99 23ms   0.00%
+GET /readings/series       50c  4,766.0 RPS   p50 8ms   p95 20ms   p99 77ms   0.00%
+POST /sync/push（单用户）  50c     42.4 RPS   p50 1.053s p95 2.042s p99 2.752s 0.08%
+GET /sync/changes          50c    136.7 RPS   p50 345ms  p95 597ms  p99 761ms  0.00%
+GET /scenes                50c  7,174.5 RPS   p50 6ms   p95 13ms   p99 18ms   0.00%
+PUT /scenes/{id}           50c  2,097.7 RPS   p50 22ms  p95 43ms   p99 57ms   0.00%
+POST /feedback             20c 12,749.3 RPS   p50 1ms   p95 3ms    p99 10ms   0.00%
+GET /feedback/mine         20c 11,443.6 RPS   p50 1ms   p95 5ms    p99 13ms   0.00%
+GET /catalog/device-types  50c 12,388.2 RPS   p50 4ms   p95 7ms    p99 11ms   0.00%
+
+push 同一用户拐点：10c 48.9 RPS(p99 227ms) → 50c 42.4(p99 2.752s) → 100c 41.5(p99 5.8s，54×503)
+push 5 用户×10c：合计 ≈158.9 RPS，API CPU ≈2.38 核
+限流 postgres 2 实例：5 放行 / 35×429；memory 对照：9 放行 / 31×429
+```
+
+#### 9.12.2 备份恢复 / 迁移往返 / 硬杀重启
+
+```text
+pg_dump -Fc 9.958s → 138MB，sha256 f344d19c…81c72
+pg_restore -j4 15.403s → 15 张表 count + hashtext 校验和 diff 为空
+
+17→16 down 1.99s：scenes 表 DROP，users/user_devices/readings/change_log 计数不变
+16→17 up 0.125s：version=17 dirty=false，scenes 60→0
+
+SIGKILL：advisory lock 1 → +0.4s 0 → +3.4s 0；重启 health 200；游标 1,086,355 后续 100 条 seq 连续
+导出任务：重启后仍 pending，直到 24h 过期（无启动对账）
+```
+
+#### 9.12.3 上线前清单
+
+阻塞项、上线前应完成项与可延后项的完整表格见 [`preflight.md`](preflight.md) §二；
+本机可复现不等于生产已验证（域名、证书、告警投递、定时器、真机、商店、推送通道均未执行）。
 
 ## 10. 本地栈自检步骤（可复现）
 
