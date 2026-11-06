@@ -60,23 +60,37 @@ type householdInvitationRecord struct {
 	createdAt   time.Time
 }
 
-// feedbackRecord 是内存版反馈；contact/diagnostics 只保存，不进入列表响应。
+// feedbackRecord 是内存版反馈；contact/diagnostics 只保存，不进入用户侧列表响应。
 type feedbackRecord struct {
-	id          string
-	userID      string
-	kind        string
-	body        string
-	contact     *string
-	platform    string
-	appVersion  string
-	buildType   string
-	osVersion   string
-	deviceModel string
-	diagnostics *string
-	status      string
-	idemKey     string
-	requestHash string
-	createdAt   time.Time
+	id           string
+	userID       string
+	kind         string
+	body         string
+	contact      *string
+	platform     string
+	appVersion   string
+	buildType    string
+	osVersion    string
+	deviceModel  string
+	diagnostics  *string
+	status       string
+	internalNote *string
+	idemKey      string
+	requestHash  string
+	createdAt    time.Time
+	updatedAt    time.Time
+}
+
+// feedbackEventRecord 是一条状态审计（与 Postgres 的 feedback_status_events 对应）。
+type feedbackEventRecord struct {
+	id         string
+	feedbackID string
+	actorType  string
+	actorID    string
+	fromStatus string
+	toStatus   string
+	note       *string
+	createdAt  time.Time
 }
 
 type userData struct {
@@ -136,26 +150,28 @@ type Store struct {
 	rooms       map[string]model.HouseholdRoom
 	invitations map[string]*householdInvitationRecord
 
-	feedback     []*feedbackRecord
-	feedbackIdem map[string]*feedbackRecord // key: userID|idemKey
+	feedback       []*feedbackRecord
+	feedbackIdem   map[string]*feedbackRecord // key: userID|idemKey
+	feedbackEvents []*feedbackEventRecord
 }
 
 // New 从 fixtures 目录加载公共元数据。
 func New(dir string) (*Store, error) {
 	s := &Store{
-		publicDevices: map[string]model.PublicDevice{},
-		deviceTypeSet: map[string]struct{}{},
-		tokens:        map[string]tokenRecord{},
-		users:         map[string]*userData{},
-		changes:       []changeRecord{},
-		nextSeq:       1,
-		idempotency:   map[string]idempotencyRecord{},
-		pairingCodes:  map[string]*pairingRecord{},
-		households:    map[string]*householdRecord{},
-		rooms:         map[string]model.HouseholdRoom{},
-		invitations:   map[string]*householdInvitationRecord{},
-		feedback:      []*feedbackRecord{},
-		feedbackIdem:  map[string]*feedbackRecord{},
+		publicDevices:  map[string]model.PublicDevice{},
+		deviceTypeSet:  map[string]struct{}{},
+		tokens:         map[string]tokenRecord{},
+		users:          map[string]*userData{},
+		changes:        []changeRecord{},
+		nextSeq:        1,
+		idempotency:    map[string]idempotencyRecord{},
+		pairingCodes:   map[string]*pairingRecord{},
+		households:     map[string]*householdRecord{},
+		rooms:          map[string]model.HouseholdRoom{},
+		invitations:    map[string]*householdInvitationRecord{},
+		feedback:       []*feedbackRecord{},
+		feedbackIdem:   map[string]*feedbackRecord{},
+		feedbackEvents: []*feedbackEventRecord{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))

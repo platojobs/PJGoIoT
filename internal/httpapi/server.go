@@ -98,6 +98,15 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	feedbackGroup := api.Group("/feedback", s.requireAuth())
 	feedbackGroup.POST("", s.feedbackRateLimit(), s.handleCreateFeedback)
 	feedbackGroup.GET("/mine", s.handleListMyFeedback)
+	// 静态路径 /mine 与参数路径 /:feedbackId 同级并存；Gin 优先匹配静态段。
+	feedbackGroup.GET("/:feedbackId", s.handleGetFeedback)
+	feedbackGroup.PATCH("/:feedbackId", s.handleUpdateFeedback)
+
+	// 运营侧受理入口：不复用客户端 Bearer token，改用独立 ADMIN_TOKEN。
+	// 未配置时中间件统一返回 404，对外与不存在的路由不可区分。
+	adminFeedback := api.Group("/admin/feedback", s.requireAdmin())
+	adminFeedback.GET("", s.handleAdminListFeedback)
+	adminFeedback.PATCH("/:feedbackId", s.handleAdminUpdateFeedback)
 
 	households := api.Group("/households", s.requireAuth())
 	households.GET("", s.handleListHouseholds)

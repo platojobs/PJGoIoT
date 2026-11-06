@@ -355,4 +355,71 @@ func TestMigrationBackfillsLegacyDevices(t *testing.T) {
 	if !feedbackTableExists() {
 		t.Fatalf("重新迁移后缺少 feedback 表")
 	}
+
+	// 000014：补 internal_note、审计表与 (status, created_at) 索引；down 需精确回滚。
+	tableExists := func(name string) bool {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables WHERE table_name = $1
+		)`, name).Scan(&exists); err != nil {
+			t.Fatalf("查询表 %s 失败: %v", name, err)
+		}
+		return exists
+	}
+	columnExists := func(table, column string) bool {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2
+		)`, table, column).Scan(&exists); err != nil {
+			t.Fatalf("查询列 %s.%s 失败: %v", table, column, err)
+		}
+		return exists
+	}
+	indexExists := func(name string) bool {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1
+		)`, name).Scan(&exists); err != nil {
+			t.Fatalf("查询索引 %s 失败: %v", name, err)
+		}
+		return exists
+	}
+	if !tableExists("feedback_status_events") {
+		t.Fatalf("000014 迁移后缺少 feedback_status_events 表")
+	}
+	if !columnExists("feedback", "internal_note") {
+		t.Fatalf("000014 迁移后缺少 feedback.internal_note")
+	}
+	for _, idx := range []string{"feedback_status_created_idx", "feedback_status_events_feedback_idx"} {
+		if !indexExists(idx) {
+			t.Fatalf("000014 迁移后缺少索引 %s", idx)
+		}
+	}
+	if err := m.Migrate(13); err != nil {
+		t.Fatalf("回滚 000014 失败: %v", err)
+	}
+	if tableExists("feedback_status_events") {
+		t.Fatalf("回滚 000014 后审计表仍存在")
+	}
+	if columnExists("feedback", "internal_note") {
+		t.Fatalf("回滚 000014 后 internal_note 仍存在")
+	}
+	if indexExists("feedback_status_created_idx") {
+		t.Fatalf("回滚 000014 后状态索引仍存在")
+	}
+	if !feedbackTableExists() {
+		t.Fatalf("回滚 000014 不应删除 feedback 表")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = $1`, userID).Scan(&deviceCount); err != nil {
+		t.Fatalf("回滚 000014 后查询用户失败: %v", err)
+	}
+	if deviceCount != 1 {
+		t.Fatalf("回滚 000014 破坏了用户数据: count=%d", deviceCount)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("回滚 000014 后重新迁移失败: %v", err)
+	}
+	if !tableExists("feedback_status_events") || !columnExists("feedback", "internal_note") {
+		t.Fatalf("重新迁移 000014 后结构未恢复")
+	}
 }

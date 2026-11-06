@@ -395,6 +395,75 @@ type FeedbackPage struct {
 	HasMore    bool       `json:"hasMore"`
 }
 
+// FeedbackDetail 是 GET /feedback/{feedbackId} 的单条视图（仅本人可见）。
+// StatusMessage 是给用户看的状态说明；contact / diagnostics 不在此结构中。
+type FeedbackDetail struct {
+	FeedbackID    string    `json:"feedbackId"`
+	Kind          string    `json:"kind"`
+	Body          string    `json:"body"`
+	Platform      string    `json:"platform"`
+	AppVersion    string    `json:"appVersion"`
+	BuildType     string    `json:"buildType"`
+	OSVersion     string    `json:"osVersion"`
+	DeviceModel   string    `json:"deviceModel"`
+	Status        string    `json:"status"`
+	StatusMessage string    `json:"statusMessage"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// AdminFeedback 是运营侧（GET /admin/feedback）的反馈视图：跨用户，含联系方式、
+// 诊断文本与内部备注，仅通过 admin token 暴露，绝不复用到用户侧响应。
+type AdminFeedback struct {
+	FeedbackID   string    `json:"feedbackId"`
+	UserID       string    `json:"userId"`
+	Kind         string    `json:"kind"`
+	Body         string    `json:"body"`
+	Contact      *string   `json:"contact,omitempty"`
+	Platform     string    `json:"platform"`
+	AppVersion   string    `json:"appVersion"`
+	BuildType    string    `json:"buildType"`
+	OSVersion    string    `json:"osVersion"`
+	DeviceModel  string    `json:"deviceModel"`
+	Diagnostics  *string   `json:"diagnostics,omitempty"`
+	Status       string    `json:"status"`
+	InternalNote *string   `json:"internalNote,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// AdminFeedbackPage 是 GET /admin/feedback 的响应体，按 createdAt 倒序游标分页。
+type AdminFeedbackPage struct {
+	Items      []AdminFeedback `json:"items"`
+	NextCursor string          `json:"nextCursor"`
+	HasMore    bool            `json:"hasMore"`
+}
+
+// FeedbackStatusMessage 把状态翻译成给用户看的中文说明。
+func FeedbackStatusMessage(status string) string {
+	switch status {
+	case "received":
+		return "已受理，工作人员正在处理"
+	case "closed":
+		return "已关闭"
+	default:
+		return "已提交，等待处理"
+	}
+}
+
+// FeedbackTransitionAllowed 定义反馈状态机：submitted -> received -> closed，
+// 允许直接关闭 submitted -> closed 与误受理回退 received -> submitted；closed 为终态。
+func FeedbackTransitionAllowed(from, to string) bool {
+	switch from {
+	case "submitted":
+		return to == "received" || to == "closed"
+	case "received":
+		return to == "submitted" || to == "closed"
+	default:
+		return false
+	}
+}
+
 // User 是 GET /me/export 中返回的账号信息。
 type User struct {
 	ID        string    `json:"id"`

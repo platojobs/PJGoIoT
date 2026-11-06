@@ -31,6 +31,9 @@ const (
 
 	defaultFeedbackPageSize = 20
 	maxFeedbackPageSize     = 100
+
+	// maxFeedbackNoteRunes 与迁移中 internal_note 的 CHECK 约束保持一致。
+	maxFeedbackNoteRunes = 2000
 )
 
 // feedbackKinds 与 openapi 的枚举保持一致；未知类型直接 400，避免脏数据入库。
@@ -39,6 +42,13 @@ var feedbackKinds = map[string]struct{}{
 	"feature":    {},
 	"experience": {},
 	"other":      {},
+}
+
+// feedbackStatuses 是状态机允许出现的全部状态值，用于入参校验。
+var feedbackStatuses = map[string]struct{}{
+	"submitted": {},
+	"received":  {},
+	"closed":    {},
 }
 
 type feedbackClientContext struct {
@@ -150,18 +160,18 @@ func (s *Server) handleCreateFeedback(c *gin.Context) {
 }
 
 // handleListMyFeedback 返回当前账号提交过的反馈与状态，只包含本人数据。
+// status 可选：空串不过滤，其余必须是 submitted/received/closed 之一。
 func (s *Server) handleListMyFeedback(c *gin.Context) {
-	limit := defaultFeedbackPageSize
-	if raw := c.Query("limit"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > maxFeedbackPageSize {
-			fail(c, http.StatusBadRequest, CodeBadRequest, "limit 取值范围 1-100")
-			return
-		}
-		limit = n
+	limit, ok := feedbackLimitParam(c)
+	if !ok {
+		return
+	}
+	status, ok := feedbackStatusParam(c)
+	if !ok {
+		return
 	}
 
-	page, err := s.store.ListUserFeedback(c.Request.Context(), userID(c), c.Query("cursor"), limit)
+	page, err := s.store.ListUserFeedback(c.Request.Context(), userID(c), status, c.Query("cursor"), limit)
 	if err != nil {
 		if errors.Is(err, store.ErrBadCursor) {
 			fail(c, http.StatusBadRequest, CodeBadRequest, "cursor 无效")
@@ -171,6 +181,138 @@ func (s *Server) handleListMyFeedback(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, page)
+}
+
+// handleGetFeedback 返回本人单条反馈详情；不存在或属于他人一律 404。
+// 响应含给用户看的状态说明，但不含 contact 与 diagnostics。
+func (s *Server) handleGetFeedback(c *gin.Context) {
+	item, err := s.store.GetUserFeedback(c.Request.Context(), userID(c), c.Param("feedbackId"))
+	if err != nil {
+		c.Error(err)
+		c.Abort()
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
+// feedbackCloseRequest 是用户侧 PATCH /feedback/{id} 的请求体。
+// 用户没有推进到 received 的权限，只能关闭自己的反馈。
+type feedbackCloseRequest struct {
+	Status string `json:"status"`
+}
+
+// handleUpdateFeedback 处理用户侧状态变更：submitted|received -> closed。
+// 已关闭的反馈再次 PATCH 返回 409 FEEDBACK_INVALID_TRANSITION，不允许回退或重复关闭。
+func (s *Server) handleUpdateFeedback(c *gin.Context) {
+	var req feedbackCloseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, CodeInvalidJSON, "请求体不是合法 JSON")
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(req.Status)) != "closed" {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "用户只能关闭反馈，status 必须为 closed")
+		return
+	}
+
+	item, err := s.store.CloseUserFeedback(c.Request.Context(), userID(c), c.Param("feedbackId"))
+	if err != nil {
+		c.Error(err)
+		c.Abort()
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
+// adminFeedbackUpdateRequest 是运营侧 PATCH /admin/feedback/{id} 的请求体。
+// note 为内部备注，可省略；空串视为未提供。
+type adminFeedbackUpdateRequest struct {
+	Status string  `json:"status"`
+	Note   *string `json:"note"`
+}
+
+// handleAdminListFeedback 跨用户返回反馈，可按状态过滤，游标语义与用户列表一致。
+func (s *Server) handleAdminListFeedback(c *gin.Context) {
+	limit, ok := feedbackLimitParam(c)
+	if !ok {
+		return
+	}
+	status, ok := feedbackStatusParam(c)
+	if !ok {
+		return
+	}
+
+	page, err := s.store.ListAdminFeedback(c.Request.Context(), status, c.Query("cursor"), limit)
+	if err != nil {
+		if errors.Is(err, store.ErrBadCursor) {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "cursor 无效")
+			return
+		}
+		s.storeFailure(c, "查询运营反馈列表失败", err)
+		return
+	}
+	c.JSON(http.StatusOK, page)
+}
+
+// handleAdminUpdateFeedback 由运营侧推进状态到 submitted/received/closed。
+// 同状态重复 PATCH 视为幂等 no-op（200，不写审计）；其余非法跳转返回 409。
+func (s *Server) handleAdminUpdateFeedback(c *gin.Context) {
+	var req adminFeedbackUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, CodeInvalidJSON, "请求体不是合法 JSON")
+		return
+	}
+	target := strings.ToLower(strings.TrimSpace(req.Status))
+	if _, ok := feedbackStatuses[target]; !ok {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "status 只能是 submitted、received 或 closed")
+		return
+	}
+
+	var note *string
+	if req.Note != nil {
+		v := strings.TrimSpace(*req.Note)
+		if utf8.RuneCountInString(v) > maxFeedbackNoteRunes {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "note 长度不能超过 2000 个字符")
+			return
+		}
+		if v != "" {
+			note = &v
+		}
+	}
+
+	item, err := s.store.UpdateFeedbackStatus(c.Request.Context(), c.Param("feedbackId"), target, note)
+	if err != nil {
+		c.Error(err)
+		c.Abort()
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
+// feedbackLimitParam 解析 limit，默认 20、范围 1-100；非法时已写出 400。
+func feedbackLimitParam(c *gin.Context) (int, bool) {
+	limit := defaultFeedbackPageSize
+	if raw := c.Query("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxFeedbackPageSize {
+			fail(c, http.StatusBadRequest, CodeBadRequest, "limit 取值范围 1-100")
+			return 0, false
+		}
+		limit = n
+	}
+	return limit, true
+}
+
+// feedbackStatusParam 解析 status 过滤参数；空串表示不过滤，未知值已写出 400。
+func feedbackStatusParam(c *gin.Context) (string, bool) {
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if status == "" {
+		return "", true
+	}
+	if _, ok := feedbackStatuses[status]; !ok {
+		fail(c, http.StatusBadRequest, CodeBadRequest, "status 只能是 submitted、received 或 closed")
+		return "", false
+	}
+	return status, true
 }
 
 // normalizeFeedback 校验并规范化请求；返回非空字符串表示校验失败原因。

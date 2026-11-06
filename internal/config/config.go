@@ -23,10 +23,13 @@ type Config struct {
 	PairingClaimBurst  int
 	// FeedbackUserPerMin / FeedbackUserBurst 是反馈接口按账号的每分钟令牌数，
 	// FeedbackIPPerMin / FeedbackIPBurst 是按来源 IP 的额度；两个维度同时生效。
-	FeedbackUserPerMin  int
-	FeedbackUserBurst   int
-	FeedbackIPPerMin    int
-	FeedbackIPBurst     int
+	FeedbackUserPerMin int
+	FeedbackUserBurst  int
+	FeedbackIPPerMin   int
+	FeedbackIPBurst    int
+	// AdminToken 是运营侧受理入口的独立凭据（请求头 X-Admin-Token）。
+	// 为空表示运维入口整体关闭：相关路由一律返回 404，不暴露接口是否存在。
+	AdminToken          string
 	MetricsEnabled      bool
 	RunMigrationsOnBoot bool
 	CORSAllowedOrigins  []string
@@ -57,6 +60,7 @@ func Load() (Config, error) {
 		FeedbackUserBurst:   getEnvInt("FEEDBACK_USER_BURST", 5),
 		FeedbackIPPerMin:    getEnvInt("FEEDBACK_IP_RATE_PER_MINUTE", 30),
 		FeedbackIPBurst:     getEnvInt("FEEDBACK_IP_BURST", 10),
+		AdminToken:          getEnv("ADMIN_TOKEN", ""),
 		MetricsEnabled:      getEnvBool("METRICS_ENABLED", true),
 		RunMigrationsOnBoot: getEnvBool("RUN_MIGRATIONS_ON_BOOT", true),
 		LogLevel:            parseLogLevel(getEnv("LOG_LEVEL", "info")),
@@ -64,7 +68,7 @@ func Load() (Config, error) {
 		ShutdownDrain:       time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
 		InstanceID:          getEnv("INSTANCE_ID", ""),
 		TokenTTLDays:        getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:             getEnv("APP_VERSION", "0.16.0"),
+		Version:             getEnv("APP_VERSION", "0.17.0"),
 	}
 
 	origins := getEnv("CORS_ALLOWED_ORIGINS", "*")

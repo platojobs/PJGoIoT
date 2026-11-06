@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.12.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.12.0", got)
+	if got := info["version"]; got != "0.13.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.13.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -90,6 +90,127 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	if _, ok := codeEnum[httpapi.CodeIdempotencyConflict]; !ok {
 		t.Fatalf("错误码枚举缺少 %s", httpapi.CodeIdempotencyConflict)
 	}
+	// 状态流转新增的错误码必须出现在契约枚举中。
+	if _, ok := codeEnum[httpapi.CodeFeedbackInvalidTransition]; !ok {
+		t.Fatalf("错误码枚举缺少 %s: %v", httpapi.CodeFeedbackInvalidTransition, codeEnum)
+	}
+
+	// GET /feedback/mine 支持按状态过滤，枚举需与实现常量一致。
+	statusParam := findParam(t, listOp, "status")
+	if got := stringSet(enumOf(t, statusParam)); !reflect.DeepEqual(got,
+		stringSet([]string{"submitted", "received", "closed"})) {
+		t.Fatalf("/feedback/mine status enum=%v", got)
+	}
+
+	// 用户侧单条详情：字段与 model.FeedbackDetail 完全一致，且不得出现个人信息。
+	detailPath := digMap(t, paths, "/feedback/{feedbackId}")
+	getOp := digMap(t, detailPath, "get")
+	if getOp["operationId"] != "getMyFeedback" {
+		t.Fatalf("operationId=%v", getOp["operationId"])
+	}
+	patchOp := digMap(t, detailPath, "patch")
+	if patchOp["operationId"] != "closeMyFeedback" {
+		t.Fatalf("operationId=%v", patchOp["operationId"])
+	}
+	detail := digMap(t, schemas, "FeedbackDetail")
+	detailProps := digMap(t, detail, "properties")
+	wantDetail := jsonFieldSet(t, model.FeedbackDetail{})
+	if got := stringSet(asStrings(t, detail["required"])); !reflect.DeepEqual(got, wantDetail) {
+		t.Fatalf("FeedbackDetail required=%v，模型字段=%v", got, wantDetail)
+	}
+	if got := stringSet(propsOf(detailProps)); !reflect.DeepEqual(got, wantDetail) {
+		t.Fatalf("FeedbackDetail properties=%v，模型字段=%v", got, wantDetail)
+	}
+	for _, forbidden := range []string{"contact", "diagnostics"} {
+		if _, ok := detailProps[forbidden]; ok {
+			t.Fatalf("FeedbackDetail 不应暴露 %s", forbidden)
+		}
+	}
+	if got := stringSet(enumOf(t, digMap(t, detailProps, "status"))); !reflect.DeepEqual(got,
+		stringSet([]string{"submitted", "received", "closed"})) {
+		t.Fatalf("FeedbackDetail status enum=%v", got)
+	}
+
+	// 用户侧关闭请求只能提交 closed。
+	closeReq := digMap(t, schemas, "FeedbackCloseRequest")
+	if got := stringSet(enumOf(t, digMap(t, digMap(t, closeReq, "properties"), "status"))); !reflect.DeepEqual(got,
+		stringSet([]string{"closed"})) {
+		t.Fatalf("FeedbackCloseRequest status enum=%v", got)
+	}
+	assertRef(t, getOp, "200", "#/components/schemas/FeedbackDetail")
+	assertRef(t, patchOp, "200", "#/components/schemas/FeedbackDetail")
+
+	// 运营侧：跨用户列表与状态推进，标注为内部接口且使用独立凭据。
+	adminListPath := digMap(t, paths, "/admin/feedback")
+	adminListOp := digMap(t, adminListPath, "get")
+	adminPatchPath := digMap(t, paths, "/admin/feedback/{feedbackId}")
+	adminPatchOp := digMap(t, adminPatchPath, "patch")
+	for name, op := range map[string]map[string]any{"adminList": adminListOp, "adminPatch": adminPatchOp} {
+		if op["x-audience"] != "internal" || op["x-client-sdk"] != false {
+			t.Fatalf("%s 未标注为内部接口（不在公开客户端 SDK）", name)
+		}
+		if !hasSecurityScheme(t, op, "adminToken") {
+			t.Fatalf("%s 未使用 adminToken 凭据", name)
+		}
+	}
+	if got := stringSet(enumOf(t, findParam(t, adminListOp, "status"))); !reflect.DeepEqual(got,
+		stringSet([]string{"submitted", "received", "closed"})) {
+		t.Fatalf("/admin/feedback status enum=%v", got)
+	}
+	adminItem := digMap(t, schemas, "AdminFeedbackItem")
+	adminProps := digMap(t, adminItem, "properties")
+	allAdminFields := jsonFieldSet(t, model.AdminFeedback{})
+	if got := stringSet(propsOf(adminProps)); !reflect.DeepEqual(got, allAdminFields) {
+		t.Fatalf("AdminFeedbackItem properties=%v，模型字段=%v", got, allAdminFields)
+	}
+	if got := stringSet(asStrings(t, adminItem["required"])); !reflect.DeepEqual(got, jsonRequiredSet(t, model.AdminFeedback{})) {
+		t.Fatalf("AdminFeedbackItem required=%v，模型必填字段=%v", got, jsonRequiredSet(t, model.AdminFeedback{}))
+	}
+	// 运营视图必须能看到个人信息与内部备注（与用户侧相反）。
+	for _, required := range []string{"contact", "diagnostics", "internalNote"} {
+		if _, ok := adminProps[required]; !ok {
+			t.Fatalf("AdminFeedbackItem 缺少 %s", required)
+		}
+	}
+	adminPatchReq := digMap(t, schemas, "AdminFeedbackUpdateRequest")
+	if got := stringSet(enumOf(t, digMap(t, digMap(t, adminPatchReq, "properties"), "status"))); !reflect.DeepEqual(got,
+		stringSet([]string{"submitted", "received", "closed"})) {
+		t.Fatalf("AdminFeedbackUpdateRequest status enum=%v", got)
+	}
+	assertRef(t, adminListOp, "200", "#/components/schemas/AdminFeedbackPage")
+	assertRef(t, adminPatchOp, "200", "#/components/schemas/AdminFeedbackItem")
+}
+
+// findParam 按 name 定位查询/路径参数，返回其 schema。
+func findParam(t *testing.T, op map[string]any, name string) map[string]any {
+	t.Helper()
+	list, ok := op["parameters"].([]any)
+	if !ok {
+		t.Fatalf("operation 缺少 parameters")
+	}
+	for _, raw := range list {
+		param := asMapAny(t, raw)
+		if param["name"] == name {
+			return digMap(t, param, "schema")
+		}
+	}
+	t.Fatalf("缺少参数 %s", name)
+	return nil
+}
+
+// hasSecurityScheme 判断 operation 的 security 列表是否包含指定 scheme。
+func hasSecurityScheme(t *testing.T, op map[string]any, scheme string) bool {
+	t.Helper()
+	list, ok := op["security"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range list {
+		if _, ok := asMapAny(t, raw)[scheme]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func loadOpenAPIDoc(t *testing.T) map[string]any {
@@ -164,6 +285,30 @@ func stringSet(list []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(list))
 	for _, s := range list {
 		out[s] = struct{}{}
+	}
+	return out
+}
+
+// jsonRequiredSet 提取不带 omitempty 的 JSON 字段，对应契约中的 required 集合。
+func jsonRequiredSet(t *testing.T, v any) map[string]struct{} {
+	t.Helper()
+	out := map[string]struct{}{}
+	typ := reflect.TypeOf(v)
+	for i := 0; i < typ.NumField(); i++ {
+		parts := strings.Split(typ.Field(i).Tag.Get("json"), ",")
+		name := parts[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		optional := false
+		for _, p := range parts[1:] {
+			if p == "omitempty" {
+				optional = true
+			}
+		}
+		if !optional {
+			out[name] = struct{}{}
+		}
 	}
 	return out
 }

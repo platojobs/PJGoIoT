@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.12.0
+  version: 0.13.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -36,6 +36,14 @@ info:
       提交按幂等键去重（客户端 `Idempotency-Key` 或规范化请求体哈希），重复提交返回同一 `feedbackId`；
       列表只返回本人数据，联系方式与诊断文本不进入列表响应；提交同时受账号与 IP 双维度限流
       （`429 FEEDBACK_RATE_LIMITED`）。
+    - 自契约 `0.13.0`（服务 v0.17.0）起反馈支持状态流转：用户可读取单条详情
+      （`GET /feedback/{feedbackId}`）并关闭自己的反馈（`PATCH /feedback/{feedbackId}`，目标状态只能是 `closed`）；
+      `GET /feedback/mine` 支持 `status` 过滤。状态机为 `submitted → received → closed`，
+      允许 `submitted → closed` 与误受理回退 `received → submitted`，其余跳转返回
+      `409 FEEDBACK_INVALID_TRANSITION`。
+      **运营侧**另有独立凭据的内部入口 `GET|PATCH /admin/feedback`（请求头 `X-Admin-Token`，
+      由环境变量 `ADMIN_TOKEN` 配置；未配置时整组返回 404）。该入口**不在公开客户端 SDK 中**，
+      仅运维系统与内部工具使用。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -51,6 +59,8 @@ tags:
   - name: sync
   - name: household
   - name: feedback
+  - name: admin
+    description: 运营侧内部入口；使用独立 admin 凭据，不在公开客户端 SDK 中
 
 paths:
   /health:
@@ -70,7 +80,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.12.0"
+                version: "0.13.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -1760,6 +1770,13 @@ paths:
       security:
         - bearerAuth: []
       parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按状态过滤；省略表示全部状态
+          schema:
+            type: string
+            enum: [submitted, received, closed]
         - name: cursor
           in: query
           required: false
@@ -1786,6 +1803,209 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /feedback/{feedbackId}:
+    get:
+      tags: [feedback]
+      operationId: getMyFeedback
+      summary: 查看本人单条反馈详情
+      description: |
+        只返回当前 token 对应账号的反馈；不存在或属于他人一律 `404 NOT_FOUND`，不暴露资源是否存在。
+
+        响应包含 `statusMessage`（给用户看的中文状态说明）与 `updatedAt`；
+        与列表一致，**不返回** `contact` 与 `diagnostics`。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/FeedbackId"
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
+    patch:
+      tags: [feedback]
+      operationId: closeMyFeedback
+      summary: 关闭本人反馈
+      description: |
+        允许本人把自己的反馈关闭：`submitted|received → closed`。
+
+        用户侧**只能**提交 `status=closed`；尝试推进到 `received` 返回 `400 BAD_REQUEST`。
+        已关闭的反馈再次 PATCH 返回 `409 FEEDBACK_INVALID_TRANSITION`，不允许回退或重复关闭。
+        成功后返回与详情接口相同结构，`updatedAt` 为本次变更时间。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/FeedbackId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackCloseRequest"
+      responses:
+        "200":
+          description: 关闭成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: 该反馈已关闭，或状态机不允许该跳转
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: FEEDBACK_INVALID_TRANSITION
+                  message: "反馈状态不允许该变更（已关闭的反馈不能再次修改）"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /admin/feedback:
+    get:
+      tags: [admin]
+      operationId: adminListFeedback
+      summary: 运营侧跨用户查询反馈
+      description: |
+        **内部接口，不在公开客户端 SDK 中。** 仅运维系统与内部工具使用。
+
+        使用独立的 `X-Admin-Token` 头鉴权（服务端由环境变量 `ADMIN_TOKEN` 配置），
+        与客户端 Bearer token 完全独立；未配置 `ADMIN_TOKEN` 时本组接口统一返回 `404`，
+        与不存在的路由不可区分。
+
+        跨用户返回反馈，可按状态过滤，按 `createdAt` 倒序游标分页；
+        响应包含联系方式、诊断文本与内部备注，**不得**暴露给终端用户。
+      security:
+        - adminToken: []
+      x-audience: internal
+      x-client-sdk: false
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按状态过滤；省略表示全部状态
+          schema:
+            type: string
+            enum: [submitted, received, closed]
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页返回的 nextCursor；首页省略
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数，默认 20，范围 1-100
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: 查询成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminFeedbackPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 运维入口未启用（未配置 ADMIN_TOKEN）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: "接口不存在"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /admin/feedback/{feedbackId}:
+    patch:
+      tags: [admin]
+      operationId: adminUpdateFeedback
+      summary: 运营侧推进反馈状态
+      description: |
+        **内部接口，不在公开客户端 SDK 中。** 仅运维系统与内部工具使用。
+
+        把反馈状态推进到 `submitted` / `received` / `closed`，可附带一条内部备注
+        （`note`，最长 2000 字符；**不对用户回显**）。
+
+        状态机：`submitted → received → closed`，允许 `submitted → closed`；
+        `received` 可回退到 `submitted`（误受理）。其余跳转返回 `409 FEEDBACK_INVALID_TRANSITION`。
+
+        幂等：目标状态与当前状态相同时返回 `200`，不改 `updatedAt`、不追加审计、忽略本次备注。
+        每次真实状态变更都会在同一事务内写入一条审计记录（谁、从什么状态到什么状态、时间、备注）。
+      security:
+        - adminToken: []
+      x-audience: internal
+      x-client-sdk: false
+      parameters:
+        - $ref: "#/components/parameters/FeedbackId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminFeedbackUpdateRequest"
+            example:
+              status: received
+              note: "已复现，转交客户端组"
+      responses:
+        "200":
+          description: 更新成功（含幂等 no-op）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminFeedbackItem"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 反馈不存在，或运维入口未启用（未配置 ADMIN_TOKEN）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: "资源不存在或无权访问"
+        "409":
+          description: 状态机不允许该跳转
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: FEEDBACK_INVALID_TRANSITION
+                  message: "反馈状态不允许该变更（已关闭的反馈不能再次修改）"
         "503":
           $ref: "#/components/responses/Timeout"
 
@@ -1845,8 +2065,24 @@ components:
       scheme: bearer
       bearerFormat: opaque-token
       description: POST /auth/anonymous 返回的不透明 token；服务端仅存哈希，可通过 POST /auth/logout 吊销。收到 401 时应提示重新登录，不要自动创建新匿名账号。
+    adminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: |
+        运营侧内部凭据，由服务端环境变量 `ADMIN_TOKEN` 配置，与客户端 Bearer token 完全独立。
+        未配置 `ADMIN_TOKEN` 时所有 admin 接口返回 404；配置后凭据缺失或错误返回 401。
+        该凭据不得下发到客户端，也不得写入公开 SDK。
 
   parameters:
+    FeedbackId:
+      name: feedbackId
+      in: path
+      required: true
+      description: 反馈 id（UUID）
+      schema:
+        type: string
+        format: uuid
     Mac:
       name: mac
       in: path
@@ -2061,6 +2297,7 @@ components:
                 - TIMEOUT
                 - ROOM_SET_MISMATCH
                 - FEEDBACK_RATE_LIMITED
+                - FEEDBACK_INVALID_TRANSITION
             message:
               type: string
               description: 面向开发者的说明，不应作为分支依据
@@ -3206,3 +3443,127 @@ components:
           description: 下一页游标；`hasMore=false` 时为空串
         hasMore:
           type: boolean
+
+    FeedbackDetail:
+      type: object
+      description: 本人单条反馈详情；含状态说明，不含 contact 与 diagnostics
+      required: [feedbackId, kind, body, platform, appVersion, buildType, osVersion, deviceModel, status, statusMessage, createdAt, updatedAt]
+      properties:
+        feedbackId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [bug, feature, experience, other]
+        body:
+          type: string
+        platform:
+          type: string
+          enum: [android, ios]
+        appVersion:
+          type: string
+        buildType:
+          type: string
+        osVersion:
+          type: string
+        deviceModel:
+          type: string
+        status:
+          type: string
+          enum: [submitted, received, closed]
+        statusMessage:
+          type: string
+          description: 给用户看的状态说明，如「已受理，工作人员正在处理」
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+          description: 最近一次状态变更时间；未变更时等于 createdAt
+
+    FeedbackCloseRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [closed]
+          description: 用户侧只允许关闭，固定为 closed
+
+    AdminFeedbackItem:
+      type: object
+      description: 运营侧反馈视图；含联系方式、诊断与内部备注，不得暴露给终端用户
+      required: [feedbackId, userId, kind, body, platform, appVersion, buildType, osVersion, deviceModel, status, createdAt, updatedAt]
+      properties:
+        feedbackId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [bug, feature, experience, other]
+        body:
+          type: string
+        contact:
+          type: string
+          nullable: true
+          description: 提交人可选联系方式（个人信息）
+        platform:
+          type: string
+          enum: [android, ios]
+        appVersion:
+          type: string
+        buildType:
+          type: string
+        osVersion:
+          type: string
+        deviceModel:
+          type: string
+        diagnostics:
+          type: string
+          nullable: true
+          description: 提交人可选诊断文本
+        status:
+          type: string
+          enum: [submitted, received, closed]
+        internalNote:
+          type: string
+          nullable: true
+          description: 最近一条内部备注；不对用户回显
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    AdminFeedbackPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminFeedbackItem"
+        nextCursor:
+          type: string
+          description: 下一页游标；`hasMore=false` 时为空串
+        hasMore:
+          type: boolean
+
+    AdminFeedbackUpdateRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [submitted, received, closed]
+          description: 目标状态；与当前状态相同时为幂等 no-op
+        note:
+          type: string
+          nullable: true
+          maxLength: 2000
+          description: 可选内部备注；不对用户回显，空白视为未提供

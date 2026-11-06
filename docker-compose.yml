@@ -9,15 +9,15 @@ x-api-common: &api-common
   build:
     context: .
     args:
-      APP_VERSION: "0.16.0"
+      APP_VERSION: "0.17.0"
       GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
-  image: pjgoiot-api:0.16.0
+  image: pjgoiot-api:0.17.0
   restart: unless-stopped
   environment: &api-env
     STORE: postgres
     DATABASE_URL: postgres://${POSTGRES_USER:-pjgoiot}:${POSTGRES_PASSWORD:-pjgoiot-local-only}@postgres:5432/${POSTGRES_DB:-pjgoiot}?sslmode=disable
     ADDR: ":8080"
-    APP_VERSION: "0.16.0"
+    APP_VERSION: "0.17.0"
     # 启动即迁移；golang-migrate 自带数据库级 advisory lock，双实例同时启动时
     # 只有一个实例真正执行迁移，另一个等待锁后发现已是最新版本。
     RUN_MIGRATIONS_ON_BOOT: "${RUN_MIGRATIONS_ON_BOOT:-true}"
@@ -28,6 +28,13 @@ x-api-common: &api-common
     RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-40}"
     PAIRING_CLAIM_RATE_PER_MINUTE: "${PAIRING_CLAIM_RATE_PER_MINUTE:-20}"
     PAIRING_CLAIM_BURST: "${PAIRING_CLAIM_BURST:-10}"
+    # 反馈提交双维度限流（账号 + IP），超限返回 429 FEEDBACK_RATE_LIMITED。
+    FEEDBACK_USER_RATE_PER_MINUTE: "${FEEDBACK_USER_RATE_PER_MINUTE:-10}"
+    FEEDBACK_USER_BURST: "${FEEDBACK_USER_BURST:-5}"
+    FEEDBACK_IP_RATE_PER_MINUTE: "${FEEDBACK_IP_RATE_PER_MINUTE:-30}"
+    FEEDBACK_IP_BURST: "${FEEDBACK_IP_BURST:-10}"
+    # 运营侧 /admin/feedback 的独立凭据；留空即关闭该入口（整组 404）。
+    ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
     CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
     LOG_LEVEL: "${LOG_LEVEL:-info}"
     # token 有效期（天）；过期后中间件返回 401，cleanup 负责删除。
@@ -133,9 +140,9 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "0.16.0"
+        APP_VERSION: "0.17.0"
         GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}"
-    image: pjgoiot-api:0.16.0
+    image: pjgoiot-api:0.17.0
     entrypoint: ["/cleanup"]
     command:
       - "-retention-days"

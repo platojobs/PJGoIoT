@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"regexp"
@@ -218,6 +220,34 @@ func routeLabel(c *gin.Context) string {
 		return "/api/v1/my/devices/:platform/:externalId/readings/" + parts[3]
 	default:
 		return full
+	}
+}
+
+// requireAdmin 校验运营侧凭据（请求头 X-Admin-Token），与客户端 Bearer token 完全独立。
+//
+// 两种失败语义严格区分：
+//   - 未配置 ADMIN_TOKEN：返回 404，与不存在的路由一致，不暴露运维入口是否存在；
+//   - 已配置但凭据缺失/错误：返回 401，明确需要正确凭据。
+//
+// 比较前先把两侧各自 SHA-256 成等长摘要，再用 subtle.ConstantTimeCompare，
+// 避免按字符串长度提前返回而泄露凭据长度。
+func (s *Server) requireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		expected := s.cfg.AdminToken
+		if expected == "" {
+			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "接口不存在")
+			c.Abort()
+			return
+		}
+		provided := c.GetHeader("X-Admin-Token")
+		sumProvided := sha256.Sum256([]byte(provided))
+		sumExpected := sha256.Sum256([]byte(expected))
+		if subtle.ConstantTimeCompare(sumProvided[:], sumExpected[:]) != 1 {
+			writeError(c.Writer, http.StatusUnauthorized, CodeUnauthorized, "admin 凭据缺失或无效")
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
 

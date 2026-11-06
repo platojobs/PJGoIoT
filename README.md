@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.12.0**（v0.16.0 新增意见反馈 `POST /feedback` 与 `GET /feedback/mine`）；服务版本 **v0.16.0**（意见反馈闭环）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.13.0**（v0.17.0 新增反馈详情、用户关闭、运营受理与状态流转）；服务版本 **v0.17.0**（反馈状态流转）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -248,9 +248,10 @@ make dev-postgres   # Postgres 模式启动 API
 - **向后兼容**：客户端必须忽略未知 `entity` 并照常推进 `nextCursor`；payload 字段只加不删。
 - **90 天保留与 410**：结构变更同样受 `change_log` 保留期约束，`cursor` 早于最老 `seq` 时返回 `410 RESYNC_REQUIRED`。
 
-### 意见反馈（v0.16.0）
+### 意见反馈（v0.16.0 提交与列表，v0.17.0 状态流转）
 
-客户端此前只能把反馈写入本地待发队列并标注「未发送」；v0.16.0 补上服务端接收与本人查询，形成真闭环。
+客户端此前只能把反馈写入本地待发队列并标注「未发送」；v0.16.0 补上服务端接收与本人查询，
+v0.17.0 再补上详情、用户关闭与运营受理，使 `submitted → received → closed` 有真实路径。
 
 **提交 `POST /feedback`**：
 
@@ -283,16 +284,53 @@ make dev-postgres   # Postgres 模式启动 API
   参数可分别用 `FEEDBACK_USER_RATE_PER_MINUTE` / `FEEDBACK_USER_BURST` /
   `FEEDBACK_IP_RATE_PER_MINUTE` / `FEEDBACK_IP_BURST` 覆盖；`RATE_LIMIT_BACKEND=postgres` 时与全局限流共用共享桶。
 
-**查看 `GET /feedback/mine?cursor=&limit=`**：
+**查看 `GET /feedback/mine?status=&cursor=&limit=`**：
 
 - 只返回当前 token 对应账号的数据，按 `createdAt` 倒序游标分页（默认 20，最大 100），
   响应 `{items,nextCursor,hasMore}`；状态 `submitted` / `received` / `closed`。
 - 响应项不含 `contact` 与 `diagnostics`：联系方式属于个人信息，诊断文本体积大且仅用于服务端排查。
-  不存在「按 id 读取他人反馈」的接口，列表隔离即为跨账号访问边界。
+- 自 v0.17.0 起支持 `?status=submitted|received|closed` 过滤；空串不过滤，未知值返回 `400 BAD_REQUEST`，
+  游标语义不变。
 - 联系方式不会写入日志明文。
+
+**详情 `GET /feedback/{feedbackId}`（v0.17.0）**：
+
+- 只返回本人反馈；不存在或属于他人一律 `404 NOT_FOUND`，不泄露资源是否存在。
+- 返回 `kind`、`body`、`status`、`createdAt`、`updatedAt` 与 `statusMessage`（给用户看的中文说明，
+  如「已提交，等待处理」「已受理，工作人员正在处理」「已关闭」）；**不回显** `contact` 与 `diagnostics`。
+
+**关闭 `PATCH /feedback/{feedbackId}`（v0.17.0）**：
+
+- 请求体必须是 `{"status":"closed"}`；用户侧只能关闭，提交其他目标状态返回 `400 BAD_REQUEST`。
+- 允许 `submitted → closed` 与 `received → closed`；已关闭的反馈再次 PATCH 返回
+  `409 FEEDBACK_INVALID_TRANSITION`，不允许回退或重复关闭。
+
+**状态机**：`submitted → received → closed`，允许 `submitted → closed`；`received` 可回退到 `submitted`
+（误受理）。其余跳转（如 `closed → received` / `closed → submitted`）一律 `409 FEEDBACK_INVALID_TRANSITION`。
+
+**运营受理入口（v0.17.0，内部接口，不在公开客户端 SDK 中）**：
+
+- `GET /admin/feedback?status=&cursor=&limit=`：跨用户查询，按状态与时间过滤，游标语义与用户列表一致；
+  响应含 `contact`、`diagnostics` 与 `internalNote`，**不得暴露给终端用户**。
+- `PATCH /admin/feedback/{feedbackId}`：请求体 `{"status":"submitted|received|closed","note":"..."}`，
+  `note` 最长 2000 字符、可为空；内部备注只在运营视图回显，用户侧接口不会出现。
+  目标状态与当前状态相同时返回 `200` 幂等 no-op（不改 `updatedAt`、不追加审计、忽略本次备注）。
+- **鉴权**：独立凭据 `X-Admin-Token`，由环境变量 `ADMIN_TOKEN` 配置；与客户端 Bearer token 完全独立，
+  两者不可互相替代。比较前对两侧取 SHA-256 摘要再用 `crypto/subtle.ConstantTimeCompare`，
+  避免按长度提前返回。
+- **默认关闭**：未配置 `ADMIN_TOKEN` 时整组接口返回 `404`（与不存在的路由不可区分，不暴露存在性）；
+  配置后凭据缺失或错误返回 `401 UNAUTHORIZED`。
+- **审计**：每次真实状态变更在同一事务内写一条 `feedback_status_events` 记录
+  （`actor_type`、`actor_id`、`from_status`、`to_status`、`note`、`created_at`）。
+  共享 admin token 没有个人身份，因此 admin 变更统一记 `actor_type=admin` / `actor_id=admin`；
+  用户关闭记 `actor_type=user` / `actor_id=<userID>`。`feedback.internal_note` 只保存最新一条备注，
+  历史备注以审计表为准。
 
 **数据落点**：现有 `user_devices` / `households` / `readings` 都不承载自由文本反馈，因此新增独立表
 `feedback`（迁移 `000013`），索引 `(user_id, created_at DESC, id)` 与唯一索引 `(user_id, idem_key)`。
+v0.17.0 的 `000014_feedback_status_workflow` 补 `internal_note` 列、`(status, created_at DESC, id)`
+索引与审计表 `feedback_status_events`（`feedback_id` 外键 `ON DELETE CASCADE`）。
+`feedback.updated_at` 与 status 的 `CHECK` 约束在 `000013` 已存在，`000014` 不重复添加。
 账号注销时 `ON DELETE CASCADE` 一并删除。
 
 ### 设备详情与市场字段（v0.3.2）
@@ -1224,12 +1262,13 @@ PJGoIoT/
 | `FEEDBACK_USER_BURST` | `5` | 反馈提交按账号的令牌桶容量（允许的瞬时连发数） |
 | `FEEDBACK_IP_RATE_PER_MINUTE` | `30` | 反馈提交按来源 IP 的每分钟令牌数 |
 | `FEEDBACK_IP_BURST` | `10` | 反馈提交按来源 IP 的令牌桶容量 |
+| `ADMIN_TOKEN` | 空 | 运营侧 `/admin/feedback` 的独立凭据（请求头 `X-Admin-Token`）；为空表示入口关闭，整组返回 404 |
 | `METRICS_ENABLED` | `true` | 是否注册根路径 `/metrics`；生产可关闭或仅内网暴露 |
 | `RUN_MIGRATIONS_ON_BOOT` | `true` | postgres 模式下启动时执行迁移；失败进程非零退出（fixture 模式忽略） |
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.16.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.12.0 不是同一个号 |
+| `APP_VERSION` | `0.17.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.13.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1393,6 +1432,12 @@ seed 数据来源与边界：
 | v0.16.0 迁移 | 通过：`000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（回到 000012）→ up`，并断言 `feedback_user_created_idx` 与 `feedback_user_idem_idx` 存在、回滚不影响用户数据 |
 | v0.16.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 **0.12.0** |
 | v0.16.0 CI | 通过：GitHub Actions [run 42077337348](https://github.com/platojobs/PJGoIoT/actions/runs/42077337348) 四 job 全绿；日志确认 `TestPostgresFeedbackIntegration` 全部 PASS，`OpenAPI 契约校验` 读到 `version: 0.12.0`；`单元测试` 中 `internal/httpapi`（含契约一致性测试）为 ok |
+| v0.17.0 状态机与审计 | 通过（真实 PostgreSQL）：`TestPostgresFeedbackLifecycleIntegration` 覆盖用户关闭本人、已关闭再改 409、跨用户读写 404、`submitted→received→submitted→closed`、`closed→received/submitted` 409、跨用户列表状态过滤、审计表逐条比对（actor/from/to/note） |
+| v0.17.0 幂等与 admin | 通过（真实 PostgreSQL）：同状态重复 PATCH 返回 200、`updatedAt` 不变、审计只增 1 条且备注不被覆盖；HTTP 层 admin 未配置 404、错误凭据 401、客户端 token 不能替代 admin 凭据、正确凭据 200 |
+| v0.17.0 HTTP 鉴权矩阵 | 通过：`TestFeedbackDetailAndClose` 与 `TestAdminFeedbackAuthMatrixAndTransitions`（fixture）覆盖用户 token / admin token / 无 token 三态、错误码与状态码一致、用户详情与列表不回显 `contact`/`diagnostics`/`internalNote` |
+| v0.17.0 契约一致性 | 通过：`TestOpenAPIFeedbackContract` 比对 `FeedbackDetail` / `AdminFeedbackItem` 的 properties/required 与模型 JSON 字段、`FeedbackCloseRequest` 与 admin 目标状态枚举、admin 路径 `x-audience: internal` / `x-client-sdk: false`、错误码枚举含 `FEEDBACK_INVALID_TRANSITION` |
+| v0.17.0 迁移 | 通过：`000014_feedback_status_workflow` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000013）→ up`，断言 `internal_note`、审计表、`feedback_status_created_idx` 存在且回滚不破坏反馈表与用户数据 |
+| v0.17.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 **0.13.0** |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1492,8 +1537,8 @@ git push origin main
 gh run watch --exit-status
 
 # 4. 打 annotated tag 并推送（不要动历史 tag）
-git tag -a v0.16.0 -m 'v0.16.0: 意见反馈提交与本人列表（幂等 + 双维度限流）'
-git push origin v0.16.0
+git tag -a v0.17.0 -m 'v0.17.0: 反馈状态流转（用户关闭 + 运营受理 + 审计）'
+git push origin v0.17.0
 ```
 
 - CI 的 `OpenAPI 契约校验` 步骤（`npx @redocly/cli lint api/openapi.yaml`）是发布门槛，失败即不发 tag。

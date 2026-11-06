@@ -42,6 +42,9 @@ const (
 	// CodeFeedbackRateLimited 表示反馈提交超过账号或 IP 维度的额度；
 	// 与全局 RATE_LIMITED 区分，便于客户端提示「反馈提交过于频繁」而不是泛化重试。
 	CodeFeedbackRateLimited = "FEEDBACK_RATE_LIMITED"
+	// CodeFeedbackInvalidTransition 表示反馈状态机不允许该跳转（含对已关闭反馈的任何推进）。
+	// 与 CONFLICT 区分，客户端可直接提示「该反馈已关闭」而不是泛化冲突重试。
+	CodeFeedbackInvalidTransition = "FEEDBACK_INVALID_TRANSITION"
 )
 
 type errorBody struct {
@@ -142,6 +145,8 @@ func (s *Server) errorHandler() gin.HandlerFunc {
 			writeError(c.Writer, http.StatusConflict, CodeRoomSetMismatch, "房间排序列表与当前房间不一致，请刷新后整段重新提交")
 		case errors.Is(last, store.ErrNotFound):
 			writeError(c.Writer, http.StatusNotFound, CodeNotFound, "资源不存在或无权访问")
+		case errors.Is(last, store.ErrFeedbackInvalidTransition):
+			writeError(c.Writer, http.StatusConflict, CodeFeedbackInvalidTransition, "反馈状态不允许该变更（已关闭的反馈不能再次修改）")
 		case errors.Is(last, store.ErrIdempotencyConflict):
 			writeError(c.Writer, http.StatusConflict, CodeIdempotencyConflict, "该 Idempotency-Key 已用于不同的请求体")
 		case errors.Is(last, store.ErrDuplicateDevice):

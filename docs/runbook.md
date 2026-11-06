@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.16.0）
+# PJGoIoT 运行手册（v0.17.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -73,6 +73,12 @@
 | v0.16.0 迁移 | **已验证** | `000013_feedback` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000012）→ up`，索引 `feedback_user_created_idx` / `feedback_user_idem_idx` 存在 |
 | v0.16.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**；契约版本 0.12.0 |
 | v0.16.0 CI | **已验证** | GitHub Actions [run 42077337348](https://github.com/platojobs/PJGoIoT/actions/runs/42077337348) 四 job 全绿；`TestPostgresFeedbackIntegration` 全部 PASS，OpenAPI lint 读到 `version: 0.12.0` |
+| v0.17.0 状态机与审计 | **已验证** | 真实 PG `TestPostgresFeedbackLifecycleIntegration`：用户关闭本人、已关闭再改 409、跨用户读写 404、`submitted→received→submitted→closed`、`closed→received/submitted` 409；审计表逐条比对 actor/from/to/note |
+| v0.17.0 幂等与 admin | **已验证** | 同状态重复 PATCH 返回 200、`updatedAt` 不变、审计只增 1 条、备注不被覆盖；HTTP 层 admin 未配置 404、错误凭据 401、客户端 token 不可替代 admin 凭据、正确凭据 200 |
+| v0.17.0 HTTP 鉴权矩阵 | **已验证** | `TestFeedbackDetailAndClose` + `TestAdminFeedbackAuthMatrixAndTransitions`：三态鉴权、错误码与状态码一致、用户侧不回显 `contact`/`diagnostics`/`internalNote` |
+| v0.17.0 契约一致性 | **已验证** | `TestOpenAPIFeedbackContract`：新 schema 字段与模型 JSON 标签一致、枚举对齐、admin 路径 `x-audience: internal` / `x-client-sdk: false`、错误码含 `FEEDBACK_INVALID_TRANSITION` |
+| v0.17.0 迁移 | **已验证** | `000014_feedback_status_workflow` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000013）→ up`，`internal_note`、审计表、`feedback_status_created_idx` 均存在且回滚不破坏反馈表与用户数据 |
+| v0.17.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 0.13.0 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -757,7 +763,7 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
 - 设备归属变更仍走已有的 `user_device` 变更，不会重复写结构变更；查家庭内设备变更归属看
   `change_log.household_id`，查结构变更看 `user_id` 扇出。
 
-### 7.14 意见反馈接口排障（v0.16.0）
+### 7.14 意见反馈接口排障（v0.16.0 提交/列表，v0.17.0 状态流转）
 
 - **429 `FEEDBACK_RATE_LIMITED`**：账号与 IP 双维度独立计数，默认账号 10/min（桶 5）、IP 30/min（桶 10）。
   先看 `FEEDBACK_USER_*` / `FEEDBACK_IP_*`，再按访问日志的 `ip` 与 `user_id` 判断是单个账号刷量还是共享出口 IP；
@@ -766,10 +772,29 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   不要在内容变化后复用旧 key；未携带 key 时服务端按规范化请求体哈希去重，不会出现该冲突。
 - **重复提交仍返回同一条**：响应码 `200` 且带 `Idempotent-Replayed: true` 属于正常幂等重放，不是新建。
 - **列表看不到刚提交的反馈**：确认请求 token 与提交时是同一账号；`GET /feedback/mine` 不存在跨账号读取路径。
-  当前没有后台受理工作流，状态会停留在 `submitted`（已知限制）。
-- **个人信息核查**：`contact` 只落 `feedback.contact` 列，不出现在列表响应；排查时不要把它拼进日志或告警文本。
-  需要核查可直接查库：`SELECT id, user_id, created_at, status FROM feedback ORDER BY created_at DESC LIMIT 20;`
-- **账号注销**：`feedback.user_id` 为 `ON DELETE CASCADE`，注销后自动清理，无需额外清理任务。
+  若带了 `?status=`，确认状态拼写为 `submitted` / `received` / `closed`，未知值会返回 400。
+- **用户关闭后仍显示旧状态**：客户端应刷新详情或列表；`PATCH /feedback/{id}` 成功返回 `200` 与最新
+  `status`/`statusMessage`/`updatedAt`。已关闭再次 PATCH 返回 `409 FEEDBACK_INVALID_TRANSITION`，
+  这是终态语义，不是幂等重放。
+- **运营入口返回 404**：先确认目标环境配置了 `ADMIN_TOKEN`（compose 需把该变量传进容器）。
+  未配置时整组 `/admin/feedback` 返回 404，与不存在的路由一致，属预期行为而非路由丢失。
+- **运营入口返回 401**：请求头 `X-Admin-Token` 缺失或与 `ADMIN_TOKEN` 不一致；客户端 Bearer token
+  不能替代它。排查时不要把凭据写进日志。
+- **运营 PATCH 返回 409**：状态机只允许 `submitted → received → closed`、`submitted → closed`
+  与 `received → submitted`；`closed` 是终态。同状态重复 PATCH 是 200 幂等 no-op。
+- **审计核查**：每次真实状态变更一条记录，直接查库：
+  ```sql
+  SELECT feedback_id, actor_type, actor_id, from_status, to_status, note, created_at
+  FROM feedback_status_events WHERE feedback_id = '<id>' ORDER BY created_at, id;
+  ```
+  `feedback.internal_note` 只保留最新备注，历史以审计表为准。
+- **状态序号不连续**：`submitted → closed` 是允许的捷径，`received → submitted` 是误受理回退，
+  审计里出现这类跳转都正常；不要用「必须经过 received」做监控断言。
+- **个人信息核查**：`contact` 只落 `feedback.contact` 列，用户侧详情与列表都不回显；运营视图才返回。
+  排查时不要把它拼进日志或告警文本。需要核查可直接查库：
+  `SELECT id, user_id, created_at, status FROM feedback ORDER BY created_at DESC LIMIT 20;`
+- **账号注销**：`feedback.user_id` 与 `feedback_status_events.feedback_id` 均为 `ON DELETE CASCADE`，
+  注销后自动清理，无需额外清理任务。
 
 ## 8. 监控与告警
 

@@ -42,6 +42,9 @@ var (
 	ErrHouseholdTargetNotMember = errors.New("目标用户不是该家庭成员")
 	// ErrHouseholdTargetAlreadyOwner 表示目标用户已经是该家庭 owner（转让给自己）。
 	ErrHouseholdTargetAlreadyOwner = errors.New("目标用户已经是该家庭 owner")
+	// ErrFeedbackInvalidTransition 表示反馈状态机不允许该跳转（含对已关闭反馈的任何推进）。
+	// HTTP 层映射为 409 FEEDBACK_INVALID_TRANSITION。
+	ErrFeedbackInvalidTransition = errors.New("反馈状态不允许该变更")
 )
 
 // PushOptions 携带同步写入的幂等参数。
@@ -183,8 +186,20 @@ type Store interface {
 	// CreateFeedback 写入一条反馈；同一 (userID, IdemKey) 重复提交返回已存记录且 replayed=true。
 	// 同一幂等键对应不同请求体时返回 ErrIdempotencyConflict。
 	CreateFeedback(ctx context.Context, userID string, sub model.FeedbackSubmission, opts FeedbackOptions) (item model.Feedback, replayed bool, err error)
-	// ListUserFeedback 只返回本人反馈，按 createdAt 倒序游标分页；非法游标返回 ErrBadCursor。
-	ListUserFeedback(ctx context.Context, userID string, cursor string, limit int) (model.FeedbackPage, error)
+	// ListUserFeedback 只返回本人反馈，可按 status 过滤（空串不过滤），
+	// 按 createdAt 倒序游标分页；非法游标返回 ErrBadCursor。
+	ListUserFeedback(ctx context.Context, userID string, status string, cursor string, limit int) (model.FeedbackPage, error)
+	// GetUserFeedback 返回本人单条反馈详情；不存在或不属于该用户时返回 ErrNotFound。
+	GetUserFeedback(ctx context.Context, userID string, feedbackID string) (model.FeedbackDetail, error)
+	// CloseUserFeedback 让本人关闭自己的反馈（submitted|received -> closed）。
+	// 不属于该用户返回 ErrNotFound；已关闭或状态不允许返回 ErrFeedbackInvalidTransition。
+	CloseUserFeedback(ctx context.Context, userID string, feedbackID string) (model.FeedbackDetail, error)
+	// ListAdminFeedback 跨用户返回反馈，可按 status 过滤（空串不过滤），按 createdAt 倒序游标分页。
+	ListAdminFeedback(ctx context.Context, status string, cursor string, limit int) (model.AdminFeedbackPage, error)
+	// UpdateFeedbackStatus 由运营侧推进状态；target 为空时不允许。
+	// 允许 submitted->received、submitted->closed、received->submitted、received->closed；
+	// 同状态视为幂等 no-op（不写审计）；其余跳转返回 ErrFeedbackInvalidTransition。
+	UpdateFeedbackStatus(ctx context.Context, feedbackID string, targetStatus string, note *string) (model.AdminFeedback, error)
 
 	// ListUserDevicesForExport 返回用户全部设备（含已删除的 tombstone），按 updated_at 倒序。
 	ListUserDevicesForExport(ctx context.Context, userID string) ([]model.UserDevice, error)

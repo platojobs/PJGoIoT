@@ -57,14 +57,25 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 	s.changes = kept
 
 	keptFeedback := s.feedback[:0]
+	removedFeedbackIDs := map[string]struct{}{}
 	for _, rec := range s.feedback {
 		if rec.userID != userID {
 			keptFeedback = append(keptFeedback, rec)
 			continue
 		}
 		delete(s.feedbackIdem, userID+"|"+rec.idemKey)
+		removedFeedbackIDs[rec.id] = struct{}{}
 	}
 	s.feedback = keptFeedback
+	if len(removedFeedbackIDs) > 0 {
+		keptEvents := s.feedbackEvents[:0]
+		for _, ev := range s.feedbackEvents {
+			if _, ok := removedFeedbackIDs[ev.feedbackID]; !ok {
+				keptEvents = append(keptEvents, ev)
+			}
+		}
+		s.feedbackEvents = keptEvents
+	}
 	return nil
 }
 
