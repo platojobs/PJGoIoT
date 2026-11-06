@@ -6,8 +6,8 @@
 - HTTP 框架：Gin v1.10（仅 `internal/httpapi` 层依赖）
 - 数据库：PostgreSQL 16（迁移 golang-migrate，查询 sqlc，不使用 ORM）
 - 日志：标准库 `log/slog` 结构化日志
-- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.13.0**（v0.17.0 新增反馈详情、用户关闭、运营受理与状态流转）；服务版本 **v0.17.0**（反馈状态流转）
-  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）。`/healthz` 见下文「部署编排」。
+- 契约：[`api/openapi.yaml`](api/openapi.yaml)，契约版本 **0.14.0**（v0.18.0 新增设备类型目录读取与运营管理）；服务版本 **v0.18.0**（设备类型目录服务端化）
+  - 说明：`APP_VERSION` / README 的 **服务版本**与 OpenAPI 的 **契约版本**是两套号。v0.7.0/v0.7.1 只增加运维形态（`/healthz`、编排、备份脚本），不改业务契约，契约保持 0.6.0；v0.8.0 只新增响应字段（`expiresAt`）与新增错误码（`RESYNC_REQUIRED`、`TIMEOUT`），按“只加不删”原则升到 0.7.0；v0.9.0 不改业务契约（`/metrics` 新增 `route` 标签属运维观测面），契约保持 **0.7.0**；v0.10.0 只在 push 描述中补充事务/400/503 语义与 503 响应示例；v0.11.0 只增加部署形态与运维响应头（`X-Instance`）与可选共享限流，契约保持 **0.7.0**；v0.12.0 新增家庭、成员、房间、邀请码接口与设备芯片字段，契约升到 **0.8.0**；v0.13.0 补齐成员移除/退出、邀请码管理与房间整段重排，`Household` 增加 `roomCount`，契约升到 **0.9.0**；v0.14.0 新增 `POST /households/{id}/transfer-ownership`、`HouseholdMember.isSelf` 与房间重排的 `ROOM_SET_MISMATCH`，契约升到 **0.10.0**（无 schema 迁移）；v0.15.0 把家庭/房间结构变更写入 `change_log`（新增 `entity=household` / `room` 及对应 payload），契约升到 **0.11.0**（无 schema 迁移）；v0.16.0 新增意见反馈提交与本人列表、`FEEDBACK_RATE_LIMITED` 错误码，契约升到 **0.12.0**（新增迁移 `000013_feedback`）；v0.17.0 新增反馈详情、用户关闭、运营受理入口与状态机、`FEEDBACK_INVALID_TRANSITION` 错误码，契约升到 **0.13.0**（新增迁移 `000014_feedback_status_workflow`）；v0.18.0 新增设备类型目录 `GET /catalog/device-types` 与运营侧 PUT/DELETE、ETag/304 协商缓存，契约升到 **0.14.0**（新增迁移 `000015_device_type_catalog`）。`/healthz` 见下文「部署编排」。
 
 ## 快速开始
 
@@ -332,6 +332,36 @@ v0.17.0 的 `000014_feedback_status_workflow` 补 `internal_note` 列、`(status
 索引与审计表 `feedback_status_events`（`feedback_id` 外键 `ON DELETE CASCADE`）。
 `feedback.updated_at` 与 status 的 `CHECK` 约束在 `000013` 已存在，`000014` 不重复添加。
 账号注销时 `ON DELETE CASCADE` 一并删除。
+
+### 设备类型目录（v0.18.0）
+
+两端 App 的「产品 / 市场」不再各自维护设备类型常量，改为读取服务端目录。
+
+**读取 `GET /catalog/device-types`（公开，匿名可读）**：
+
+- 响应 `{ version, generatedAt, items[] }`，每项含 `type`、`displayName`、`description`、
+  `gattServices`（服务 UUID + 名称）、`metrics`（`key` / `unit` / `characteristicUuid`）、
+  `limitations`、`compatibility`、`updatedAt`。
+- 鉴权可选：不带 token 也能读；带有效 Bearer token 时按 `(userId, 目录版本)` 记录一次访问
+  （`device_type_catalog_accesses`，同版本去重），用于后续灰度；token 无效也不会 401。
+- 协商缓存：响应带 `ETag`（`"catalog-v<version>"`）与 `Last-Modified`；`If-None-Match` 命中
+  返回 `304`，未带时按 `If-Modified-Since` 比较（秒级）。任意管理端写入都会自增版本，
+  因此 ETag 一定变化。
+
+**运营管理（内部接口，不在公开客户端 SDK 中）**：
+
+- `PUT /admin/catalog/device-types/{type}`：整项替换（字段全部必填），只能更新已存在项；
+  `DELETE /admin/catalog/device-types/{type}`：软删除（`deleted_at`）。
+- 与 `/admin/feedback` 共用 `X-Admin-Token`；未配置 `ADMIN_TOKEN` 时 404，凭据错误 401，
+  类型不存在/已删除 404。写目录、版本自增与审计（`device_type_catalog_audits`）同事务完成。
+
+**真值来源与一致性**：
+
+- 唯一真值表在 [`internal/devicecatalog/catalog.go`](internal/devicecatalog/catalog.go)，
+  GATT 服务、可解析指标、来源特征 UUID 与限制说明只在这里维护；
+- `go run ./cmd/cataloggen` 生成迁移 `000015_device_type_catalog`（含 seed）与 down；
+- 真实 PG 测试 `TestPostgresCatalogDeviceTypesIntegration` 把接口返回的 metrics / 特征 UUID /
+  GATT 服务与真值表逐项比对，手改迁移或文档漂移会直接测试失败。
 
 ### 设备详情与市场字段（v0.3.2）
 
@@ -1268,7 +1298,7 @@ PJGoIoT/
 | `CORS_ALLOWED_ORIGINS` | `*` | 逗号分隔的允许来源，`*` 表示全部 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `TOKEN_TTL_DAYS` | `180` | 签发 token 的有效期（天）；过期后鉴权返回 401，`cmd/cleanup` 删除过期行 |
-| `APP_VERSION` | `0.17.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.13.0 不是同一个号 |
+| `APP_VERSION` | `0.18.0` | 服务版本（健康接口与日志展示）；与 OpenAPI 契约版本 0.14.0 不是同一个号 |
 | `DB_MAX_OPEN_CONNS` | `20` | postgres 连接池最大连接数；过小会在高并发下排队并在超时预算后返回 503 TIMEOUT |
 | `DB_MAX_IDLE_CONNS` | `10` | 连接池最大空闲连接数，超过 `DB_MAX_OPEN_CONNS` 时自动收敛 |
 | `HEALTHCHECK_URL` | 自动推导 | `-healthcheck` 模式请求的完整 URL |
@@ -1442,6 +1472,15 @@ seed 数据来源与边界：
 | v0.17.0 运营工具联调 | 未验证：只提供 HTTP 契约与 curl 级验证，未接入真实运营后台；`ADMIN_TOKEN` 的下发、轮换与吊销流程未落地 |
 | v0.17.0 admin 并发压测 | 未验证：`SELECT ... FOR UPDATE` 保证同一反馈的审计顺序，但未做多实例并发 PATCH 压测；共享 token 下审计 actor 固定为 `admin`，无法区分具体操作人 |
 | v0.17.0 审计留存 | 未验证：审计表随反馈级联删除，未设计独立归档 / 保留期策略；长期增长与清理未评估 |
+| v0.18.0 目录读取与一致性 | 通过（真实 PostgreSQL）：`TestPostgresCatalogDeviceTypesIntegration` 读取 5 个目录项；`metrics` / 来源特征 UUID / `gattServices` / `limitations` / `compatibility` 与 `internal/devicecatalog` 真值表逐项比对一致 |
+| v0.18.0 ETag / 304 | 通过（真实 PostgreSQL + HTTP）：匿名读取 200 带 `ETag`/`Last-Modified`；`If-None-Match` 命中 304；管理端 PUT 后版本自增、ETag 变化，旧 ETag 不再命中 304，新 ETag 命中；fixture 层同步覆盖弱 ETag 与 `If-Modified-Since` |
+| v0.18.0 管理与软删 | 通过（真实 PostgreSQL + HTTP）：PUT 整项更新、DELETE 软删后列表不再返回但行仍在库中；admin 未配置 404、错误凭据 401、正确凭据 200/204；不存在或已删除类型 PUT/DELETE 均 404；审计 `upsert`/`delete` 与版本号逐条核对 |
+| v0.18.0 访问记录 | 通过（真实 PostgreSQL）：同一用户同一目录版本重复记录只保留 1 行（`ON CONFLICT DO NOTHING`）；匿名读取不写访问表；无效 token 仍按匿名返回 200 |
+| v0.18.0 迁移 | 通过：临时库 `up → down（000014）→ up`，`device_type_catalog` 及其索引/审计/访问/版本表可正确增删；重新执行 up 后 seed 行数为 5 |
+| v0.18.0 契约一致性 | 通过：`TestOpenAPICatalogContract` 比对 `CatalogMetric` / `CatalogDeviceType` / `DeviceTypeCatalog` / `CatalogDeviceTypeInput` 的 properties/required 与模型 JSON 字段；公开读取 `security: []`、304 响应、admin 路径 `x-audience: internal` / `x-client-sdk: false` |
+| v0.18.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning，均为 operation-4xx-response 提示）；契约版本 **0.14.0** |
+| v0.18.0 客户端接入 | 未验证：两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
+| v0.18.0 admin 并发 | 未验证：目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
 | OpenAPI 静态校验 | 通过（v0.8.0）：`npx @redocly/cli lint api/openapi.yaml` → valid，0 errors（12 条非阻断 warning，多为 operation-4xx-response 提示）；`expiresAt`、`410 CursorExpired`、`503 Timeout`、`RESYNC_REQUIRED`/`TIMEOUT` 均进入契约且 `$ref` 可解析 |
@@ -1450,7 +1489,7 @@ seed 数据来源与边界：
 
 ```bash
 TEST_DATABASE_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_test?sslmode=disable' \
-  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold' -v
+  go test ./internal/store/postgres -run 'TestPostgresStoreIntegration|TestPostgresCatalogDeviceTypesIntegration|TestMigrationBackfillsLegacyDevices|TestHousehold' -v
 ```
 
 ## 多实例部署（v0.11.0）

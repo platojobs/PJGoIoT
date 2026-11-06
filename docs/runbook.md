@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.17.0）
+# PJGoIoT 运行手册（v0.18.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -80,6 +80,13 @@
 | v0.17.0 迁移 | **已验证** | `000014_feedback_status_workflow` 在 `TestMigrationBackfillsLegacyDevices` 中验证 `up → down（000013）→ up`，`internal_note`、审计表、`feedback_status_created_idx` 均存在且回滚不破坏反馈表与用户数据 |
 | v0.17.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 0.13.0 |
 | v0.17.0 CI | **已验证** | GitHub Actions [run 42163927951](https://github.com/platojobs/PJGoIoT/actions/runs/42163927951) 四 job 全绿；`TestPostgresFeedbackLifecycleIntegration` 全部子测试执行且 job 成功 |
+| v0.18.0 目录一致性 | **已验证** | 真实 PG `TestPostgresCatalogDeviceTypesIntegration`：5 个目录项的 `metrics` / 特征 UUID / `gattServices` / `limitations` / `compatibility` 与 `internal/devicecatalog` 真值表逐项一致 |
+| v0.18.0 ETag / 304 | **已验证** | 真实 PG + HTTP：匿名 200 带 ETag/Last-Modified；`If-None-Match` 命中 304；PUT 后版本自增、ETag 变化，旧 ETag 不再命中 304；fixture 层覆盖弱 ETag 与 `If-Modified-Since` |
+| v0.18.0 管理与软删 | **已验证** | 真实 PG：PUT 后目录反映更新、版本 +1、审计 `upsert`；DELETE 后列表不再返回但 `deleted_at` 已写、审计 `delete`；重复 PUT/DELETE 与非法类型均 `ErrNotFound`；HTTP 层 admin 未配置 404、错误凭据 401、正确凭据 200/204 |
+| v0.18.0 访问记录 | **已验证** | 真实 PG：同一用户同一版本重复记录只保留 1 行；匿名不写；无效 token 仍匿名 200 |
+| v0.18.0 迁移 | **已验证** | 临时库 `up → down（000014）→ up`：`device_type_catalog` / 索引 / 审计 / 访问 / 版本表增删正确，重新 up 后 seed 5 行 |
+| v0.18.0 契约一致性 | **已验证** | `TestOpenAPICatalogContract`：4 个 schema 的 properties/required 与模型一致、公开读取 `security: []`、304 响应存在、admin 路径 `x-audience: internal` / `x-client-sdk: false` |
+| v0.18.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 0.14.0 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |
@@ -87,6 +94,9 @@
 | v0.17.0 运营工具联调 | **未验证** | 只提供 HTTP 契约与 curl 级验证，未接入真实运营后台；`ADMIN_TOKEN` 的下发、轮换与吊销流程未落地 |
 | v0.17.0 admin 并发压测 | **未验证** | `SELECT ... FOR UPDATE` 保证同一反馈的审计顺序，但未做多实例并发 PATCH 压测；共享 token 下审计 actor 固定为 `admin`，无法区分具体操作人 |
 | v0.17.0 审计留存 | **未验证** | 审计表随反馈级联删除，未设计独立归档 / 保留期策略；长期增长与清理未评估 |
+| v0.18.0 客户端接入 | **未验证** | 两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
+| v0.18.0 admin 并发 | **未验证** | 目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
+| v0.18.0 访问日志分析 | **未验证** | 访问表只做 `(user, 版本)` 去重，未接入灰度分流逻辑；未评估长期行数增长与清理策略 |
 
 ## 1. 部署前检查清单
 
@@ -799,6 +809,40 @@ docker compose exec -T postgres psql -U pjgoiot -d pjgoiot \
   `SELECT id, user_id, created_at, status FROM feedback ORDER BY created_at DESC LIMIT 20;`
 - **账号注销**：`feedback.user_id` 与 `feedback_status_events.feedback_id` 均为 `ON DELETE CASCADE`，
   注销后自动清理，无需额外清理任务。
+
+### 7.15 设备类型目录排障（v0.18.0）
+
+- **目录 404 / 路由不存在**：公开读取是 `GET /api/v1/catalog/device-types`；运营管理是
+  `/api/v1/admin/catalog/device-types/{type}`。确认没有把旧 `/device-types/{type}/catalog`
+  （固件/配件）当成目录接口。
+- **运营入口 404**：先确认配置了 `ADMIN_TOKEN`；未配置时整组 admin 路由返回 404，与不存在一致。
+- **运营入口 401**：`X-Admin-Token` 缺失或与 `ADMIN_TOKEN` 不一致；客户端 Bearer token 不能替代。
+- **PUT 返回 404**：管理端只更新已存在的目录项（新增型号走真值表 + 迁移）。软删除后再次 PUT
+  也是 404；这是软删语义，不是数据丢失。
+- **PUT 返回 400**：`displayName` 为空、UUID 非 128 位、metric key/unit 非法、数组超限或
+  `compatibility` 不是 JSON 对象。错误信息会指出具体下标字段。
+- **客户端一直拿 304 / 看不到更新**：先看响应头 `ETag`（`"catalog-v<version>"`）。管理端每次
+  PUT/DELETE 都在同一事务内自增 `device_type_catalog_meta.version`，即便内容相同也会变。
+  若 ETag 未变，检查写入是否真正提交（审计表是否有对应行）。
+- **`If-Modified-Since` 不生效**：该头只在没有 `If-None-Match` 时参与比较，且按秒级比较；
+  ETag 优先。客户端应优先使用 ETag。
+- **目录与解析能力不一致**：不要手改迁移 seed。改
+  `internal/devicecatalog/catalog.go` 后执行 `go run ./cmd/cataloggen`，再跑
+  `TestPostgresCatalogDeviceTypesIntegration`；不一致会直接失败。
+- **审计核查**：
+  ```sql
+  SELECT device_type, action, actor, catalog_version, created_at
+  FROM device_type_catalog_audits ORDER BY created_at DESC, id DESC LIMIT 20;
+  ```
+- **灰度访问记录核查**：同一用户同一目录版本只有一行：
+  ```sql
+  SELECT user_id, catalog_version, first_accessed_at
+  FROM device_type_catalog_accesses ORDER BY first_accessed_at DESC LIMIT 20;
+  ```
+  该表只做去重记录，不参与鉴权；匿名读取不写入。
+- **软删恢复**：当前管理端不提供恢复接口；需要恢复时由 DBA 将 `deleted_at` 置空、
+  执行 `UPDATE device_type_catalog_meta SET version = version + 1, updated_at = now() WHERE id = 1`
+  并补一条审计，或按真值表重新生成 seed 后走发布流程。操作前先备份该行。
 
 ## 8. 监控与告警
 

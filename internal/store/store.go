@@ -82,6 +82,19 @@ type Store interface {
 	// ListAccessories 返回指定设备类型的配件列表。
 	ListAccessories(ctx context.Context, deviceType string) ([]model.Accessory, error)
 
+	// GetDeviceTypeCatalog 返回服务端设备类型目录（过滤软删除项）与整体版本。
+	// 目录内容由迁移 000015 从 internal/devicecatalog 的唯一真值表生成。
+	GetDeviceTypeCatalog(ctx context.Context) (model.DeviceTypeCatalog, error)
+	// UpdateCatalogDeviceType 整项更新一个已存在的目录项，版本号自增并写一条审计。
+	// 类型不存在或已软删除时返回 ErrNotFound。
+	UpdateCatalogDeviceType(ctx context.Context, deviceType string, input model.CatalogDeviceTypeInput) (model.CatalogDeviceType, int64, error)
+	// DeleteCatalogDeviceType 软删除一个目录项，版本号自增并写一条审计。
+	// 类型不存在或已软删除时返回 ErrNotFound。
+	DeleteCatalogDeviceType(ctx context.Context, deviceType string) (int64, error)
+	// RecordCatalogAccess 按 (userID, catalogVersion) 记录一次访问，用于后续灰度。
+	// 重复访问同一版本不新增记录；匿名读取不会调用本方法。
+	RecordCatalogAccess(ctx context.Context, userID string, catalogVersion int64) error
+
 	// CreateUserWithToken 创建匿名用户并写入 token 哈希与过期时间，返回用户 id。
 	CreateUserWithToken(ctx context.Context, tokenHash string, expiresAt time.Time) (userID string, err error)
 	// UserIDByTokenHash 解析 token 哈希；已吊销视为未认证。

@@ -111,9 +111,9 @@ func (s *Server) cors() gin.HandlerFunc {
 			if allowed, value := s.allowedOrigin(origin); allowed {
 				c.Header("Access-Control-Allow-Origin", value)
 				c.Header("Vary", "Origin")
-				c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+				c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key")
-				c.Header("Access-Control-Expose-Headers", "X-Request-Id, Idempotent-Replayed, Content-Disposition")
+				c.Header("Access-Control-Expose-Headers", "X-Request-Id, Idempotent-Replayed, Content-Disposition, ETag, Last-Modified")
 				c.Header("Access-Control-Max-Age", "600")
 			}
 		}
@@ -188,6 +188,28 @@ func (s *Server) requireAuth() gin.HandlerFunc {
 
 		c.Set(ctxKeyUserID, userID)
 		c.Set(ctxKeyTokenHash, auth.Hash(token))
+		c.Next()
+	}
+}
+
+// optionalAuth 用于公开只读资源（例如设备类型目录）。
+//
+// 与 requireAuth 的区别：缺少 token、token 格式不对或 token 无效/过期都不拦请求，
+// 一律按匿名放行；只有 token 有效时才写入用户身份，供访问记录等可选逻辑使用。
+// 这样既不会因为鉴权把匿名用户挡在门外，带 token 的客户端又能被灰度统计到。
+func (s *Server) optionalAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		const prefix = "Bearer "
+		if len(header) > len(prefix) && strings.EqualFold(header[:len(prefix)], prefix) {
+			token := strings.TrimSpace(header[len(prefix):])
+			if token != "" {
+				if userID, err := s.store.UserIDByTokenHash(c.Request.Context(), auth.Hash(token)); err == nil {
+					c.Set(ctxKeyUserID, userID)
+					c.Set(ctxKeyTokenHash, auth.Hash(token))
+				}
+			}
+		}
 		c.Next()
 	}
 }

@@ -153,25 +153,35 @@ type Store struct {
 	feedback       []*feedbackRecord
 	feedbackIdem   map[string]*feedbackRecord // key: userID|idemKey
 	feedbackEvents []*feedbackEventRecord
+
+	// catalog 是设备类型目录的内存副本，初始化自 internal/devicecatalog 的唯一真值表。
+	catalog          []model.CatalogDeviceType
+	catalogVersion   int64
+	catalogUpdatedAt time.Time
+	catalogAccesses  map[string]map[int64]struct{} // userID -> catalogVersion 集合
 }
 
 // New 从 fixtures 目录加载公共元数据。
 func New(dir string) (*Store, error) {
 	s := &Store{
-		publicDevices:  map[string]model.PublicDevice{},
-		deviceTypeSet:  map[string]struct{}{},
-		tokens:         map[string]tokenRecord{},
-		users:          map[string]*userData{},
-		changes:        []changeRecord{},
-		nextSeq:        1,
-		idempotency:    map[string]idempotencyRecord{},
-		pairingCodes:   map[string]*pairingRecord{},
-		households:     map[string]*householdRecord{},
-		rooms:          map[string]model.HouseholdRoom{},
-		invitations:    map[string]*householdInvitationRecord{},
-		feedback:       []*feedbackRecord{},
-		feedbackIdem:   map[string]*feedbackRecord{},
-		feedbackEvents: []*feedbackEventRecord{},
+		publicDevices:    map[string]model.PublicDevice{},
+		deviceTypeSet:    map[string]struct{}{},
+		tokens:           map[string]tokenRecord{},
+		users:            map[string]*userData{},
+		changes:          []changeRecord{},
+		nextSeq:          1,
+		idempotency:      map[string]idempotencyRecord{},
+		pairingCodes:     map[string]*pairingRecord{},
+		households:       map[string]*householdRecord{},
+		rooms:            map[string]model.HouseholdRoom{},
+		invitations:      map[string]*householdInvitationRecord{},
+		feedback:         []*feedbackRecord{},
+		feedbackIdem:     map[string]*feedbackRecord{},
+		feedbackEvents:   []*feedbackEventRecord{},
+		catalog:          catalogFromTruth(),
+		catalogVersion:   1,
+		catalogUpdatedAt: time.Now().UTC(),
+		catalogAccesses:  map[string]map[int64]struct{}{},
 	}
 
 	deviceTypes, err := loadJSON[[]model.DeviceType](filepath.Join(dir, "device_types.json"))

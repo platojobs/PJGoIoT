@@ -19,7 +19,7 @@ PG_IMAGE="${E2E_PG_IMAGE:-postgres:16-alpine}"
 PG_USER="pjgoiot"
 PG_PASSWORD="pjgoiot-e2e-only"
 PG_DB="pjgoiot_e2e"
-APP_VERSION="${APP_VERSION:-0.17.0}"
+APP_VERSION="${APP_VERSION:-0.18.0}"
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -35,7 +35,7 @@ usage() {
   E2E_PG_IMAGE    Postgres 镜像（默认 postgres:16-alpine）
   E2E_PG_PORT     仅用于验证端口冲突：首次尝试该端口，占用则自动换端口
   E2E_API_PORT    同上，作用于 API
-  APP_VERSION     写入 API 的 APP_VERSION（默认 0.17.0）
+  APP_VERSION     写入 API 的 APP_VERSION（默认 0.18.0）
 EOF
 }
 

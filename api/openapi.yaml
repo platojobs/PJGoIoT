@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.13.0
+  version: 0.14.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -55,6 +55,8 @@ tags:
   - name: system
   - name: auth
   - name: metadata
+  - name: catalog
+    description: 设备类型目录；服务端事实来源，供两端 App 的产品/市场模块读取
   - name: user
   - name: sync
   - name: household
@@ -441,6 +443,71 @@ paths:
                       $ref: "#/components/schemas/Accessory"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /catalog/device-types:
+    get:
+      tags: [catalog]
+      operationId: getDeviceTypeCatalog
+      security: []
+      summary: 设备类型目录（服务端事实来源）
+      description: |
+        返回服务端维护的设备类型目录，供两端 App 的产品/市场模块使用，替代各端本地写死的
+        设备类型常量。目录内容与后端解析能力共用一处真值表（`internal/devicecatalog`），
+        迁移 000015 由 `go run ./cmd/cataloggen` 生成，避免文档与实现漂移。
+
+        **鉴权**：公开只读资源，`Authorization` 头可选。匿名请求直接返回目录；
+        带有效 Bearer token 时按 `(user, 目录版本)` 记录一次访问，供后续灰度使用；
+        token 无效或过期也不会返回 401，仍按匿名读取。
+
+        **缓存**：响应带 `ETag`（由目录版本号派生，如 `"catalog-v3"`）与 `Last-Modified`。
+        `If-None-Match` 命中返回 `304`；未带该头时按 `If-Modified-Since` 比较。
+        管理端任意一次 PUT/DELETE 都会自增版本，因此 `ETag` 一定变化。
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 上次响应返回的 ETag；支持 `*`、逗号列表与弱比较
+          schema:
+            type: string
+        - name: If-Modified-Since
+          in: header
+          required: false
+          description: 上次响应的 Last-Modified；仅在没有 If-None-Match 时生效
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 目录内容
+          headers:
+            ETag:
+              description: 目录版本派生值，例如 `"catalog-v3"`
+              schema:
+                type: string
+            Last-Modified:
+              description: 目录最近一次变更时间（HTTP 日期）
+              schema:
+                type: string
+            Cache-Control:
+              description: 公共缓存策略
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceTypeCatalog"
+        "304":
+          description: 目录未变更（ETag 或 Last-Modified 命中）
+          headers:
+            ETag:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /my/devices:
     get:
@@ -2009,6 +2076,98 @@ paths:
         "503":
           $ref: "#/components/responses/Timeout"
 
+  /admin/catalog/device-types/{type}:
+    put:
+      tags: [admin]
+      operationId: adminUpdateCatalogDeviceType
+      summary: 运营侧整项更新设备类型目录
+      description: |
+        **内部接口，不在公开客户端 SDK 中。** 仅运维系统与内部工具使用。
+
+        与 `/admin/feedback` 共用 `X-Admin-Token` 鉴权；未配置 `ADMIN_TOKEN` 时返回 `404`，
+        与不存在的路由不可区分。采用整项替换语义，请求体字段全部必填；只能更新已存在的
+        目录项（新增型号仍走 `internal/devicecatalog` 真值表 + 迁移生成），类型不存在返回 `404`。
+
+        更新与目录版本自增、审计写入在同一事务内完成；响应 `ETag` 为新版本，
+        客户端下次请求即可感知变化。审计记录包含设备类型、动作（upsert）、actor 与版本号。
+      security:
+        - adminToken: []
+      x-audience: internal
+      x-client-sdk: false
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogDeviceTypeInput"
+      responses:
+        "200":
+          description: 更新成功
+          headers:
+            ETag:
+              description: 新目录版本的 ETag
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogDeviceType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 运维入口未启用（未配置 ADMIN_TOKEN）或设备类型不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: "资源不存在或无权访问"
+        "503":
+          $ref: "#/components/responses/Timeout"
+    delete:
+      tags: [admin]
+      operationId: adminDeleteCatalogDeviceType
+      summary: 运营侧软删除设备类型目录项
+      description: |
+        **内部接口，不在公开客户端 SDK 中。** 仅运维系统与内部工具使用。
+
+        软删除：写入 `deleted_at`，列表查询立即不再返回该项，但数据保留可追溯。
+        删除与目录版本自增、审计写入在同一事务内完成；响应 `204` 并在 `ETag` 头返回新版本。
+      security:
+        - adminToken: []
+      x-audience: internal
+      x-client-sdk: false
+      parameters:
+        - $ref: "#/components/parameters/DeviceType"
+      responses:
+        "204":
+          description: 删除成功
+          headers:
+            ETag:
+              description: 新目录版本的 ETag
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 运维入口未启用（未配置 ADMIN_TOKEN）或设备类型不存在/已删除
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: "资源不存在或无权访问"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
   /metrics:
     servers:
       - url: http://127.0.0.1:8080
@@ -2408,6 +2567,103 @@ components:
           allOf:
             - $ref: "#/components/schemas/Compatibility"
           description: 型号级兼容性；未核实的型号为 null
+
+    CatalogMetric:
+      type: object
+      description: 设备类型可解析的一个指标及其来源 GATT 特征
+      required: [key, unit, characteristicUuid]
+      properties:
+        key:
+          type: string
+          description: 规范化指标 key，与读数上报的 metric 一致
+        unit:
+          type: string
+          description: 推荐单位（客户端可按用户偏好换算展示）
+          example: celsius
+        characteristicUuid:
+          type: string
+          description: 指标来源的 GATT 特征 UUID（不是服务 UUID）
+          example: "00002a6e-0000-1000-8000-00805f9b34fb"
+
+    CatalogDeviceType:
+      type: object
+      description: 设备类型目录项
+      required: [type, displayName, description, gattServices, metrics, limitations, compatibility, updatedAt]
+      properties:
+        type:
+          type: string
+          description: 稳定类型标识，客户端持久化使用
+        displayName:
+          type: string
+        description:
+          type: string
+        gattServices:
+          type: array
+          items:
+            $ref: "#/components/schemas/GATTService"
+        metrics:
+          type: array
+          description: 该类型可解析的指标；空数组表示透传设备由客户端解析
+          items:
+            $ref: "#/components/schemas/CatalogMetric"
+        limitations:
+          type: array
+          description: 限制说明，供产品/市场页原样展示
+          items:
+            type: string
+        compatibility:
+          $ref: "#/components/schemas/Compatibility"
+        updatedAt:
+          type: string
+          format: date-time
+
+    DeviceTypeCatalog:
+      type: object
+      description: 设备类型目录整体快照
+      required: [version, generatedAt, items]
+      properties:
+        version:
+          type: integer
+          format: int64
+          description: 目录整体版本号；每次管理端 PUT/DELETE 自增，ETag 由它派生
+        generatedAt:
+          type: string
+          format: date-time
+          description: 目录最近一次变更时间
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogDeviceType"
+
+    CatalogDeviceTypeInput:
+      type: object
+      description: 运营侧整项替换目录项的请求体；字段全部必填
+      required: [displayName, description, gattServices, metrics, limitations, compatibility]
+      properties:
+        displayName:
+          type: string
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 2000
+        gattServices:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/GATTService"
+        metrics:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/CatalogMetric"
+        limitations:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            maxLength: 500
+        compatibility:
+          $ref: "#/components/schemas/Compatibility"
 
     Firmware:
       type: object

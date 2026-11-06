@@ -85,6 +85,10 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	deviceTypesGroup.GET("/:type/firmwares", s.handleFirmwares)
 	deviceTypesGroup.GET("/:type/accessories", s.handleAccessories)
 
+	// 设备类型目录：服务端事实来源，公开只读，匿名可读；带有效 token 时记录访问用于灰度。
+	catalogGroup := api.Group("/catalog")
+	catalogGroup.GET("/device-types", s.optionalAuth(), s.handleDeviceTypeCatalog)
+
 	myGroup := api.Group("/my", s.requireAuth())
 	myGroup.GET("/devices", s.handleMyDevices)
 	// Gin 不允许同一段同时存在 :mac 与 :platform/:externalId 两个参数节点，
@@ -107,6 +111,11 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	adminFeedback := api.Group("/admin/feedback", s.requireAdmin())
 	adminFeedback.GET("", s.handleAdminListFeedback)
 	adminFeedback.PATCH("/:feedbackId", s.handleAdminUpdateFeedback)
+
+	// 运营侧目录管理：与 admin/feedback 共用 ADMIN_TOKEN 与未配置 404 语义。
+	adminCatalog := api.Group("/admin/catalog/device-types", s.requireAdmin())
+	adminCatalog.PUT("/:type", s.handleAdminUpdateCatalogDeviceType)
+	adminCatalog.DELETE("/:type", s.handleAdminDeleteCatalogDeviceType)
 
 	households := api.Group("/households", s.requireAuth())
 	households.GET("", s.handleListHouseholds)

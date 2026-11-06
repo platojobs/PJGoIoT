@@ -35,6 +35,47 @@ type DeviceType struct {
 	Compatibility json.RawMessage `json:"compatibility"`
 }
 
+// CatalogMetric 是设备类型目录中一个可解析指标。
+// CharacteristicUUID 是该指标来源的 GATT 特征 UUID，客户端据此定位订阅目标。
+type CatalogMetric struct {
+	Key                string `json:"key"`
+	Unit               string `json:"unit"`
+	CharacteristicUUID string `json:"characteristicUuid"`
+}
+
+// CatalogDeviceType 是 /catalog/device-types 中的一项。
+// 与旧 /device-types 的 DeviceType 分开：目录项带 metrics、limitations 与 updatedAt，
+// 且 displayName 替代旧 name 字段，避免改变既有契约。
+type CatalogDeviceType struct {
+	Type          string          `json:"type"`
+	DisplayName   string          `json:"displayName"`
+	Description   string          `json:"description"`
+	GATTServices  []GATTService   `json:"gattServices"`
+	Metrics       []CatalogMetric `json:"metrics"`
+	Limitations   []string        `json:"limitations"`
+	Compatibility json.RawMessage `json:"compatibility"`
+	UpdatedAt     time.Time       `json:"updatedAt"`
+}
+
+// DeviceTypeCatalog 是 GET /catalog/device-types 的响应体。
+// Version 是目录整体版本号（每次管理端写入自增），GeneratedAt 是最近一次目录变更时间。
+type DeviceTypeCatalog struct {
+	Version     int64               `json:"version"`
+	GeneratedAt time.Time           `json:"generatedAt"`
+	Items       []CatalogDeviceType `json:"items"`
+}
+
+// CatalogDeviceTypeInput 是运营侧 PUT /admin/catalog/device-types/{type} 的请求体。
+// 采用整项替换语义：字段必须全部提供，未提供的集合视为空数组。
+type CatalogDeviceTypeInput struct {
+	DisplayName   string          `json:"displayName"`
+	Description   string          `json:"description"`
+	GATTServices  []GATTService   `json:"gattServices"`
+	Metrics       []CatalogMetric `json:"metrics"`
+	Limitations   []string        `json:"limitations"`
+	Compatibility json.RawMessage `json:"compatibility"`
+}
+
 // Firmware 是某一设备类型的固件版本记录。
 // vendor 标识固件发布方，compatibility 描述平台与协议支持，供市场模块筛选。
 type Firmware struct {

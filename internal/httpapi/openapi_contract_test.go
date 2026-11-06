@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.13.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.13.0", got)
+	if got := info["version"]; got != "0.14.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.14.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -179,6 +179,66 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	}
 	assertRef(t, adminListOp, "200", "#/components/schemas/AdminFeedbackPage")
 	assertRef(t, adminPatchOp, "200", "#/components/schemas/AdminFeedbackItem")
+}
+
+// TestOpenAPICatalogContract 校验设备类型目录契约：模型字段、必填集合、匿名可读、
+// 304 协商缓存与运营侧内部接口标注。
+func TestOpenAPICatalogContract(t *testing.T) {
+	doc := loadOpenAPIDoc(t)
+	paths := digMap(t, doc, "paths")
+
+	catalogOp := digMap(t, asMapAny(t, paths["/catalog/device-types"]), "get")
+	if catalogOp["operationId"] != "getDeviceTypeCatalog" {
+		t.Fatalf("operationId=%v", catalogOp["operationId"])
+	}
+	// 公开只读：security 必须为空数组，匿名请求不被拦。
+	sec, ok := catalogOp["security"].([]any)
+	if !ok || len(sec) != 0 {
+		t.Fatalf("/catalog/device-types 必须允许匿名读取（security 为空数组），实际 %v", catalogOp["security"])
+	}
+	assertRef(t, catalogOp, "200", "#/components/schemas/DeviceTypeCatalog")
+	digMap(t, catalogOp, "responses", "304")
+
+	schemas := digMap(t, digMap(t, doc, "components"), "schemas")
+	for _, tc := range []struct {
+		schema string
+		model  any
+	}{
+		{"CatalogMetric", model.CatalogMetric{}},
+		{"CatalogDeviceType", model.CatalogDeviceType{}},
+		{"DeviceTypeCatalog", model.DeviceTypeCatalog{}},
+		{"CatalogDeviceTypeInput", model.CatalogDeviceTypeInput{}},
+	} {
+		schema := digMap(t, schemas, tc.schema)
+		wantFields := jsonFieldSet(t, tc.model)
+		if got := stringSet(propsOf(digMap(t, schema, "properties"))); !reflect.DeepEqual(got, wantFields) {
+			t.Fatalf("%s properties=%v，模型字段=%v", tc.schema, got, wantFields)
+		}
+		if got := stringSet(asStrings(t, schema["required"])); !reflect.DeepEqual(got, jsonRequiredSet(t, tc.model)) {
+			t.Fatalf("%s required=%v，模型必填字段=%v", tc.schema, got, jsonRequiredSet(t, tc.model))
+		}
+	}
+	// 指标必须声明来源特征 UUID，避免客户端把服务 UUID 当成特征 UUID。
+	metricProps := digMap(t, schemas, "CatalogMetric", "properties")
+	if _, ok := metricProps["characteristicUuid"]; !ok {
+		t.Fatalf("CatalogMetric 缺少 characteristicUuid")
+	}
+
+	adminPath := digMap(t, paths, "/admin/catalog/device-types/{type}")
+	putOp := digMap(t, adminPath, "put")
+	deleteOp := digMap(t, adminPath, "delete")
+	for name, op := range map[string]map[string]any{"adminPut": putOp, "adminDelete": deleteOp} {
+		if op["x-audience"] != "internal" || op["x-client-sdk"] != false {
+			t.Fatalf("%s 未标注为内部接口（不在公开客户端 SDK）", name)
+		}
+		if !hasSecurityScheme(t, op, "adminToken") {
+			t.Fatalf("%s 未使用 adminToken 凭据", name)
+		}
+	}
+	assertRef(t, putOp, "200", "#/components/schemas/CatalogDeviceType")
+	if _, ok := digMap(t, deleteOp, "responses")["204"]; !ok {
+		t.Fatalf("DELETE /admin/catalog/device-types/{type} 缺少 204 响应")
+	}
 }
 
 // findParam 按 name 定位查询/路径参数，返回其 schema。
