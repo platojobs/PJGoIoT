@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.24.0）
+# PJGoIoT 运行手册（v0.25.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -155,6 +155,15 @@
 | v0.24.0 校验 job 等价项 | **已验证（本机）** | YAML 解析（compose/alerts/scrape）、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（新脚本 0 告警）全部通过 |
 | v0.24.0 CI | **已验证** | GitHub Actions [run 42292106877](https://github.com/platojobs/PJGoIoT/actions/runs/42292106877) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 | v0.24.0 未验证 | **未验证** | >40 并发 / 单段 >20 分钟 / 多实例 / 跨主机 TLS；把池排队推到请求预算以上观察 503 的边界；场景数上千；真实 FCM/APNs 与生产部署状态同 v0.23.0 |
+| v0.25.0 设备标记迁移 | **已验证（真实 PG）** | `db/migrations/000019_device_marked_at`：`migrate-drill.sh` 在临时库 `up（version=19）→ down 18 步到 version=1 → up 到 19`，`user_devices` 与业务行数不丢；`marked_at` 为可空 `timestamptz` |
+| v0.25.0 标记/取消与 change_log | **已验证（真实 PG 测试）** | `TestDeviceMarkedAtPostgres`：标记后 `change_log` 新增 1 条；重复同一时间戳（含 +500ns）为 `unchanged` 且不新增；`null` 取消标记后 `marked_at` 为 NULL、新增第 2 条；更旧时间戳 `conflict(server_newer)` 不写库；再标记为第 3 条且 `/sync/changes` payload 带微秒精度 `markedAt`；缺省保持；用户 B 同 `externalId` 不影响用户 A |
+| v0.25.0 三态与 HTTP | **已验证（单元 + HTTP + e2e）** | `TestOptionalTimeJSON`（缺失/`null`/空串/RFC3339 截断微秒/非法报错）、`TestMarkedAtLWW`（幂等/旧写/取消）、`TestSyncPushMarkedAt`（真实 handler：标记、清除、缺省保持、非法 400）；e2e 真栈 `POST /sync/push` `applied=1`，`GET /my/devices` 回读 `markedAt=2026-11-05T08:09:10.123456Z`，`GET /sync/changes` payload 一致 |
+| v0.25.0 `/sync/changes` 性能复测 | **已验证（本机真实 PG）** | 与 v0.24.0 同规模数据集（108 万行）：floor 16 家庭 p95 **0.850 ms**（v0.24.0 1.035）、buffers 54 不变；主查询 cursor=0 新结构 p95 **2.985 ms**、buffers **121 不变**；旧 OR/IN 104.793 ms。见 [`perf-baseline.md`](perf-baseline.md) §7 |
+| v0.25.0 单测与集成 | **已验证** | `go test ./...`（`TEST_DATABASE_URL` 指向真实 PostgreSQL，迁移 19）：**111 个顶层测试 + 204 个子测试全部 PASS，0 FAIL、0 SKIP** |
+| v0.25.0 e2e 栈 | **已验证（Docker PG + 本地 API）** | `scripts/stack-for-e2e.sh` + `seed-for-e2e.sh`：push `applied=1 skippedReadings=0 conflicts=0`；`user_devices=1`、`readings=24`、`device_types=5`，firmware/accessory/public_model 校验通过 |
+| v0.25.0 契约 | **已验证** | `openapi info.version=0.20.0`；`UserDevice.markedAt` 可空、`PushDevice.markedAt` 三态；redocly lint **0 error**（14 条非阻断 warning）；health 示例版本 0.25.0 |
+| v0.25.0 校验 job 等价项 | **已验证（本机）** | YAML 解析、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（含改动的 `migrate-drill.sh`）全部通过 |
+| v0.25.0 未验证 | **未验证** | 标记密集写入下的写放大与 payload 增长；`marked_at` 高频变更对端到端 HTTP+JSON 的影响（§7 只测 SQL 层）；其余同 v0.24.0 |
 
 ## 1. 部署前检查清单
 

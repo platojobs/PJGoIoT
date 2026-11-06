@@ -18,8 +18,8 @@ func TestOpenAPIFeedbackContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
 
 	info := digMap(t, doc, "info")
-	if got := info["version"]; got != "0.19.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.19.0", got)
+	if got := info["version"]; got != "0.20.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.20.0", got)
 	}
 
 	paths := digMap(t, doc, "paths")
@@ -350,12 +350,12 @@ func TestOpenAPIDeletionExportContract(t *testing.T) {
 	}
 }
 
-// TestOpenAPISceneContract 校验契约 0.19.0（场景上云部分自 0.16.0 起）：
+// TestOpenAPISceneContract 校验契约 0.20.0（场景上云部分自 0.16.0 起）：
 // 路径、鉴权、schema 与模型字段逐项对齐，并确认 change_log 的 scene entity 在契约中有定义。
 func TestOpenAPISceneContract(t *testing.T) {
 	doc := loadOpenAPIDoc(t)
-	if got := digMap(t, doc, "info")["version"]; got != "0.19.0" {
-		t.Fatalf("openapi info.version=%v，期望 0.19.0", got)
+	if got := digMap(t, doc, "info")["version"]; got != "0.20.0" {
+		t.Fatalf("openapi info.version=%v，期望 0.20.0", got)
 	}
 	paths := digMap(t, doc, "paths")
 	schemas := digMap(t, digMap(t, doc, "components"), "schemas")

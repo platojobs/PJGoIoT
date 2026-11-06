@@ -421,3 +421,61 @@ scripts/scenes-soak.sh
 - 场景数上千时的 `GET /scenes` 列表与 JSONB 解码成本（本轮 150 个场景，未到上千）。
 - `change_log` 增长到 226 万行后，cleanup 保留期与磁盘增长的实际影响（本轮未跑 cleanup）。
 - 调大 `DB_MAX_OPEN_CONNS` 后的吞吐/延迟对照，以及它与生产 `max_connections` 的关系。
+
+## 7. v0.25.0：`user_devices.marked_at` 后的 `/sync/changes` 复测
+
+> 目标：确认新增可空列 `marked_at` 没有拖差 `/sync/changes`。沿用 v0.24.0 的多家庭数据集
+> 与同一脚本来复测，数字口径完全可比。原始结果：
+> [v0.25.0-sync-floor.md](perf-results/v0.25.0-sync-floor.md)。
+
+### 7.1 数据集与差异
+
+| 项 | 值 |
+| --- | --- |
+| 数据库 | `pjgoiot_perf25`（v0.24.0 同款 seed，仅迁移多了一版） |
+| 迁移版本 | 19（新增 `000019_device_marked_at`） |
+| `change_log` | 1,080,000 行 / 357 MB（与 v0.24.0 一致） |
+| 用户 / 家庭 / 成员 / 房间 / 设备 | 2,033 / 16 / 46 / 48 / 320 |
+| 目标用户 | 1 个，16 个家庭 |
+| 索引 | 未新增；`marked_at` 是普通可空列，不参与 `change_log` 过滤 |
+
+复现：
+
+```bash
+psql postgres://platojobs@127.0.0.1:5432/postgres -c "create database pjgoiot_perf25"
+go run ./cmd/migrate -database-url 'postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' -direction up
+psql 'postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' \
+  -v ON_ERROR_STOP=1 -f scripts/perf-multi-household-seed.sql
+DB_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' scripts/perf-sync-floor.sh
+```
+
+### 7.2 可见性下限（与 v0.24.0 对照）
+
+| 家庭数 | v0.24.0 p95 (ms) | v0.25.0 p95 (ms) | 变化 | buffers (24→25) |
+| --- | --- | --- | --- | --- |
+| 1 | 0.632 | 0.579 | -8.4% | 9 → 9 |
+| 4 | 0.700 | 0.621 | -11.3% | 18 → 18 |
+| 8 | 0.754 | 0.752 | -0.3% | 30 → 30 |
+| 16 | 1.035 | 0.850 | -17.9% | 54 → 54 |
+
+buffer 数完全不变（floor 查询不读取设备行），p95 的下降属于同机测量的正常波动。
+**结论：新字段没有改变可见性下限的查询计划与成本。**
+
+### 7.3 主查询（16 家庭，limit=100）
+
+| 游标 | 查询 | v0.24.0 p95 (ms) | v0.25.0 p95 (ms) | buffers (24→25) |
+| --- | --- | --- | --- | --- |
+| 0 | 旧 OR/IN | 104.904 | 104.793 | 16,282 → 16,282 |
+| 0 | 新分支结构 | 2.402 | 2.985 | 121 → 121 |
+| 640000 | 旧 OR/IN | 0.386 | 0.255 | 10 → 10 |
+| 640000 | 新分支结构 | 5.509 | 5.804 | 282 → 271 |
+
+`change_log` 查询只投影 `entity/payload`，设备行是 payload 的一部分，`marked_at`
+不参与 WHERE/ORDER BY，因此执行计划与 buffer 命中不变；±25% 属于 10 次采样的抖动。
+绝对值仍在 3–6 ms 量级，离 30 ms SLO 有充分余量。**结论：无性能回退。**
+
+### 7.4 未验证
+
+- 标记密集写入（大量设备同时 mark/unmark）下的 `change_log` 写放大与 payload 体积增长未压测。
+- 设备 `marked_at` 高频变更对 `/sync/changes` 端到端（HTTP + JSON 编解码）的影响未单独测量；
+  本轮只测数据库层 SQL。

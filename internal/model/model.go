@@ -3,7 +3,9 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -135,6 +137,9 @@ type UserDevice struct {
 	Compatibility   json.RawMessage `json:"compatibility"`
 	HouseholdID     *string         `json:"householdId"`
 	RoomID          *string         `json:"roomId"`
+	// MarkedAt 是用户「标记设备」的操作时间；nil 表示未标记（JSON 输出 null）。
+	// 它同时作为该字段的 LWW 版本，逐字段与客户端上报值比较并截断到微秒。
+	MarkedAt *time.Time `json:"markedAt"`
 }
 
 // Household 是家庭视图：role 为当前用户在家庭中的角色，counts 由服务端聚合。
@@ -207,14 +212,48 @@ type PushDevice struct {
 	Rules          json.RawMessage `json:"rules"`
 	ScanRecords    json.RawMessage `json:"scanRecords"`
 	UpdatedAt      time.Time       `json:"updatedAt"`
-	Deleted        bool            `json:"deleted"`
+	// MarkedAt 三态：字段缺失=未上报（保持原值）；null=取消标记；时间戳=标记。
+	MarkedAt OptionalTime `json:"markedAt"`
+	Deleted  bool         `json:"deleted"`
+}
+
+// OptionalTime 区分「字段缺失」「显式 null」与「具体时间」三种状态。
+// markedAt 使用它：缺失=保持原值；null（或空串）=取消标记；RFC3339=标记。
+type OptionalTime struct {
+	Set  bool
+	Time *time.Time
+}
+
+// UnmarshalJSON 只会被 JSON 中真实出现的字段调用；字段缺失时 Set 保持 false。
+func (o *OptionalTime) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	o.Time = nil
+	raw := bytes.TrimSpace(b)
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == `""` {
+		return nil
+	}
+	var t time.Time
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return fmt.Errorf("markedAt 必须是 RFC3339 时间、null 或空串: %w", err)
+	}
+	t = t.UTC().Truncate(time.Microsecond)
+	o.Time = &t
+	return nil
+}
+
+func (o OptionalTime) MarshalJSON() ([]byte, error) {
+	if o.Time == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.Time.UTC().Truncate(time.Microsecond))
 }
 
 // ResolvePresence 按「未上报保持原值、显式值覆盖」的规则，解析出本次写入应采用的值。
 // existing 为 nil（新建）时未上报字段取空串。
-func (d PushDevice) ResolvePresence(existing *UserDevice) (alias, advertisedName, group string) {
+func (d PushDevice) ResolvePresence(existing *UserDevice) (alias, advertisedName, group string, markedAt *time.Time) {
 	if existing != nil {
 		alias, advertisedName, group = existing.Alias, existing.AdvertisedName, existing.Group
+		markedAt = existing.MarkedAt
 	}
 	if d.Alias != nil {
 		alias = *d.Alias
@@ -225,7 +264,10 @@ func (d PushDevice) ResolvePresence(existing *UserDevice) (alias, advertisedName
 	if d.Group != nil {
 		group = *d.Group
 	}
-	return alias, advertisedName, group
+	if d.MarkedAt.Set {
+		markedAt = d.MarkedAt.Time
+	}
+	return alias, advertisedName, group, markedAt
 }
 
 // PushReading 是客户端在一次 push 中提交的单条测量读数。

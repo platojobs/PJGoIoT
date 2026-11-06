@@ -214,3 +214,57 @@ func TestDecideField(t *testing.T) {
 		}
 	})
 }
+
+// TestMarkedAtLWW 固化设备标记字段的三态与精度规则：
+// 缺省=不参与比较；null=显式取消；时间戳按微秒截断后比较，
+// 重复标记同一时间戳必须是 no-op，旧写入不得覆盖新标记。
+func TestMarkedAtLWW(t *testing.T) {
+	now := time.Date(2026, 11, 7, 6, 0, 0, 0, time.UTC)
+	marked := now.Add(-2 * time.Minute).Truncate(time.Microsecond)
+	server := serverAt(now.Add(-time.Minute))
+	server.MarkedAt = &marked
+
+	t.Run("未上报 markedAt 不影响幂等", func(t *testing.T) {
+		client := clientAt(server.UpdatedAt, "服务端")
+		if !SameContent(server, client) {
+			t.Fatalf("缺省 markedAt 不应造成内容差异")
+		}
+	})
+
+	t.Run("显式 null 与已标记不同", func(t *testing.T) {
+		client := clientAt(server.UpdatedAt, "服务端")
+		client.MarkedAt = model.OptionalTime{Set: true}
+		if SameContent(server, client) {
+			t.Fatalf("取消标记应视为内容差异")
+		}
+	})
+
+	t.Run("重复标记同一时间戳且内容一致为 no-op", func(t *testing.T) {
+		clientTime := server.UpdatedAt.Add(500 * time.Nanosecond)
+		client := clientAt(clientTime, "服务端")
+		nano := marked.Add(400 * time.Nanosecond)
+		client.MarkedAt = model.OptionalTime{Set: true, Time: &nano}
+		d := Decide(now, client, server)
+		if !d.Noop || d.Apply {
+			t.Fatalf("同一微秒的重复标记应为 no-op，得到 %+v", d)
+		}
+	})
+
+	t.Run("更旧的标记写入服务端获胜", func(t *testing.T) {
+		client := clientAt(server.UpdatedAt.Add(-time.Second), "服务端")
+		old := marked.Add(-time.Second)
+		client.MarkedAt = model.OptionalTime{Set: true, Time: &old}
+		d := Decide(now, client, server)
+		if d.Apply || d.Noop || d.Reason != ReasonServerNewer {
+			t.Fatalf("旧标记不应覆盖新标记，得到 %+v", d)
+		}
+	})
+
+	t.Run("较新的取消标记被接受", func(t *testing.T) {
+		client := clientAt(server.UpdatedAt.Add(time.Second), "服务端")
+		client.MarkedAt = model.OptionalTime{Set: true}
+		if d := Decide(now, client, server); !d.Apply {
+			t.Fatalf("较新的取消标记应应用，得到 %+v", d)
+		}
+	})
+}

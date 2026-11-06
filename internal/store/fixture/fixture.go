@@ -638,8 +638,9 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
 			dev.DeviceType = *existing.DeviceType
 		}
-		// alias / advertisedName / group 缺省表示未上报，保持原值；空串表示显式清除。
-		alias, advertisedName, group := dev.ResolvePresence(existing)
+		// alias / advertisedName / group / markedAt 缺省表示未上报，保持原值；
+		// 空串（或 markedAt: null）表示显式清除。
+		alias, advertisedName, group, markedAt := dev.ResolvePresence(existing)
 
 		decision := lww.Decide(now, dev, existing)
 		if !decision.Apply && !decision.Noop {
@@ -680,6 +681,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			ScanRecords:    dev.ScanRecords,
 			UpdatedAt:      decision.EffectiveUpdatedAt,
 			ServerSeq:      seq,
+			MarkedAt:       markedAt,
 		}
 		if householdID != "" {
 			v := householdID

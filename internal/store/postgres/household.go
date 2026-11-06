@@ -1170,15 +1170,16 @@ func (s *Store) UpdateUserDeviceMeta(ctx context.Context, userID string, platfor
 		scanRecords  []byte
 		updatedAt    time.Time
 		deletedAt    sql.NullTime
+		curMarkedAt  sql.NullTime
 	)
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, alias, household_id, room_id, client_id, device_type, advertised_name, "group",
-		       rules, scan_records, updated_at, deleted_at
+		       rules, scan_records, updated_at, deleted_at, marked_at
 		FROM user_devices
 		WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL
 		FOR UPDATE`, uid, platform, externalID).
 		Scan(&devID, &curAlias, &curHousehold, &curRoom, &clientID, &devType, &advertised, &group,
-			&rules, &scanRecords, &updatedAt, &deletedAt)
+			&rules, &scanRecords, &updatedAt, &deletedAt, &curMarkedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.UserDevice{}, store.ErrNotFound
 	}
@@ -1272,6 +1273,10 @@ func (s *Store) UpdateUserDeviceMeta(ctx context.Context, userID string, platfor
 		Alias: newAlias, AdvertisedName: advertised, Group: group,
 		Rules: rules, ScanRecords: scanRecords, UpdatedAt: now, ServerSeq: seq,
 		HouseholdID: hhStr, RoomID: roomStr,
+	}
+	if curMarkedAt.Valid {
+		v := curMarkedAt.Time.UTC()
+		d.MarkedAt = &v
 	}
 	if devType.Valid && devType.String != "" {
 		v := devType.String

@@ -38,16 +38,41 @@ docker run -d --name "${CONTAINER}" \
     -e POSTGRES_USER="${DB_USER}" -e POSTGRES_PASSWORD="${DB_PASS}" \
     -p "127.0.0.1:${PORT}:5432" "${IMAGE}" >/dev/null
 
+# 镜像启动阶段会先起一个临时实例再重启，pg_isready 可能在重启间隙短暂为真；
+# 这里以真实查询为准，避免 CREATE DATABASE 撞上 "database system is shutting down"。
+ready=0
 for _ in $(seq 1 120); do
-    if docker exec "${CONTAINER}" pg_isready -U "${DB_USER}" >/dev/null 2>&1; then
+    if docker exec "${CONTAINER}" psql -U "${DB_USER}" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+        ready=1
         break
     fi
     sleep 0.5
 done
+if [ "$ready" -ne 1 ]; then
+    echo "演练用 PostgreSQL 未就绪" >&2
+    docker logs "${CONTAINER}" 2>&1 | tail -20 >&2
+    exit 1
+fi
+
+create_db() {
+    local db="$1"
+    # 官方镜像初始化结束时会重启实例；CREATE 可能撞上重启窗口，重试即可。
+    for _ in $(seq 1 30); do
+        if docker exec "${CONTAINER}" psql -U "${DB_USER}" -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE ${db};" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
 for db in drill_empty drill_legacy drill_roundtrip; do
-    docker exec "${CONTAINER}" psql -U "${DB_USER}" -d postgres -v ON_ERROR_STOP=1 \
-        -c "CREATE DATABASE ${db};" >/dev/null
+    create_db "${db}" || {
+        echo "创建演练库 ${db} 失败" >&2
+        docker logs "${CONTAINER}" 2>&1 | tail -20 >&2
+        exit 1
+    }
 done
 
 echo "== 编译 migrate =="

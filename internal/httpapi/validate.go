@@ -89,18 +89,19 @@ type pushReadingPayload struct {
 }
 
 type pushDevicePayload struct {
-	ID             string          `json:"id" binding:"required,uuid"`
-	Platform       string          `json:"platform" binding:"omitempty,oneof=android ios"`
-	ExternalID     string          `json:"externalId" binding:"max=128"`
-	MAC            string          `json:"mac" binding:"max=64"`
-	DeviceType     string          `json:"deviceType" binding:"omitempty,max=64"`
-	Alias          *string         `json:"alias"`
-	AdvertisedName *string         `json:"advertisedName"`
-	Group          *string         `json:"group"`
-	Rules          json.RawMessage `json:"rules"`
-	ScanRecords    json.RawMessage `json:"scanRecords"`
-	UpdatedAt      time.Time       `json:"updatedAt" binding:"required"`
-	Deleted        bool            `json:"deleted"`
+	ID             string             `json:"id" binding:"required,uuid"`
+	Platform       string             `json:"platform" binding:"omitempty,oneof=android ios"`
+	ExternalID     string             `json:"externalId" binding:"max=128"`
+	MAC            string             `json:"mac" binding:"max=64"`
+	DeviceType     string             `json:"deviceType" binding:"omitempty,max=64"`
+	Alias          *string            `json:"alias"`
+	AdvertisedName *string            `json:"advertisedName"`
+	Group          *string            `json:"group"`
+	Rules          json.RawMessage    `json:"rules"`
+	ScanRecords    json.RawMessage    `json:"scanRecords"`
+	UpdatedAt      time.Time          `json:"updatedAt" binding:"required"`
+	MarkedAt       model.OptionalTime `json:"markedAt"`
+	Deleted        bool               `json:"deleted"`
 }
 
 // toModel 把 DTO 转成领域请求；字段 JSON 结构对外保持不变。
@@ -119,6 +120,7 @@ func (p pushPayload) toModel() model.PushRequest {
 			Rules:          d.Rules,
 			ScanRecords:    d.ScanRecords,
 			UpdatedAt:      d.UpdatedAt,
+			MarkedAt:       d.MarkedAt,
 			Deleted:        d.Deleted,
 		})
 	}

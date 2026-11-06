@@ -397,11 +397,16 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 			compatibility []byte
 			householdID   uuid.NullUUID
 			roomID        uuid.NullUUID
+			markedAt      sql.NullTime
 		)
 		if err := rows.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &mac, &d.Alias,
 			&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
-			&deviceType, &vendor, &firmware, &compatibility, &householdID, &roomID); err != nil {
+			&deviceType, &vendor, &firmware, &compatibility, &householdID, &roomID, &markedAt); err != nil {
 			return nil, fmt.Errorf("解析用户设备失败: %w", err)
+		}
+		if markedAt.Valid {
+			v := markedAt.Time.UTC()
+			d.MarkedAt = &v
 		}
 		if mac.Valid {
 			d.MAC = mac.String
@@ -449,7 +454,7 @@ SELECT d.id, d.client_id, d.platform, d.external_id, d.mac, d.alias, d.advertise
          WHEN pd.compatibility IS NOT NULL AND pd.compatibility <> '{}'::jsonb THEN pd.compatibility
          WHEN dt.compatibility IS NOT NULL THEN dt.compatibility
        END AS resolved_compatibility,
-       d.household_id, d.room_id
+       d.household_id, d.room_id, d.marked_at
 FROM user_devices d
 LEFT JOIN public_devices pd ON pd.mac = lower(d.mac)
 LEFT JOIN device_types dt ON dt.type = COALESCE(NULLIF(d.device_type, ''), pd.device_type)
@@ -501,7 +506,7 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 const visibleDeviceSelectSQL = `
 SELECT d.id, d.client_id, d.platform, d.external_id, COALESCE(d.mac, ''), d.alias, d.advertised_name,
        d."group", d.rules, d.scan_records, d.updated_at, d.server_seq, d.device_type,
-       d.household_id, d.room_id
+       d.household_id, d.room_id, d.marked_at
 FROM user_devices d
 WHERE d.deleted_at IS NULL
   AND (d.user_id = $1 OR d.household_id IN (
@@ -515,11 +520,16 @@ func scanVisibleDevice(row deviceScanner) (model.UserDevice, error) {
 		deviceType  sql.NullString
 		householdID uuid.NullUUID
 		roomID      uuid.NullUUID
+		markedAt    sql.NullTime
 	)
 	if err := row.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &d.MAC, &d.Alias,
 		&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
-		&deviceType, &householdID, &roomID); err != nil {
+		&deviceType, &householdID, &roomID, &markedAt); err != nil {
 		return model.UserDevice{}, err
+	}
+	if markedAt.Valid {
+		v := markedAt.Time.UTC()
+		d.MarkedAt = &v
 	}
 	if deviceType.Valid && deviceType.String != "" {
 		v := deviceType.String
@@ -682,7 +692,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 		if dev.DeviceType == "" && existing != nil && existing.DeviceType != nil {
 			dev.DeviceType = *existing.DeviceType
 		}
-		alias, advertisedName, group := dev.ResolvePresence(existing)
+		alias, advertisedName, group, markedAt := dev.ResolvePresence(existing)
 		if existing != nil && keyHolder != nil && existing.ID != keyHolder.ID {
 			result.Conflicts = append(result.Conflicts, model.Conflict{
 				ID: dev.ID, Platform: dev.Platform, ExternalID: dev.ExternalID, MAC: dev.MAC,
@@ -721,6 +731,7 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			ScanRecords:    dev.ScanRecords,
 			UpdatedAt:      decision.EffectiveUpdatedAt,
 			HouseholdID:    &personalIDStr,
+			MarkedAt:       markedAt,
 		}
 		// 已存设备沿用归属；历史数据缺失家庭时回落到个人家庭。
 		if existing != nil && existing.HouseholdID != nil {
@@ -933,7 +944,7 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 	}
 	query := `SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at,
 		deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name,
-		household_id, room_id
+		household_id, room_id, marked_at
 		FROM user_devices
 		WHERE user_id = $1 AND (id IN (` + buildIN(2, len(ids)) + `) OR external_id IN (` +
 		buildIN(2+len(ids), len(exts)) + `))`
@@ -947,14 +958,19 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 			row         sqlcgen.UserDevice
 			householdID uuid.NullUUID
 			roomID      uuid.NullUUID
+			markedAt    sql.NullTime
 		)
 		if err := rows.Scan(&row.UserID, &row.ID, &row.ClientID, &row.Mac, &row.Alias, &row.Group,
 			&row.Rules, &row.ScanRecords, &row.UpdatedAt, &row.DeletedAt, &row.ServerSeq,
 			&row.CreatedAt, &row.Platform, &row.ExternalID, &row.DeviceType, &row.AdvertisedName,
-			&householdID, &roomID); err != nil {
+			&householdID, &roomID, &markedAt); err != nil {
 			return nil, nil, fmt.Errorf("解析已存设备失败: %w", err)
 		}
 		d := mapUserDevice(row)
+		if markedAt.Valid {
+			t := markedAt.Time.UTC()
+			d.MarkedAt = &t
+		}
 		if householdID.Valid {
 			v := householdID.UUID.String()
 			d.HouseholdID = &v
@@ -1085,7 +1101,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 				uid, devID, clientID, nullableString(p.dev.MAC), p.record.Alias, p.record.Group,
 				p.record.Rules, p.record.ScanRecords, p.record.UpdatedAt, p.deletedAt, seqs[i],
 				p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.DeviceType), p.record.AdvertisedName,
-				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
+				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID), nullableTime(p.record.MarkedAt),
 			})
 			continue
 		}
@@ -1094,7 +1110,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 				devID, clientID, p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.MAC),
 				p.record.Alias, p.record.Group, p.record.Rules, p.record.ScanRecords,
 				p.record.UpdatedAt, p.deletedAt, seqs[i], nullableString(p.dev.DeviceType), p.record.AdvertisedName,
-				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
+				nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID), nullableTime(p.record.MarkedAt),
 			})
 			continue
 		}
@@ -1107,13 +1123,13 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 			id = $1, client_id = $2, platform = $3, external_id = $4, mac = $5, alias = $6,
 			"group" = $7, rules = $8, scan_records = $9, updated_at = $10, deleted_at = $11,
 			server_seq = $12, device_type = $13, advertised_name = $14,
-			household_id = $15, room_id = $16
-			WHERE user_id = $17 AND id = $18`,
+			household_id = $15, room_id = $16, marked_at = $17
+			WHERE user_id = $18 AND id = $19`,
 			devID, clientID, p.dev.Platform, p.dev.ExternalID, nullableString(p.dev.MAC),
 			p.record.Alias, p.record.Group, p.record.Rules, p.record.ScanRecords,
 			p.record.UpdatedAt, p.deletedAt, seqs[i], nullableString(p.dev.DeviceType),
 			p.record.AdvertisedName, nullableUUID(p.record.HouseholdID), nullableUUID(p.record.RoomID),
-			uid, oldID)
+			nullableTime(p.record.MarkedAt), uid, oldID)
 		if err != nil {
 			return fmt.Errorf("写入用户设备失败: %w", err)
 		}
@@ -1166,7 +1182,7 @@ func writePendingDevices(ctx context.Context, db *sql.Tx, uid uuid.UUID, clientI
 
 const listUserDevicesInsertSQL = `INSERT INTO user_devices
 	(user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at, deleted_at,
-	 server_seq, platform, external_id, device_type, advertised_name, household_id, room_id)
+	 server_seq, platform, external_id, device_type, advertised_name, household_id, room_id, marked_at)
 VALUES %s ON CONFLICT (user_id, platform, external_id) DO NOTHING`
 
 const listUserDevicesUpdateSQL = `UPDATE user_devices AS d SET
@@ -1174,18 +1190,19 @@ const listUserDevicesUpdateSQL = `UPDATE user_devices AS d SET
 	"group" = v.group_name, rules = v.rules, scan_records = v.scan_records,
 	updated_at = v.updated_at, deleted_at = v.deleted_at, server_seq = v.server_seq,
 	device_type = v.device_type, advertised_name = v.advertised_name,
-	client_id = v.client_id, household_id = v.household_id, room_id = v.room_id
+	client_id = v.client_id, household_id = v.household_id, room_id = v.room_id,
+	marked_at = v.marked_at
 FROM (VALUES %s) AS v(id, client_id, platform, external_id, mac, alias, group_name, rules,
 	scan_records, updated_at, deleted_at, server_seq, device_type, advertised_name,
-	household_id, room_id)
+	household_id, room_id, marked_at)
 WHERE d.user_id = $1 AND d.id = v.id`
 
 const changeLogInsertSQL = `INSERT INTO change_log (seq, user_id, household_id, entity, entity_id, op, payload, server_ts)
 VALUES %s`
 
-var insertDeviceCasts = []string{"uuid", "uuid", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "text", "text", "uuid", "uuid"}
+var insertDeviceCasts = []string{"uuid", "uuid", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "text", "text", "uuid", "uuid", "timestamptz"}
 
-var updateDeviceCasts = []string{"uuid", "text", "text", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "uuid", "uuid"}
+var updateDeviceCasts = []string{"uuid", "text", "text", "text", "text", "text", "text", "jsonb", "jsonb", "timestamptz", "timestamptz", "bigint", "text", "text", "uuid", "uuid", "timestamptz"}
 
 var changeLogCasts = []string{"bigint", "uuid", "uuid", "text", "text", "text", "jsonb", "timestamptz"}
 
@@ -1417,6 +1434,14 @@ func nullableUUID(v *string) any {
 		return nil
 	}
 	return id
+}
+
+// nullableTime 把可空时间转成数据库可写入的值（统一 UTC，Postgres 保留微秒）。
+func nullableTime(v *time.Time) sql.NullTime {
+	if v == nil {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: v.UTC(), Valid: true}
 }
 
 // maxVisibleChangeSeq 返回用户可见范围内的最大 change_log seq（含共享家庭）。

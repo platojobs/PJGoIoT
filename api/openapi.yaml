@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.19.0
+  version: 0.20.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -74,6 +74,11 @@ info:
       `/sync/changes` 仅调整可见性下限与主查询的**内部实现**：非零游标的 `410 CURSOR_EXPIRED`
       判定与响应结构不变；`cursor=0` 按既有约定始终从最老保留行开始返回（不再做无意义的
       下限探测，也不会因历史清理而误报 410）。
+    - 自契约 `0.20.0`（服务 v0.25.0）起设备支持正式同步字段 `markedAt`：
+      `UserDevice` 新增可空 `markedAt`，`PushDevice` 支持「缺省=保持 / null=取消标记 /
+      RFC3339=标记」三态；标记与取消标记都会写入 `change_log`，参与与其他设备字段相同的
+      字段级 LWW（微秒截断），重复上报同一时间戳不产生新的变更条目。
+      迁移 `000019_device_marked_at`（`user_devices.marked_at timestamptz NULL`）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -118,7 +123,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.24.0"
+                version: "0.25.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -3379,6 +3384,15 @@ components:
           format: uuid
           nullable: true
           description: 设备所属房间；未分配房间或房间被删除时为 null（自 0.12.0）
+        markedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            用户「标记设备」的操作时间（UTC，微秒精度，自 0.20.0）。
+            未标记时为 null；标记后该值就是字段级 LWW 的版本号。
+            标记/取消标记都会写入 `change_log`（entity=`user_device`），
+            因此 App 的增量同步与多端、跨设备都能拿到同一状态。
         alias:
           type: string
           description: 用户设置的别名；不会因设备广播名变化而被覆盖
@@ -3478,6 +3492,17 @@ components:
           description: |
             用户分组。缺省（absent）= 未上报，保持原值；
             空串 `""` = 显式清除分组，服务端将 `group` 置为空串。
+        markedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            设备标记时间（自 0.20.0），三态：
+            - 字段缺省（absent）= 未上报，保持服务端原值；
+            - `null`（或空串）= 取消标记，服务端 `marked_at` 置为 NULL；
+            - RFC3339 时间戳 = 标记，精度截断到微秒后参与 LWW。
+            与 `alias` 等字段一致受设备级 `updatedAt` 约束：旧写入不会覆盖更新的标记。
+            重复上报相同 `markedAt` 且内容未变化时返回 `unchanged`，不产生新的 `change_log`。
         rules:
           type: object
           additionalProperties: true

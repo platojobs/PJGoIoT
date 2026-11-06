@@ -42,7 +42,10 @@ type Decision struct {
 // Decide 计算单台设备的同步判定。server 为 nil 表示服务端尚无该设备。
 func Decide(now time.Time, client model.PushDevice, server *model.UserDevice) Decision {
 	now = now.UTC()
-	effective := client.UpdatedAt.UTC()
+	// 与字段级 LWW 一致：Postgres 只存微秒，比较前统一截断，
+	// 避免同一时刻的纳秒差异被误判为「严格更新」而反复写 change_log。
+	now = microsecond(now)
+	effective := microsecond(client.UpdatedAt)
 	clamped := false
 	if effective.After(now.Add(MaxClockSkew)) {
 		effective = now
@@ -56,12 +59,12 @@ func Decide(now time.Time, client model.PushDevice, server *model.UserDevice) De
 		return decision
 	}
 
-	if effective.After(server.UpdatedAt.UTC()) {
+	if effective.After(microsecond(server.UpdatedAt)) {
 		decision.Apply = true
 		return decision
 	}
 
-	if effective.Equal(server.UpdatedAt.UTC()) && SameContent(server, client) {
+	if effective.Equal(microsecond(server.UpdatedAt)) && SameContent(server, client) {
 		decision.Noop = true
 		return decision
 	}
@@ -143,6 +146,11 @@ func SameContent(server *model.UserDevice, client model.PushDevice) bool {
 	if client.Group != nil && server.Group != *client.Group {
 		return false
 	}
+	// markedAt 与 alias/group 一样按「是否上报」参与比较：
+	// 未上报不参与；null 是显式取消标记；时间戳按微秒截断后比较。
+	if client.MarkedAt.Set && !sameMarkedAt(server.MarkedAt, client.MarkedAt.Time) {
+		return false
+	}
 	if (server.DeletedAt != nil) != client.Deleted {
 		return false
 	}
@@ -158,6 +166,13 @@ func SameContent(server *model.UserDevice, client model.PushDevice) bool {
 		}
 	}
 	return jsonEqual(server.Rules, client.Rules) && jsonEqual(server.ScanRecords, client.ScanRecords)
+}
+
+func sameMarkedAt(server, client *time.Time) bool {
+	if server == nil || client == nil {
+		return server == nil && client == nil
+	}
+	return microsecond(*server).Equal(microsecond(*client))
 }
 
 func jsonEqual(a, b []byte) bool {
