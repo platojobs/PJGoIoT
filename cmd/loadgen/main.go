@@ -1,14 +1,18 @@
-// Command loadgen 对运行中的 PJGoIoT API 做三场景压测并输出 p50/p95/p99、RPS 与错误率。
+// Command loadgen 对运行中的 PJGoIoT API 做多场景压测并输出 p50/p95/p99、RPS 与错误率。
 //
 // 场景：
 //  1. devices：GET /api/v1/my/devices，默认 100 并发、30s；
 //  2. push：POST /api/v1/sync/push，默认 50 并发，每请求 100 设备 + 200 读数；
-//  3. series：GET /api/v1/my/devices/{platform}/{externalId}/readings/series?bucket=1d 90 天窗口，默认 50 并发。
+//  3. series：GET /api/v1/my/devices/{platform}/{externalId}/readings/series?bucket=1d 90 天窗口，默认 50 并发；
+//  4. changes：GET /api/v1/sync/changes 增量读，游标按响应推进、到底后回到 0；
+//  5. scenes：GET /api/v1/scenes 列表 + PUT /api/v1/scenes/{id} 字段级 LWW 写入；
+//  6. feedback：POST /api/v1/feedback 提交 + GET /api/v1/feedback/mine 列表；
+//  7. catalog：GET /api/v1/catalog/device-types，预热取 ETag 后带 If-None-Match 命中 304。
 //
 // 运行前请先启动本地栈（Docker Compose 或 go run ./cmd/api），并关闭或调高限流：
 //
-//	RATE_LIMIT_PER_MINUTE=0 docker compose up -d api
-//	go run ./cmd/loadgen -base-url https://localhost -duration 30s
+//	RATE_LIMIT_PER_MINUTE=0 FEEDBACK_USER_RATE_PER_MINUTE=0 FEEDBACK_IP_RATE_PER_MINUTE=0 go run ./cmd/api
+//	go run ./cmd/loadgen -base-url http://127.0.0.1:8080 -scenario all -duration 30s
 //
 // 若使用 Docker Compose 的 Caddy 自签证书，保持默认 -insecure-skip-verify=true。
 package main
@@ -43,6 +47,12 @@ type config struct {
 	concurrency    int
 	pushConc       int
 	seriesConc     int
+	changesLimit   int
+	scenesCount    int
+	changesConc    int
+	scenesConc     int
+	feedbackConc   int
+	catalogConc    int
 	insecure       bool
 	seedReadings   int
 	reportPath     string
@@ -127,6 +137,12 @@ func main() {
 	flag.IntVar(&cfg.concurrency, "concurrency", 100, "devices 场景并发")
 	flag.IntVar(&cfg.pushConc, "push-concurrency", 50, "push 场景并发")
 	flag.IntVar(&cfg.seriesConc, "series-concurrency", 50, "series 场景并发")
+	flag.IntVar(&cfg.changesLimit, "changes-limit", 100, "changes 场景每页条数（1-500）")
+	flag.IntVar(&cfg.scenesCount, "scenes-count", 50, "scenes 场景预置的场景数")
+	flag.IntVar(&cfg.changesConc, "changes-concurrency", 50, "changes 场景并发")
+	flag.IntVar(&cfg.scenesConc, "scenes-concurrency", 50, "scenes 场景并发")
+	flag.IntVar(&cfg.feedbackConc, "feedback-concurrency", 20, "feedback 场景并发")
+	flag.IntVar(&cfg.catalogConc, "catalog-concurrency", 100, "catalog 场景并发")
 	flag.IntVar(&cfg.seedReadings, "seed-readings", 2000, "series 场景前预置的读数条数（覆盖 90 天）")
 	flag.BoolVar(&cfg.insecure, "insecure-skip-verify", true, "跳过 TLS 校验（自签证书场景）")
 	flag.StringVar(&cfg.reportPath, "report", "", "可选：把 Markdown 结果写入文件")
@@ -154,12 +170,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 连接池按所有场景并发之和配置，避免高并发下反复建连污染延迟数字。
+	pool := cfg.concurrency + cfg.pushConc + cfg.seriesConc + cfg.changesConc +
+		cfg.scenesConc + cfg.feedbackConc + cfg.catalogConc
 	client := &http.Client{
 		Timeout: cfg.requestTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: cfg.insecure},
-			MaxIdleConns:        cfg.concurrency + cfg.seriesConc + cfg.concurrency,
-			MaxIdleConnsPerHost: cfg.concurrency + cfg.seriesConc + cfg.concurrency,
+			MaxIdleConns:        pool,
+			MaxIdleConnsPerHost: pool,
 			MaxConnsPerHost:     0,
 		},
 	}
@@ -174,17 +193,80 @@ func main() {
 		cfg.token = tok
 	}
 
+	// 场景名即报告里的路径标签，也用于 -scenario 过滤。
+	const (
+		scDevices       = "GET /my/devices"
+		scPush          = "POST /sync/push"
+		scSeries        = "GET /readings/series"
+		scChanges       = "GET /sync/changes"
+		scScenesRead    = "GET /scenes"
+		scScenesWrite   = "PUT /scenes"
+		scFeedbackWrite = "POST /feedback"
+		scFeedbackRead  = "GET /feedback/mine"
+		scCatalog       = "GET /catalog/device-types"
+	)
+	// extended 是 v0.21.0 新增的压测场景；CI smoke 只跑原有三个，避免短跑里创建
+	// 反馈/场景数据并触发未配置阈值。
+	extended := map[string]bool{
+		scChanges: true, scScenesRead: true, scScenesWrite: true,
+		scFeedbackWrite: true, scFeedbackRead: true, scCatalog: true,
+	}
+	enabled := func(name string) bool {
+		if cfg.scenario == "all" {
+			return !cfg.smoke || !extended[name]
+		}
+		switch cfg.scenario {
+		case "devices":
+			return name == scDevices
+		case "push":
+			return name == scPush
+		case "series":
+			return name == scSeries
+		case "changes":
+			return name == scChanges
+		case "scenes":
+			return name == scScenesRead || name == scScenesWrite
+		case "feedback":
+			return name == scFeedbackWrite || name == scFeedbackRead
+		case "catalog":
+			return name == scCatalog
+		}
+		return false
+	}
+
 	macs := make([]string, cfg.deviceCount)
 	for i := range macs {
 		macs[i] = fmt.Sprintf("AA:BB:CC:DD:%02X:%02X", (i/256)%256, i%256)
 	}
-	if err := seedDevices(client, base, cfg.token, macs); err != nil {
-		fmt.Fprintln(os.Stderr, "预置设备失败:", err)
-		os.Exit(1)
+	if enabled(scDevices) || enabled(scPush) || enabled(scSeries) || enabled(scChanges) {
+		if err := seedDevices(client, base, cfg.token, macs); err != nil {
+			fmt.Fprintln(os.Stderr, "预置设备失败:", err)
+			os.Exit(1)
+		}
 	}
-	if err := seedReadings(client, base, cfg.token, macs[0], cfg.seedReadings); err != nil {
-		fmt.Fprintln(os.Stderr, "预置读数失败:", err)
-		os.Exit(1)
+	if enabled(scSeries) {
+		if err := seedReadings(client, base, cfg.token, macs[0], cfg.seedReadings); err != nil {
+			fmt.Fprintln(os.Stderr, "预置读数失败:", err)
+			os.Exit(1)
+		}
+	}
+	var sceneIDs []string
+	if enabled(scScenesRead) || enabled(scScenesWrite) {
+		ids, err := seedScenes(client, base, cfg.token, cfg.scenesCount)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "预置场景失败:", err)
+			os.Exit(1)
+		}
+		sceneIDs = ids
+	}
+	var catalogETag string
+	if enabled(scCatalog) {
+		status, etag, err := fetchETag(client, base+"/api/v1/catalog/device-types", cfg.token)
+		if err != nil || status != http.StatusOK || etag == "" {
+			fmt.Fprintf(os.Stderr, "获取 catalog ETag 失败: status=%d etag=%q err=%v\n", status, etag, err)
+			os.Exit(1)
+		}
+		catalogETag = etag
 	}
 
 	type scenario struct {
@@ -193,23 +275,25 @@ func main() {
 		run         func(s *stats, worker int)
 	}
 	list := []scenario{
-		{"GET /my/devices", cfg.concurrency, func(s *stats, _ int) { runDevices(client, base, cfg.token, s) }},
-		{"POST /sync/push", cfg.pushConc, func(s *stats, worker int) { runPush(client, base, cfg.token, cfg, worker, s) }},
-		{"GET /readings/series", cfg.seriesConc, func(s *stats, _ int) { runSeries(client, base, cfg.token, macs[0], s) }},
+		{scDevices, cfg.concurrency, func(s *stats, _ int) { runDevices(client, base, cfg.token, s) }},
+		{scPush, cfg.pushConc, func(s *stats, worker int) { runPush(client, base, cfg.token, cfg, worker, s) }},
+		{scSeries, cfg.seriesConc, func(s *stats, _ int) { runSeries(client, base, cfg.token, macs[0], s) }},
+		{scChanges, cfg.changesConc, runChanges(client, base, cfg.token, cfg.changesLimit)},
+		{scScenesRead, cfg.scenesConc, func(s *stats, _ int) { runScenesRead(client, base, cfg.token, s) }},
+		{scScenesWrite, cfg.scenesConc, runScenesWrite(client, base, cfg.token, sceneIDs)},
+		{scFeedbackWrite, cfg.feedbackConc, func(s *stats, _ int) { runFeedbackWrite(client, base, cfg.token, s) }},
+		{scFeedbackRead, cfg.feedbackConc, func(s *stats, _ int) { runFeedbackRead(client, base, cfg.token, s) }},
+		{scCatalog, cfg.catalogConc, func(s *stats, _ int) { runCatalog(client, base, cfg.token, catalogETag, s) }},
 	}
-	if cfg.scenario != "all" {
-		filtered := list[:0]
-		for _, sc := range list {
-			if cfg.scenario == "devices" && sc.name == "GET /my/devices" ||
-				cfg.scenario == "push" && sc.name == "POST /sync/push" ||
-				cfg.scenario == "series" && sc.name == "GET /readings/series" {
-				filtered = append(filtered, sc)
-			}
+	filtered := list[:0]
+	for _, sc := range list {
+		if enabled(sc.name) {
+			filtered = append(filtered, sc)
 		}
-		list = filtered
 	}
+	list = filtered
 	if len(list) == 0 {
-		fmt.Fprintln(os.Stderr, "-scenario 只能是 devices|push|series|all")
+		fmt.Fprintln(os.Stderr, "-scenario 只能是 devices|push|series|changes|scenes|feedback|catalog|all")
 		os.Exit(1)
 	}
 
@@ -218,7 +302,7 @@ func main() {
 	lines = append(lines, "| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 	var results []scenarioResult
 	for _, sc := range list {
-		runWarmup(client, base, cfg, sc.name, sc.concurrency)
+		runWarmup(cfg, sc.concurrency, sc.run)
 		st := &stats{statuses: map[int]int{}}
 		start := time.Now()
 		var wg sync.WaitGroup
@@ -315,27 +399,22 @@ func join(lines []string) string {
 	return b.String()
 }
 
-func runWarmup(client *http.Client, base string, cfg config, name string, concurrency int) {
+// runWarmup 用与正式跑完全相同的请求逻辑预热，结果写入独立的丢弃桶，不进入统计。
+func runWarmup(cfg config, concurrency int, run func(*stats, int)) {
 	if cfg.warmup <= 0 {
 		return
 	}
+	discard := &stats{statuses: map[int]int{}}
 	deadline := time.Now().Add(cfg.warmup)
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
 			for time.Now().Before(deadline) {
-				switch name {
-				case "GET /my/devices":
-					_, _ = get(client, base+"/api/v1/my/devices", cfg.token)
-				case "POST /sync/push":
-					_, _ = pushOnce(client, base, cfg.token, nil, cfg, 1)
-				case "GET /readings/series":
-					_, _ = seriesOnce(client, base, cfg.token, "")
-				}
+				run(discard, worker)
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 }
@@ -506,18 +585,213 @@ func runSeries(client *http.Client, base, token, mac string, st *stats) {
 	st.record(d, status)
 }
 
-func seriesOnce(client *http.Client, base, token, mac string) (int, error) {
-	if mac == "" {
-		mac = "AA:BB:CC:DD:00:00"
-	}
-	status, _ := get(client, seriesURL(base, mac), token)
-	return status, nil
-}
-
 func seriesURL(base, mac string) string {
 	now := time.Now().UTC()
 	from := now.Add(-90 * 24 * time.Hour).Format(time.RFC3339)
 	to := now.Format(time.RFC3339)
 	return fmt.Sprintf("%s/api/v1/my/devices/android/%s/readings/series?metric=heart_rate&bucket=1d&from=%s&to=%s",
 		base, mac, from, to)
+}
+
+// doRequest 发送一次请求并读出响应体；headers 可为 nil，返回状态码、响应体与耗时错误。
+func doRequest(client *http.Client, method, url, token string, body []byte, headers map[string]string) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, nil
+}
+
+// seedScenes 用定时条件（不依赖设备）预置场景，供列表与字段级写入场景使用。
+func seedScenes(client *http.Client, base, token string, count int) ([]string, error) {
+	ids := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		body, _ := json.Marshal(map[string]any{
+			"name":    fmt.Sprintf("loadgen-%03d", i),
+			"trigger": map[string]any{"kind": "schedule", "timeOfDay": "08:00", "timezone": "UTC"},
+			"actions": []any{map[string]any{"kind": "log", "message": "tick", "level": "info"}},
+		})
+		status, data, err := doRequest(client, http.MethodPost, base+"/api/v1/scenes", token, body, nil)
+		if err != nil {
+			return nil, err
+		}
+		if status != http.StatusCreated {
+			return nil, fmt.Errorf("创建场景 status=%d body=%s", status, data)
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil || out.ID == "" {
+			return nil, fmt.Errorf("解析场景 id 失败: body=%s err=%v", data, err)
+		}
+		ids = append(ids, out.ID)
+	}
+	return ids, nil
+}
+
+// fetchETag 预取目录版本 ETag：后续请求带 If-None-Match 才能命中 304。
+func fetchETag(client *http.Client, url, token string) (int, string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, resp.Header.Get("ETag"), nil
+}
+
+// runChanges 返回增量读场景：每个 worker 维护自己的游标，按响应 nextCursor 推进，
+// 到底后回到 0 继续读，模拟客户端反复增量同步。
+func runChanges(client *http.Client, base, token string, limit int) func(*stats, int) {
+	var (
+		mu      sync.Mutex
+		cursors = map[int]*int64{}
+	)
+	cursorFor := func(worker int) *int64 {
+		mu.Lock()
+		defer mu.Unlock()
+		p, ok := cursors[worker]
+		if !ok {
+			p = new(int64)
+			cursors[worker] = p
+		}
+		return p
+	}
+	return func(s *stats, worker int) {
+		c := cursorFor(worker)
+		url := fmt.Sprintf("%s/api/v1/sync/changes?limit=%d&cursor=%d", base, limit, atomic.LoadInt64(c))
+		start := time.Now()
+		status, data, err := doRequest(client, http.MethodGet, url, token, nil, nil)
+		elapsed := time.Since(start)
+		if err != nil {
+			s.record(elapsed, 0)
+			return
+		}
+		if status == http.StatusOK {
+			var page struct {
+				NextCursor int64 `json:"nextCursor"`
+				HasMore    bool  `json:"hasMore"`
+			}
+			if json.Unmarshal(data, &page) == nil {
+				next := page.NextCursor
+				if !page.HasMore {
+					next = 0
+				}
+				atomic.StoreInt64(c, next)
+			}
+		}
+		s.record(elapsed, status)
+	}
+}
+
+func runScenesRead(client *http.Client, base, token string, st *stats) {
+	start := time.Now()
+	status, _, err := doRequest(client, http.MethodGet, base+"/api/v1/scenes", token, nil, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		st.record(elapsed, 0)
+		return
+	}
+	st.record(elapsed, status)
+}
+
+var sceneWriteSeq int64
+
+// runScenesWrite 返回字段级写入场景：每个请求改一个不同场景的 name，触发一次真实 UPDATE
+// 与 change_log 写入；value 每次不同，保证不会被 LWW 判成幂等 no-op。
+func runScenesWrite(client *http.Client, base, token string, ids []string) func(*stats, int) {
+	return func(s *stats, worker int) {
+		if len(ids) == 0 {
+			s.record(0, 0)
+			return
+		}
+		seq := atomic.AddInt64(&sceneWriteSeq, 1)
+		id := ids[worker%len(ids)]
+		body, _ := json.Marshal(map[string]any{
+			"name": map[string]any{
+				"value":     fmt.Sprintf("loadgen-%d", seq),
+				"updatedAt": time.Now().UTC(),
+			},
+		})
+		start := time.Now()
+		status, _, err := doRequest(client, http.MethodPut, base+"/api/v1/scenes/"+id, token, body, nil)
+		elapsed := time.Since(start)
+		if err != nil {
+			s.record(elapsed, 0)
+			return
+		}
+		s.record(elapsed, status)
+	}
+}
+
+var feedbackSeq int64
+
+func runFeedbackWrite(client *http.Client, base, token string, st *stats) {
+	seq := atomic.AddInt64(&feedbackSeq, 1)
+	body, _ := json.Marshal(map[string]any{
+		"kind": "experience",
+		"body": fmt.Sprintf("loadgen feedback %d at %s", seq, time.Now().UTC().Format(time.RFC3339Nano)),
+		"context": map[string]any{
+			"platform": "android", "appVersion": "0.21.0", "buildType": "release",
+			"osVersion": "14", "deviceModel": "loadgen",
+		},
+	})
+	start := time.Now()
+	status, _, err := doRequest(client, http.MethodPost, base+"/api/v1/feedback", token, body, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		st.record(elapsed, 0)
+		return
+	}
+	st.record(elapsed, status)
+}
+
+func runFeedbackRead(client *http.Client, base, token string, st *stats) {
+	start := time.Now()
+	status, _, err := doRequest(client, http.MethodGet, base+"/api/v1/feedback/mine?limit=20", token, nil, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		st.record(elapsed, 0)
+		return
+	}
+	st.record(elapsed, status)
+}
+
+// runCatalog 返回目录读取场景：带 If-None-Match，命中时服务端返回 304。
+func runCatalog(client *http.Client, base, token, etag string, st *stats) {
+	start := time.Now()
+	status, _, err := doRequest(client, http.MethodGet, base+"/api/v1/catalog/device-types", token, nil,
+		map[string]string{"If-None-Match": etag})
+	elapsed := time.Since(start)
+	if err != nil {
+		st.record(elapsed, 0)
+		return
+	}
+	st.record(elapsed, status)
 }
