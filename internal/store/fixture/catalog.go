@@ -138,10 +138,3 @@ func (s *Store) RecordCatalogAccess(ctx context.Context, userID string, catalogV
 	versions[catalogVersion] = struct{}{}
 	return nil
 }
-
-// catalogAccessCount 仅供测试观察访问是否按用户记录。
-func (s *Store) catalogAccessCount(userID string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.catalogAccesses[userID])
-}

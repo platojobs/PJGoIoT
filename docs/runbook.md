@@ -87,6 +87,7 @@
 | v0.18.0 迁移 | **已验证** | 临时库 `up → down（000014）→ up`：`device_type_catalog` / 索引 / 审计 / 访问 / 版本表增删正确，重新 up 后 seed 5 行 |
 | v0.18.0 契约一致性 | **已验证** | `TestOpenAPICatalogContract`：4 个 schema 的 properties/required 与模型一致、公开读取 `security: []`、304 响应存在、admin 路径 `x-audience: internal` / `x-client-sdk: false` |
 | v0.18.0 OpenAPI 契约 | **已验证** | `npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 0.14.0 |
+| v0.18.0 CI | **已验证** | GitHub Actions [run 42166636796](https://github.com/platojobs/PJGoIoT/actions/runs/42166636796) 四 job 全绿；`TestPostgresCatalogDeviceTypesIntegration` 各子测试执行且 job 成功 |
 | 生产域名 / ACME 证书 | **未验证** | 需要真实域名与 80/443 可达，本机未开通任何云账号 |
 | systemd timer / 真实 cron | **未验证** | 仅提供示例文本，未在目标主机安装 |
 | 数小时长稳压 / 多实例长稳 | **未验证** | 多实例已做并发/滚动/故障短时验证；未做数小时长稳与跨主机多实例 |

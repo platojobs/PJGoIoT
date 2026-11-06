@@ -1479,6 +1479,7 @@ seed 数据来源与边界：
 | v0.18.0 迁移 | 通过：临时库 `up → down（000014）→ up`，`device_type_catalog` 及其索引/审计/访问/版本表可正确增删；重新执行 up 后 seed 行数为 5 |
 | v0.18.0 契约一致性 | 通过：`TestOpenAPICatalogContract` 比对 `CatalogMetric` / `CatalogDeviceType` / `DeviceTypeCatalog` / `CatalogDeviceTypeInput` 的 properties/required 与模型 JSON 字段；公开读取 `security: []`、304 响应、admin 路径 `x-audience: internal` / `x-client-sdk: false` |
 | v0.18.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning，均为 operation-4xx-response 提示）；契约版本 **0.14.0** |
+| v0.18.0 CI | 通过：GitHub Actions [run 42166636796](https://github.com/platojobs/PJGoIoT/actions/runs/42166636796) 四 job 全绿；`Postgres 集成测试` 执行 `TestPostgresCatalogDeviceTypesIntegration` 全部子测试，`OpenAPI 契约校验` 0 error |
 | v0.18.0 客户端接入 | 未验证：两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
 | v0.18.0 admin 并发 | 未验证：目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
