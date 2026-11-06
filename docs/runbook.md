@@ -153,6 +153,7 @@
 | v0.24.0 e2e 栈 | **已验证（Docker PG + 本地 API）** | `scripts/stack-for-e2e.sh` + `seed-for-e2e.sh`：push `applied=1 skipped=0 conflicts=0`；`user_devices=1`、`readings=24`、`device_types=5`，firmware/accessory/public_model 校验通过 |
 | v0.24.0 契约 | **已验证** | `openapi info.version=0.19.0`；`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；health 示例版本 0.24.0 |
 | v0.24.0 校验 job 等价项 | **已验证（本机）** | YAML 解析（compose/alerts/scrape）、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（新脚本 0 告警）全部通过 |
+| v0.24.0 CI | **已验证** | GitHub Actions [run 42292106877](https://github.com/platojobs/PJGoIoT/actions/runs/42292106877) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 | v0.24.0 未验证 | **未验证** | >40 并发 / 单段 >20 分钟 / 多实例 / 跨主机 TLS；把池排队推到请求预算以上观察 503 的边界；场景数上千；真实 FCM/APNs 与生产部署状态同 v0.23.0 |
 
 ## 1. 部署前检查清单

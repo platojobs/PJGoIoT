@@ -1744,6 +1744,7 @@ seed 数据来源与边界：
 | v0.24.0 admin 双密钥轮换 | 通过（单元 + HTTP）：窗口内新旧密钥并存 200、未知/空 401、窗口过期后旧密钥 401 而当前仍 200、未配置 404 |
 | v0.24.0 单测与 e2e | 通过：`go test ./...`（含 `TEST_DATABASE_URL` 真实 PG）**107 个顶层测试 + 194 子测试全 PASS，0 FAIL**；`scripts/stack-for-e2e.sh` + `seed-for-e2e.sh` 在 Docker PostgreSQL 上 `applied=1 skipped=0 conflicts=0`、readings=24 |
 | v0.24.0 契约一致性 | 通过：`openapi info.version=0.19.0`；`/metrics` 新增连接池指标、admin 双密钥轮换语义写入契约；`redocly lint` **0 error**（14 条非阻断 warning） |
+| v0.24.0 CI | 通过：GitHub Actions [run 42292106877](https://github.com/platojobs/PJGoIoT/actions/runs/42292106877) 四 job 全绿（`构建与测试` 含真实 PG 集成与 OpenAPI 契约校验、`配置与脚本校验` 含新脚本 shellcheck、`压测门槛（smoke）`、`构建镜像`） |
 | v0.24.0 未验证 | 未验证：>40 并发 / 单段 >20 分钟 / 多实例 / 跨主机 TLS；把池排队推到请求预算以上观察 503；场景数上千；真实 FCM/APNs 状态同 v0.23.0 |
 | `docker build` | 通过（GitHub Actions `构建镜像` job，v0.6.0 提交 8a5e4bd，run 41951827338） |
 | GitHub Actions | 通过（v0.6.0：gofmt、vet、build、单元测试、迁移到 version=7、Postgres 集成测试、distroless 镜像构建；run 41951827338） |
