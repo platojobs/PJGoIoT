@@ -1503,6 +1503,9 @@ seed 数据来源与边界：
 | v0.18.0 契约一致性 | 通过：`TestOpenAPICatalogContract` 比对 `CatalogMetric` / `CatalogDeviceType` / `DeviceTypeCatalog` / `CatalogDeviceTypeInput` 的 properties/required 与模型 JSON 字段；公开读取 `security: []`、304 响应、admin 路径 `x-audience: internal` / `x-client-sdk: false` |
 | v0.18.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning，均为 operation-4xx-response 提示）；契约版本 **0.14.0** |
 | v0.18.0 CI | 通过：GitHub Actions [run 42166636796](https://github.com/platojobs/PJGoIoT/actions/runs/42166636796) 四 job 全绿；`Postgres 集成测试` 执行 `TestPostgresCatalogDeviceTypesIntegration` 全部子测试，`OpenAPI 契约校验` 0 error |
+| v0.19.0 迁移 | 通过：临时库 `up → down（000015）→ up`，`account_deletion_tokens` / `personal_data_export_tasks` 与四个索引可正确增删；重新执行 up 后迁移版本 16 |
+| v0.19.0 OpenAPI 契约 | 通过：`npx @redocly/cli lint api/openapi.yaml` → **0 error**（14 条非阻断 warning）；契约版本 **0.15.0** |
+| v0.19.0 CI | 通过：GitHub Actions [run 42170187766](https://github.com/platojobs/PJGoIoT/actions/runs/42170187766) 四 job 全绿；`Postgres 集成测试` 执行 `TestPostgresAccountDeletionExportIntegration` 三个子测试，`OpenAPI 契约校验` 0 error |
 | v0.18.0 客户端接入 | 未验证：两端 App 仍使用本地常量，尚未切到 `GET /catalog/device-types`；缓存失效、离线回退与灰度开关未在真实客户端验证 |
 | v0.18.0 admin 并发 | 未验证：目录写入单事务 + 版本自增，但未做多实例并发 PUT 压测；共享 `ADMIN_TOKEN` 下审计 actor 固定为 `admin` |
 | v0.19.0 删除令牌与逐表清空 | 通过（真实 PostgreSQL）：错误令牌/过期令牌分别返回明确错误；删除前 14 张关联表全部非空，删除后逐表计数为 0，`users` 为 0；新申请作废旧令牌 |
