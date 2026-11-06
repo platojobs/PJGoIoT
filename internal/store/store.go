@@ -128,6 +128,15 @@ type Store interface {
 	UserIDByTokenHash(ctx context.Context, tokenHash string) (userID string, err error)
 	// RevokeToken 吊销 token，重复吊销不报错。
 	RevokeToken(ctx context.Context, tokenHash string) error
+	// RefreshToken 轮换 token：校验旧 token 仍有效后在同一个事务内吊销旧 token 并写入新 token。
+	// 旧 token 不存在、已吊销或已过期时返回 ErrUnauthorized（刷新不能复活已吊销 token）。
+	RefreshToken(ctx context.Context, oldTokenHash string, newTokenHash string, now time.Time, newExpiresAt time.Time) (userID string, err error)
+	// ListSessions 返回账号当前有效（未吊销、未过期）的登录会话，按创建时间倒序。
+	// currentTokenHash 用于标记当前请求所在的会话。
+	ListSessions(ctx context.Context, userID string, currentTokenHash string) ([]model.Session, error)
+	// RevokeSession 按会话 id 吊销单个会话；不存在或不属于该账号返回 ErrNotFound。
+	// 已吊销的会话再次调用按幂等成功处理（204）。
+	RevokeSession(ctx context.Context, userID string, sessionID string, now time.Time) error
 	// GetUser 返回账号基础信息，供数据导出使用。
 	GetUser(ctx context.Context, userID string) (model.User, error)
 
@@ -147,6 +156,12 @@ type Store interface {
 	FinishExportTask(ctx context.Context, taskID string, artifact model.PersonalDataExport) error
 	// FailExportTask 把任务置为 failed 并写入对外可读原因。
 	FailExportTask(ctx context.Context, taskID string, reason string) error
+	// ReconcileExportTasks 把创建时间早于 olderThan 且仍为 pending 的任务标记为 failed，
+	// 返回本次标记条数。用于进程被 SIGKILL 后启动时对账：任务在进程内 goroutine 执行，
+	// 进程退出后不会有人再推进状态，必须由重启对账收敛。
+	// 实现必须幂等：单条 UPDATE ... WHERE status = 'pending'，多实例并发启动时
+	// 只有实际推进状态的那次会计入条数，不会重复处理同一任务，也不会触碰 ready/failed。
+	ReconcileExportTasks(ctx context.Context, olderThan time.Time, reason string) (int64, error)
 	// GetExportTask 按 (userID, taskID) 查询任务；不存在或不属于该用户返回 ErrNotFound。
 	GetExportTask(ctx context.Context, userID string, taskID string) (model.ExportTaskStatus, error)
 	// PrepareExportDownload 为 ready 的任务签发一次性下载令牌（只存哈希），替换旧令牌。

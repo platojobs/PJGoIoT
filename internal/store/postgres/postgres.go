@@ -255,6 +255,110 @@ func (s *Store) RevokeToken(ctx context.Context, tokenHash string) error {
 	return nil
 }
 
+// RefreshToken 实现 store.Store：滚动轮换 token。
+//
+// 旋转而非「保留旧 token 到过期」：180 天 TTL 很长，若旧 token 继续可用，
+// 设备丢失/泄漏时刷新只会多出一个可用凭据，无法缩小攻击窗口。旋转后旧 token
+// 立即失效，且因为吊销是数据库事实，刷新接口本身也不能把已吊销的 token 复活。
+// 行锁保证并发刷新同一 token 时只有一次成功：另一个事务会读到 revoked_at 非空而返回 401。
+func (s *Store) RefreshToken(ctx context.Context, oldTokenHash string, newTokenHash string, now time.Time, newExpiresAt time.Time) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	var userID uuid.UUID
+	err = tx.QueryRowContext(ctx, `
+		SELECT user_id FROM tokens
+		WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $2
+		FOR UPDATE`, oldTokenHash, now.UTC()).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", store.ErrUnauthorized
+	}
+	if err != nil {
+		return "", fmt.Errorf("查询待刷新 token 失败: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tokens SET revoked_at = $2 WHERE token_hash = $1`, oldTokenHash, now.UTC()); err != nil {
+		return "", fmt.Errorf("吊销旧 token 失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
+		userID, newTokenHash, newExpiresAt.UTC()); err != nil {
+		return "", fmt.Errorf("签发新 token 失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("提交事务失败: %w", err)
+	}
+	return userID.String(), nil
+}
+
+// ListSessions 实现 store.Store。
+// 只返回未吊销且未过期的会话；current 由 token_hash 精确匹配计算，不返回哈希本身。
+func (s *Store) ListSessions(ctx context.Context, userID string, currentTokenHash string) ([]model.Session, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("非法 user id: %w", err)
+	}
+	ctx, cancel := queryTimeout(ctx)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, created_at, expires_at, token_hash = $2
+		FROM tokens
+		WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
+		ORDER BY created_at DESC, id DESC`, uid, currentTokenHash)
+	if err != nil {
+		return nil, fmt.Errorf("查询会话失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]model.Session, 0)
+	for rows.Next() {
+		var item model.Session
+		var id uuid.UUID
+		if err := rows.Scan(&id, &item.CreatedAt, &item.ExpiresAt, &item.Current); err != nil {
+			return nil, fmt.Errorf("解析会话失败: %w", err)
+		}
+		item.ID = id.String()
+		item.CreatedAt = item.CreatedAt.UTC()
+		item.ExpiresAt = item.ExpiresAt.UTC()
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历会话失败: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeSession 实现 store.Store。
+// 按 (user_id, id) 定位，跨用户与不存在统一返回 ErrNotFound；已吊销的会话重复调用返回 nil。
+func (s *Store) RevokeSession(ctx context.Context, userID string, sessionID string, now time.Time) error {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("非法 user id: %w", err)
+	}
+	sid, err := uuid.Parse(sessionID)
+	if err != nil {
+		return store.ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tokens SET revoked_at = COALESCE(revoked_at, $3)
+		WHERE id = $1 AND user_id = $2`, sid, uid, now.UTC())
+	if err != nil {
+		return fmt.Errorf("吊销会话失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取吊销结果失败: %w", err)
+	}
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 // dbQueryTimeout 是 API 查询的默认数据库超时预算。
 // 超过后由 pgx 取消查询，HTTP 层映射为 503 TIMEOUT，避免请求无限挂起。
 const dbQueryTimeout = 3 * time.Second
@@ -1157,11 +1261,22 @@ func (s *Store) Changes(ctx context.Context, userID string, cursor int64, limit 
 	// 保留边界检查：若该用户最早保留的 seq 比 cursor+1 还大，说明中间的行已被清理，
 	// 静默返回空页会让客户端永久丢数据，因此返回 ErrCursorExpired。
 	// cursor=0 表示客户端从未同步过，此时从头拉取剩余变更即可，不构成数据缺口。
+	//
+	// 下限查询必须走索引：可见范围是「本人行 ∪ 所属家庭行」，若写成
+	// `user_id = $1 OR household_id IN (...)`，优化器无法分别利用两个复合索引的
+	// (user_id/household_id, seq) 有序前缀，只能退化成主键扫描 + Filter，成本随
+	// change_log 全局行数增长（111 万行时 ~63 ms / 8.8 万 buffers）。
+	// 改写为「本人分支 MIN + 每个家庭分支 MIN」后，每个分支都是 LIMIT 1 的
+	// Index Only Scan，代价只与分支数有关，与全局行数无关。
+	// 语义不变：MIN 对集合并取最小值，等价于先取各分支最小值再取整体最小值。
 	var minSeq sql.NullInt64
 	if err := s.db.QueryRowContext(qctx, `
-		SELECT MIN(c.seq) FROM change_log c
-		WHERE c.user_id = $1 OR c.household_id IN (
-			SELECT hm.household_id FROM household_members hm WHERE hm.user_id = $1)`, uid).Scan(&minSeq); err != nil {
+		SELECT min(x) FROM (
+			SELECT min(seq) AS x FROM change_log WHERE user_id = $1
+			UNION ALL
+			SELECT (SELECT min(seq) FROM change_log WHERE household_id = m.household_id) AS x
+			FROM household_members m WHERE m.user_id = $1
+		) s`, uid).Scan(&minSeq); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return model.ChangesPage{}, store.ErrTimeout
 		}

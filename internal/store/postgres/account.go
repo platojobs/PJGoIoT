@@ -437,6 +437,31 @@ func (s *Store) FailExportTask(ctx context.Context, taskID string, reason string
 	return nil
 }
 
+// ReconcileExportTasks 实现 store.Store。
+//
+// 选择「标记 failed」而不是「重新入队」：任务执行体是进程内 goroutine，没有持久队列与
+// worker 领取协议；若在对账时重新入队，需要额外实现「谁领取、如何防重复、产物写回」，
+// 其复杂度与风险远大于收益。导出本身可随时重新发起且产物有 24 小时 TTL，
+// 直接把超时未完成的任务收敛为 failed 并给出可读原因，客户端据此提示重新申请即可。
+//
+// 幂等性由单条 UPDATE 的条件保证：只有 status='pending' 且创建时间早于阈值的行会被
+// 第一次推进到 failed，之后的实例（包括并发启动的其他实例）更新 0 行；
+// 条件同时保证不会触碰 ready/failed 任务。
+func (s *Store) ReconcileExportTasks(ctx context.Context, olderThan time.Time, reason string) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE personal_data_export_tasks
+		SET status = 'failed', artifact = NULL, failure_reason = $2, completed_at = now()
+		WHERE status = 'pending' AND created_at < $1`, olderThan.UTC(), reason)
+	if err != nil {
+		return 0, fmt.Errorf("对账导出任务失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取对账结果失败: %w", err)
+	}
+	return n, nil
+}
+
 // GetExportTask 实现 store.Store。
 func (s *Store) GetExportTask(ctx context.Context, userID string, taskID string) (model.ExportTaskStatus, error) {
 	uid, err := uuid.Parse(userID)
@@ -450,11 +475,12 @@ func (s *Store) GetExportTask(ctx context.Context, userID string, taskID string)
 	var status model.ExportTaskStatus
 	var id uuid.UUID
 	var completedAt sql.NullTime
+	var failureReason sql.NullString
 	err = s.db.QueryRowContext(ctx, `
-		SELECT id, status, created_at, completed_at, expires_at
+		SELECT id, status, created_at, completed_at, expires_at, failure_reason
 		FROM personal_data_export_tasks
 		WHERE id = $1 AND user_id = $2 AND expires_at > now()`, tid, uid).
-		Scan(&id, &status.Status, &status.CreatedAt, &completedAt, &status.ExpiresAt)
+		Scan(&id, &status.Status, &status.CreatedAt, &completedAt, &status.ExpiresAt, &failureReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.ExportTaskStatus{}, store.ErrNotFound
 	}
@@ -464,6 +490,9 @@ func (s *Store) GetExportTask(ctx context.Context, userID string, taskID string)
 	status.ID = id.String()
 	status.CreatedAt = status.CreatedAt.UTC()
 	status.ExpiresAt = status.ExpiresAt.UTC()
+	if failureReason.Valid {
+		status.FailureReason = failureReason.String
+	}
 	if completedAt.Valid {
 		t := completedAt.Time.UTC()
 		status.CompletedAt = &t

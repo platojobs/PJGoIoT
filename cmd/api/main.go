@@ -24,6 +24,14 @@ import (
 	"github.com/platojobs/PJGoIoT/internal/store/postgres"
 )
 
+const (
+	// exportReconcileThreshold 是启动对账的判定阈值。导出任务自身有 60 秒构建预算，
+	// 5 分钟仍未完成说明执行它的进程已经退出，任务不可能再被推进。
+	exportReconcileThreshold = 5 * time.Minute
+	// exportInterruptedReason 是回给客户端的可读失败原因，客户端据此提示重新申请导出。
+	exportInterruptedReason = "导出任务因服务重启中断，请重新发起导出"
+)
+
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "作为容器健康检查：请求本地健康接口后退出")
 	flag.Parse()
@@ -73,6 +81,18 @@ func main() {
 		logger.Info("启动清理过期配对码完成", "deleted", n)
 	}
 	cleanupCancel()
+
+	// 启动对账：导出任务在进程内 goroutine 执行，进程被 SIGKILL 后状态会永久停在 pending，
+	// 直到 24 小时 TTL 被清理。启动时把超过阈值仍未完成的任务收敛为 failed 并写原因，
+	// 客户端轮询时能拿到可读提示并重新申请。多实例并发启动时该 UPDATE 幂等，
+	// 只有实际推进状态的一次会计入条数。对账失败不阻塞启动（服务本身仍可用）。
+	reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if n, err := st.ReconcileExportTasks(reconcileCtx, time.Now().UTC().Add(-exportReconcileThreshold), exportInterruptedReason); err != nil {
+		logger.Warn("启动对账导出任务失败", "error", err)
+	} else if n > 0 {
+		logger.Info("启动对账导出任务完成", "failed", n)
+	}
+	reconcileCancel()
 
 	// draining 为 true 后 readiness 立即返回 503；滚动发布脚本依赖该信号让反代先摘流量。
 	var draining atomic.Bool

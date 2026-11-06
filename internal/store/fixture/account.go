@@ -361,6 +361,7 @@ func (s *Store) FinishExportTask(ctx context.Context, taskID string, artifact mo
 	now := time.Now().UTC()
 	task.status = "ready"
 	task.artifact = &artifact
+	task.failureReason = ""
 	task.completedAt = &now
 	return nil
 }
@@ -466,12 +467,32 @@ func (s *Store) CleanupExportTasks(ctx context.Context, before time.Time) (int64
 	return n, nil
 }
 
+// ReconcileExportTasks 实现 store.Store。
+func (s *Store) ReconcileExportTasks(ctx context.Context, olderThan time.Time, reason string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	now := time.Now().UTC()
+	for _, task := range s.exportTasks {
+		if task.status != "pending" || !task.createdAt.Before(olderThan.UTC()) {
+			continue
+		}
+		task.status = "failed"
+		task.artifact = nil
+		task.failureReason = reason
+		task.completedAt = &now
+		n++
+	}
+	return n, nil
+}
+
 func exportTaskStatus(task *exportTaskRecord) model.ExportTaskStatus {
 	out := model.ExportTaskStatus{
-		ID:        task.id,
-		Status:    task.status,
-		CreatedAt: task.createdAt.UTC(),
-		ExpiresAt: task.expiresAt.UTC(),
+		ID:            task.id,
+		Status:        task.status,
+		CreatedAt:     task.createdAt.UTC(),
+		ExpiresAt:     task.expiresAt.UTC(),
+		FailureReason: task.failureReason,
 	}
 	if task.completedAt != nil {
 		t := task.completedAt.UTC()
@@ -517,7 +538,7 @@ func (s *Store) ClaimPairingCode(ctx context.Context, codeHash string, tokenHash
 	}
 
 	delete(s.pairingCodes, codeHash)
-	s.tokens[tokenHash] = tokenRecord{userID: rec.userID, expiresAt: tokenExpiresAt.UTC()}
+	s.tokens[tokenHash] = tokenRecord{id: uuid.NewString(), userID: rec.userID, createdAt: now.UTC(), expiresAt: tokenExpiresAt.UTC()}
 	return rec.userID, nil
 }
 

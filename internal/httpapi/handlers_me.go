@@ -157,6 +157,7 @@ func exportTaskView(task model.ExportTaskStatus, token string) model.ExportTask 
 		Status:            task.Status,
 		CreatedAt:         task.CreatedAt,
 		CompletedAt:       task.CompletedAt,
+		FailureReason:     task.FailureReason,
 		DownloadExpiresAt: task.DownloadExpiresAt,
 		ExpiresAt:         task.ExpiresAt,
 	}

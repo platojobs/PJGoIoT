@@ -41,6 +41,7 @@ type exportTaskResp struct {
 	Status            string     `json:"status"`
 	CreatedAt         time.Time  `json:"createdAt"`
 	CompletedAt       *time.Time `json:"completedAt,omitempty"`
+	FailureReason     string     `json:"failureReason,omitempty"`
 	DownloadURL       string     `json:"downloadUrl,omitempty"`
 	DownloadExpiresAt *time.Time `json:"downloadExpiresAt,omitempty"`
 	ExpiresAt         time.Time  `json:"expiresAt"`

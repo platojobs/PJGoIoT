@@ -29,8 +29,11 @@ type idempotencyRecord struct {
 
 // tokenRecord 是内存版 token，与 tokens 表一一对应。
 type tokenRecord struct {
+	id        string
 	userID    string
+	createdAt time.Time
 	expiresAt time.Time
+	revokedAt *time.Time
 }
 
 type changeRecord struct {
@@ -332,7 +335,7 @@ func (s *Store) CreateUserWithToken(ctx context.Context, tokenHash string, expir
 		kind:      "anonymous",
 		createdAt: time.Now().UTC(),
 	}
-	s.tokens[tokenHash] = tokenRecord{userID: userID, expiresAt: expiresAt.UTC()}
+	s.tokens[tokenHash] = tokenRecord{id: uuid.NewString(), userID: userID, createdAt: time.Now().UTC(), expiresAt: expiresAt.UTC()}
 	s.createPersonalHouseholdLocked(userID)
 	return userID, nil
 }
@@ -342,7 +345,7 @@ func (s *Store) UserIDByTokenHash(ctx context.Context, tokenHash string) (string
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.tokens[tokenHash]
-	if !ok || !rec.expiresAt.After(time.Now().UTC()) {
+	if !ok || rec.revokedAt != nil || !rec.expiresAt.After(time.Now().UTC()) {
 		return "", store.ErrUnauthorized
 	}
 	return rec.userID, nil
@@ -356,17 +359,71 @@ func (s *Store) RevokeToken(ctx context.Context, tokenHash string) error {
 	if !ok {
 		return store.ErrUnauthorized
 	}
-	userID := rec.userID
-	delete(s.tokens, tokenHash)
-	delete(s.users, userID)
-	for i := range s.changes {
-		if s.changes[i].userID == userID {
-			// 用户注销后其变更不再对外可见。
-			s.changes[i].payload = json.RawMessage(`null`)
-		}
+	if rec.revokedAt == nil {
+		now := time.Now().UTC()
+		rec.revokedAt = &now
+		s.tokens[tokenHash] = rec
 	}
-	// 变更日志按 user_id 过滤，删除用户后自然不可见，无需重写。
 	return nil
+}
+
+// RefreshToken 实现 store.Store。
+func (s *Store) RefreshToken(ctx context.Context, oldTokenHash string, newTokenHash string, now time.Time, newExpiresAt time.Time) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.tokens[oldTokenHash]
+	if !ok || rec.revokedAt != nil || !rec.expiresAt.After(now.UTC()) {
+		return "", store.ErrUnauthorized
+	}
+	t := now.UTC()
+	rec.revokedAt = &t
+	s.tokens[oldTokenHash] = rec
+	s.tokens[newTokenHash] = tokenRecord{
+		id: uuid.NewString(), userID: rec.userID, createdAt: now.UTC(), expiresAt: newExpiresAt.UTC(),
+	}
+	return rec.userID, nil
+}
+
+// ListSessions 实现 store.Store。
+func (s *Store) ListSessions(ctx context.Context, userID string, currentTokenHash string) ([]model.Session, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().UTC()
+	out := make([]model.Session, 0)
+	for hash, rec := range s.tokens {
+		if rec.userID != userID || rec.revokedAt != nil || !rec.expiresAt.After(now) {
+			continue
+		}
+		out = append(out, model.Session{
+			ID: rec.id, CreatedAt: rec.createdAt.UTC(), ExpiresAt: rec.expiresAt.UTC(),
+			Current: hash == currentTokenHash,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out, nil
+}
+
+// RevokeSession 实现 store.Store。
+func (s *Store) RevokeSession(ctx context.Context, userID string, sessionID string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, rec := range s.tokens {
+		if rec.id != sessionID || rec.userID != userID {
+			continue
+		}
+		if rec.revokedAt == nil {
+			t := now.UTC()
+			rec.revokedAt = &t
+			s.tokens[hash] = rec
+		}
+		return nil
+	}
+	return store.ErrNotFound
 }
 
 // ListUserDevices 实现 store.Store。

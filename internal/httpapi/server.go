@@ -68,8 +68,15 @@ func (s *Server) registerRoutes(r *gin.Engine) {
 	authGroup.POST("/anonymous", s.handleAnonymous)
 	authGroup.POST("/login", s.handleLogin)
 	authGroup.POST("/logout", s.requireAuth(), s.handleLogout)
+	// 刷新使用滚动轮换：旧 token 立即失效，新 token 获得新的 TTL。
+	authGroup.POST("/refresh", s.requireAuth(), s.handleRefreshToken)
 	authGroup.POST("/pairing-code", s.requireAuth(), s.handleCreatePairingCode)
 	authGroup.POST("/pairing-code/claim", s.claimRateLimit(), s.handleClaimPairingCode)
+
+	// 登录会话：列出与单独吊销。删除账号时 tokens 表随账号一并清理。
+	sessionsGroup := api.Group("/sessions", s.requireAuth())
+	sessionsGroup.GET("", s.handleListSessions)
+	sessionsGroup.DELETE("/:id", s.handleRevokeSession)
 
 	// 账号数据：删除与导出。
 	// DELETE /me 只用一次性删除令牌鉴权（账号删除后 Bearer 已失效，重放必须得到 404 而不是 401）。

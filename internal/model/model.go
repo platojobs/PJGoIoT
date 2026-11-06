@@ -521,11 +521,13 @@ type DeletionRequest struct {
 
 // ExportTask 是 POST /me/export 与 GET /me/export/{id} 的响应体（异步导出）。
 // Status 取值 pending / ready / failed；仅 ready 时返回 downloadUrl 与 downloadExpiresAt。
+// failed 时返回 failureReason，客户端据此提示用户重新发起导出。
 type ExportTask struct {
 	ID                string     `json:"id"`
 	Status            string     `json:"status"`
 	CreatedAt         time.Time  `json:"createdAt"`
 	CompletedAt       *time.Time `json:"completedAt,omitempty"`
+	FailureReason     string     `json:"failureReason,omitempty"`
 	DownloadURL       string     `json:"downloadUrl,omitempty"`
 	DownloadExpiresAt *time.Time `json:"downloadExpiresAt,omitempty"`
 	ExpiresAt         time.Time  `json:"expiresAt"`
@@ -537,8 +539,18 @@ type ExportTaskStatus struct {
 	Status            string
 	CreatedAt         time.Time
 	CompletedAt       *time.Time
+	FailureReason     string
 	ExpiresAt         time.Time
 	DownloadExpiresAt *time.Time
+}
+
+// Session 是 GET /sessions 返回的一条登录会话（服务端只存 token 哈希，不暴露 token 本身）。
+// Current 标记本次请求所用的会话，供客户端识别「当前设备」。
+type Session struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"createdAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	Current   bool      `json:"current"`
 }
 
 // ExportReadingAggregate 是导出中的读数聚合项：按 (platform, externalId, metric, unit) 分组。

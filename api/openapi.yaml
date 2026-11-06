@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.16.0
+  version: 0.17.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -56,6 +56,12 @@ info:
       `change_log` 的 `scene` entity（`household_id` 恒为 NULL，仅本人可见）。
       `PUT` 为**字段级 LWW**：每个出现的字段自带 `updatedAt`，并发修改不同字段互不覆盖；
       同一字段冲突时服务端较新值静默获胜。场景引用的设备被删除后场景保留，但 `deviceMissing=true`。
+    - 自契约 `0.17.0`（服务 v0.22.0）起补齐凭据生命周期：
+      `POST /auth/refresh` 用当前有效 token 换取新 token 并**立即吊销旧 token**（滚动 TTL，旧 token 不可复活）；
+      `GET /sessions` 列出账号全部有效登录会话（`current` 标记本次请求所用会话），
+      `DELETE /sessions/{id}` 单独吊销指定会话（跨用户/不存在统一 404，重复吊销幂等 204）；
+      删除账号时 `tokens` 随账号一并清理。导出任务新增 `failureReason`：
+      进程重启后启动对账会把超过 5 分钟仍未完成的任务标记为 `failed`，客户端据此提示重新申请。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -96,7 +102,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.21.0"
+                version: "0.22.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -159,6 +165,83 @@ paths:
           description: 吊销成功
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refreshToken
+      summary: 滚动刷新 token（旧 token 立即失效）
+      description: |
+        用当前**未过期、未吊销**的 Bearer token 换取新 token：
+
+        - 旧 token 在同一事务内被吊销，`expiresAt` 按当前时间重新计算（滚动 TTL）；
+        - 刷新成功后旧 token 立即返回 `401`，且不能再用旧 token 刷新（吊销是服务端事实，刷新无法复活）；
+        - 并发刷新同一 token 时只有一个请求成功，其余返回 `401`；
+        - 响应体与 `/auth/anonymous` 相同（`userId` / `token` / `expiresAt`），客户端应原子替换本地 token。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnonymousResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /sessions:
+    get:
+      tags: [auth]
+      operationId: listSessions
+      summary: 列出当前账号的登录会话
+      description: |
+        只返回未吊销且未过期的会话，按创建时间倒序。响应不包含 token 本身，服务端只存哈希；
+        `current=true` 标记本次请求所用的会话。删除账号时全部会话随账号清理。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/Timeout"
+
+  /sessions/{id}:
+    delete:
+      tags: [auth]
+      operationId: revokeSession
+      summary: 吊销指定登录会话
+      description: |
+        按会话 id 吊销单个会话，吊销后该会话对应的 token 立即返回 `401`，且不能被刷新复活。
+        不存在或属于其他账号统一返回 `404`，不泄露会话是否存在；已吊销会话重复调用返回 `204`（幂等）。
+        可以吊销当前会话（等价于 `/auth/logout`）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 会话 id（`GET /sessions` 返回的 `id`）
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: 吊销成功
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Timeout"
 
   /auth/pairing-code:
     post:
@@ -2804,6 +2887,35 @@ components:
           format: date-time
           description: token 过期时间（默认创建后 180 天，服务端 TOKEN_TTL_DAYS 可配）；过期后请求返回 401
 
+    Session:
+      type: object
+      required: [id, createdAt, expiresAt, current]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 会话 id；用于 DELETE /sessions/{id}
+        createdAt:
+          type: string
+          format: date-time
+          description: 会话创建时间
+        expiresAt:
+          type: string
+          format: date-time
+          description: 会话 token 过期时间
+        current:
+          type: boolean
+          description: 是否为本次请求所用的会话
+
+    SessionList:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Session"
+
     GATTService:
       type: object
       required: [uuid, name]
@@ -3669,6 +3781,11 @@ components:
           type: string
           format: date-time
           description: 任务完成（ready 或 failed）时间；未完成时省略
+        failureReason:
+          type: string
+          description: |
+            仅 failed 时返回的可读原因（不超过 500 字）。进程重启导致任务中断时，
+            启动对账会把超过 5 分钟仍未完成的任务标记为 failed，客户端应提示用户重新申请导出。
         downloadUrl:
           type: string
           description: 仅 ready 时返回；相对路径，含一次性下载令牌，10 分钟有效且只能使用一次
