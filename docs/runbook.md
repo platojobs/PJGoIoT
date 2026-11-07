@@ -171,6 +171,7 @@
 | v0.25.1 契约 | **未变更** | 服务端行为与 0.20.0 一致，无 schema 迁移；服务版本仅用于发布记账，递增到 0.25.1 |
 | v0.25.1 单测与 e2e | **已验证** | `go test ./...`（真实 PostgreSQL，迁移 19）：**111 个顶层 + 204 个子测试 PASS，0 FAIL、0 SKIP**；e2e `applied=1 skippedReadings=0 conflicts=0`、`readings=24`、`device_types=5` |
 | v0.25.1 校验 | **已验证（本机）** | redocly **0 error / 14 warnings**；新增脚本 `bash -n` 与容器内 `shellcheck -x` 通过 |
+| v0.25.1 CI | **已验证** | GitHub Actions [run 42316135591](https://github.com/platojobs/PJGoIoT/actions/runs/42316135591) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 | v0.25.1 真机边界 | **未验证** | 客户端并发调度/弱网重试、本地库合并与 UI、设备时钟漂移、>2 客户端与跨平台并发、推送与进程被杀重放；只做了 HTTP 模拟 |
 | v0.25.0 未验证 | **未验证** | 标记密集写入下的写放大与 payload 增长；`marked_at` 高频变更对端到端 HTTP+JSON 的影响（§7 只测 SQL 层）；其余同 v0.24.0 |
 
