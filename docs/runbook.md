@@ -183,6 +183,7 @@
 | v0.26.0 MAC 路径解码 | **已验证（HTTP + e2e）** | 服务端按 RFC 只解码一层：`AA%3A...` → 200；`AA%253A...` → path 参数为字面量 `%3A` → 400 `INVALID_MAC`。不为双重编码做二次解码，也不放宽 MAC 校验 |
 | v0.26.0 最新读数路径 | **已确认（契约 + e2e）** | 后端没有「按设备取最新一条」的单接口；`GET /my/devices/{platform}/{externalId}/readings/metrics` 已返回每指标 `lastAt` 与 `unit`，选中指标后 `GET /my/devices/{platform}/{externalId}/readings?metric=X&limit=1`（`recorded_at DESC, id DESC`）即最新一条，两次往返即可 |
 | v0.26.0 未验证 | **未验证** | presence 高频心跳的 `change_log` 写放大；handler 侧 JSON 重算的端到端 HTTP p95；共享家庭中成员读设备时 owner 记录的在线状态（本轮按账号隔离，不跨账号改写）；真机蓝牙在线判定 |
+| v0.26.0 CI | **已验证** | GitHub Actions [run 42345319122](https://github.com/platojobs/PJGoIoT/actions/runs/42345319122) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 
 ## 1. 部署前检查清单
 
