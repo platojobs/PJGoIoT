@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -92,6 +94,23 @@ func (s *Server) handleChanges(c *gin.Context) {
 	}
 	if page.Changes == nil {
 		page.Changes = []model.Change{}
+	}
+	// change_log 的 user_device payload 是写入时的快照；presence 是时间相关推导，
+	// 必须在响应生成时按当前时间重算，避免客户端拿到「写入时 online、回放时已离线」
+	// 的错误状态。重新计算只影响 presence 一个字段，payload 其余内容保持原样。
+	now := time.Now().UTC()
+	for i := range page.Changes {
+		if page.Changes[i].Entity != "user_device" {
+			continue
+		}
+		var d model.UserDevice
+		if err := json.Unmarshal(page.Changes[i].Payload, &d); err != nil {
+			continue
+		}
+		d.Presence = model.DerivePresence(now, d.LastSeenAt)
+		if raw, err := json.Marshal(d); err == nil {
+			page.Changes[i].Payload = raw
+		}
 	}
 	c.JSON(http.StatusOK, page)
 }

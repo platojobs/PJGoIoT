@@ -479,3 +479,61 @@ buffer 数完全不变（floor 查询不读取设备行），p95 的下降属于
 - 标记密集写入（大量设备同时 mark/unmark）下的 `change_log` 写放大与 payload 体积增长未压测。
 - 设备 `marked_at` 高频变更对 `/sync/changes` 端到端（HTTP + JSON 编解码）的影响未单独测量；
   本轮只测数据库层 SQL。
+
+## 8. v0.26.0：`user_devices.last_seen_at` 后的 `/sync/changes` 复测
+
+> 目标：确认新增可空列 `last_seen_at`（在线状态来源）没有拖差 `/sync/changes`。
+> 沿用 `pjgoiot_perf25` 的 16 家庭数据集，在同一库上做迁移前/后 A/B：
+> 先回滚到 19 跑一轮，再迁移到 20 跑同一脚本，两组均 60 次 floor + 30 次主查询采样。
+
+### 8.1 数据集与差异
+
+| 项 | 值 |
+| --- | --- |
+| 数据库 | `pjgoiot_perf25` |
+| 迁移版本 | 19（before）→ 20（after，新增 `000020_device_presence`） |
+| `change_log` | 1,080,000 行 / 357 MB |
+| 用户 / 家庭 / 成员 / 房间 / 设备 | 2,033 / 16 / 46 / 48 / 320 |
+| 目标用户 | 1 个，16 个家庭 |
+| 索引 | 未新增；`last_seen_at` 是 `user_devices` 上的普通可空列，不参与 `change_log` 过滤 |
+
+复现：
+
+```bash
+DB_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' \
+  RUNS=60 LEGACY_RUNS=30 scripts/perf-sync-floor.sh          # before（version=19）
+go run ./cmd/migrate -database-url 'postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' -direction up
+DB_URL='postgres://platojobs@127.0.0.1:5432/pjgoiot_perf25?sslmode=disable' \
+  RUNS=60 LEGACY_RUNS=30 scripts/perf-sync-floor.sh          # after（version=20）
+```
+
+### 8.2 可见性下限（before → after）
+
+| 家庭数 | 迁移前 version=19 p95 (ms) | 迁移后 version=20 p95 (ms) | 变化 | buffers (19→20) |
+| --- | --- | --- | --- | --- |
+| 1 | 0.734 | 0.726 | -1.1% | 9 → 9 |
+| 4 | 0.701 | 0.819 | +16.8% | 18 → 18 |
+| 8 | 1.256 | 0.755 | -39.9% | 30 → 30 |
+| 16 | 0.905 | 0.869 | -4.0% | 54 → 54 |
+
+floor 查询只读 `change_log` 与 `household_members`，buffer 数完全一致；p95 差异属于同机测量抖动。
+**结论：新列没有改变可见性下限的查询计划与成本。**
+
+### 8.3 主查询（16 家庭，limit=100）
+
+| 游标 | 查询 | 迁移前 p95 (ms) | 迁移后 p95 (ms) | buffers (19→20) |
+| --- | --- | --- | --- | --- |
+| 0 | 旧 OR/IN | 131.178 | 122.711 | 16,282 → 16,282 |
+| 0 | 新分支结构 | 5.708 | 4.179 | 121 → 121 |
+| 640000 | 旧 OR/IN | 0.366 | 0.434 | 10 → 10 |
+| 640000 | 新分支结构 | 7.135 | 5.896 | 271 → 271 |
+
+`/sync/changes` 的 SQL 只读 `change_log`，`last_seen_at` 只出现在 `payload` 里（且本查询不解析 payload），
+执行计划与 buffer 命中完全不变。**结论：无性能回退。**
+
+### 8.4 未验证
+
+- 新增的 handler 侧 `presence` 重算只对 `user_device` 行做一次 JSON 解码/编码（每页 ≤100 行），
+  未单独做端到端 HTTP 压测；本轮数字仍是数据库层 SQL。
+- 读数高频上报带来的 `user_device` 变更写放大与 `change_log` 增长速度未压测。
+

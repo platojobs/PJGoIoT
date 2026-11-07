@@ -1171,15 +1171,16 @@ func (s *Store) UpdateUserDeviceMeta(ctx context.Context, userID string, platfor
 		updatedAt    time.Time
 		deletedAt    sql.NullTime
 		curMarkedAt  sql.NullTime
+		curLastSeen  sql.NullTime
 	)
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, alias, household_id, room_id, client_id, device_type, advertised_name, "group",
-		       rules, scan_records, updated_at, deleted_at, marked_at
+		       rules, scan_records, updated_at, deleted_at, marked_at, last_seen_at
 		FROM user_devices
 		WHERE user_id = $1 AND platform = $2 AND external_id = $3 AND deleted_at IS NULL
 		FOR UPDATE`, uid, platform, externalID).
 		Scan(&devID, &curAlias, &curHousehold, &curRoom, &clientID, &devType, &advertised, &group,
-			&rules, &scanRecords, &updatedAt, &deletedAt, &curMarkedAt)
+			&rules, &scanRecords, &updatedAt, &deletedAt, &curMarkedAt, &curLastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.UserDevice{}, store.ErrNotFound
 	}
@@ -1278,6 +1279,11 @@ func (s *Store) UpdateUserDeviceMeta(ctx context.Context, userID string, platfor
 		v := curMarkedAt.Time.UTC()
 		d.MarkedAt = &v
 	}
+	if curLastSeen.Valid {
+		v := curLastSeen.Time.UTC()
+		d.LastSeenAt = &v
+	}
+	d.Presence = model.DerivePresence(now, d.LastSeenAt)
 	if devType.Valid && devType.String != "" {
 		v := devType.String
 		d.DeviceType = &v

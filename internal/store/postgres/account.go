@@ -246,7 +246,8 @@ func (s *Store) BuildPersonalDataExport(ctx context.Context, userID string) (mod
 func (s *Store) exportDevices(ctx context.Context, uid uuid.UUID) ([]model.UserDevice, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, client_id, platform, external_id, mac, alias, advertised_name, "group",
-		       rules, scan_records, updated_at, deleted_at, server_seq, device_type, marked_at
+		       rules, scan_records, updated_at, deleted_at, server_seq, device_type, marked_at,
+		       last_seen_at
 		FROM user_devices
 		WHERE user_id = $1
 		ORDER BY updated_at DESC, id ASC`, uid)
@@ -258,12 +259,14 @@ func (s *Store) exportDevices(ctx context.Context, uid uuid.UUID) ([]model.UserD
 	out := make([]model.UserDevice, 0)
 	for rows.Next() {
 		var (
-			row      sqlcgen.UserDevice
-			markedAt sql.NullTime
+			row        sqlcgen.UserDevice
+			markedAt   sql.NullTime
+			lastSeenAt sql.NullTime
 		)
 		if err := rows.Scan(&row.ID, &row.ClientID, &row.Platform, &row.ExternalID, &row.Mac,
 			&row.Alias, &row.AdvertisedName, &row.Group, &row.Rules, &row.ScanRecords,
-			&row.UpdatedAt, &row.DeletedAt, &row.ServerSeq, &row.DeviceType, &markedAt); err != nil {
+			&row.UpdatedAt, &row.DeletedAt, &row.ServerSeq, &row.DeviceType, &markedAt,
+			&lastSeenAt); err != nil {
 			return nil, fmt.Errorf("解析导出设备失败: %w", err)
 		}
 		d := mapUserDevice(row)
@@ -271,6 +274,11 @@ func (s *Store) exportDevices(ctx context.Context, uid uuid.UUID) ([]model.UserD
 			v := markedAt.Time.UTC()
 			d.MarkedAt = &v
 		}
+		if lastSeenAt.Valid {
+			v := lastSeenAt.Time.UTC()
+			d.LastSeenAt = &v
+		}
+		d.Presence = model.DerivePresence(time.Now().UTC(), d.LastSeenAt)
 		out = append(out, s.enrichUserDevice(ctx, s.q, d))
 	}
 	if err := rows.Err(); err != nil {

@@ -518,6 +518,9 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 // enrichUserDevice 用 fixtures 中的公共元数据补全型号、厂商、固件版本与兼容性。
 // 关联缺失时字段为 nil（JSON null），不产生错误。
 func (s *Store) enrichUserDevice(d model.UserDevice) model.UserDevice {
+	// fixture 不模拟读数上报，设备一律处于 unknown（lastSeenAt=NULL）；
+	// 仍需填充合法三态，避免本地开发返回空字符串。
+	d.Presence = model.DerivePresence(time.Now().UTC(), d.LastSeenAt)
 	resolved := ""
 	if d.DeviceType != nil {
 		resolved = *d.DeviceType

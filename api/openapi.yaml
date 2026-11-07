@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: PJGoIoT API
-  version: 0.20.0
+  version: 0.21.0
   description: |
     蓝牙设备数据面板 App（Android + iOS）的后端接口（多用户 + 多设备数据同步）。
 
@@ -79,6 +79,14 @@ info:
       RFC3339=标记」三态；标记与取消标记都会写入 `change_log`，参与与其他设备字段相同的
       字段级 LWW（微秒截断），重复上报同一时间戳不产生新的变更条目。
       迁移 `000019_device_marked_at`（`user_devices.marked_at timestamptz NULL`）。
+    - 自契约 `0.21.0`（服务 v0.26.0）起设备在线状态进入契约：
+      `UserDevice` 新增只读字段 `lastSeenAt`（UTC、微秒、可空）与三态 `presence`
+      （`unknown` / `online` / `offline`）。`lastSeenAt=null` 表示该账号从未收到过这台设备的读数
+      （`presence=unknown`），与「曾在线、现已超出 15 分钟窗口」的 `presence=offline` 严格区分。
+      判定来源是 `/sync/push` 中被服务端接受的读数，使用**服务端接收时间**而非读数 `recordedAt`；
+      窗口由服务端统一执行：`now - lastSeenAt <= 900s` 为 `online`，超过即自然转为 `offline`。
+      该状态由服务端在同一事务内维护，多端/换机同步可见，客户端不可写、不参与 LWW。
+      迁移 `000020_device_presence`（`user_devices.last_seen_at timestamptz NULL`）。
     - 契约只增不删，客户端应忽略未知字段。
     - `401` 表示 token 缺失、无效或已吊销；客户端必须提示用户重新登录，**不得**自动调用
       `/auth/anonymous` 静默创建新账号。自动重登会更换 userId，导致同步游标与数据漂移。
@@ -123,7 +131,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.25.1"
+                version: "0.26.0"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":
@@ -781,6 +789,13 @@ paths:
         返回本人拥有的设备，以及本人所在家庭内其他成员共享的设备。
         跨家庭设备不可见；`householdId`/`roomId` 为设备当前归属，未归属时为 null。
         未分配（`roomId=null`）仅表示未放入任何房间。
+
+        每台设备都带服务端推导的三态在线状态：
+        - `lastSeenAt`：服务端最后一次接受该设备读数上报的接收时间（UTC、微秒），从未上报为 null；
+        - `presence`：`unknown`（从未上报）/ `online`（窗口内）/ `offline`（曾上报但已超出窗口）。
+        判定窗口固定 15 分钟（`now - lastSeenAt <= 900s` 为 online），由服务端在每次响应时
+        按当前时间重新计算，客户端不得自行实现第二套阈值。共享家庭设备显示的是其 owner
+        记录上的状态；读数只更新推送者本人名下的设备行。
       security:
         - bearerAuth: []
       responses:
@@ -1203,6 +1218,12 @@ paths:
 
         每条变更的 `payload` 为 `UserDevice`，包含 `platform`、`externalId` 与可选 `mac`；
         `entityId` 为 `<userId>:<platform>:<externalId>` 派生的稳定字符串。
+
+        **在线状态（自 `0.21.0`）**：读数上报会推进设备 `lastSeenAt`，并在同一事务内写入一条
+        `user_device` 变更，因此多端登录与换机后的增量同步能拿到在线状态。`payload` 里的
+        `presence` 是**响应生成时**按当前时间重算的结果（不是写入时快照），与 `GET /my/devices`
+        的判定一致；`unknown`/`offline` 的区分同 `UserDevice` 字段说明。无读数上报的自然离线
+        不单独产生变更条目，客户端应在回到前台时重新拉取设备列表或依赖同一 payload 的重算值。
 
         **家庭结构变更（自 `0.11.0`）**：`entity` 取值为 `household` 或 `room`，
         `entityId` 分别是 `<householdId>` / `<roomId>`，`op` 沿用 `upsert` / `delete`；
@@ -3353,7 +3374,7 @@ components:
 
     UserDevice:
       type: object
-      required: [id, clientId, platform, externalId, alias, advertisedName, group, rules, scanRecords, updatedAt, serverSeq]
+      required: [id, clientId, platform, externalId, alias, advertisedName, group, rules, scanRecords, updatedAt, serverSeq, lastSeenAt, presence]
       properties:
         id:
           type: string
@@ -3393,6 +3414,30 @@ components:
             未标记时为 null；标记后该值就是字段级 LWW 的版本号。
             标记/取消标记都会写入 `change_log`（entity=`user_device`），
             因此 App 的增量同步与多端、跨设备都能拿到同一状态。
+        lastSeenAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            服务端最后一次接受该设备读数上报的接收时间（自 0.21.0）。
+            时间精度截断到微秒，时区固定 UTC（RFC 3339，`Z` 后缀）。
+
+            三态语义（必须能区分「从未知道」与「明确离线」）：
+            - `null` = 该账号自注册该设备以来**从未**收到过它的读数，对应 `presence=unknown`；
+            - 非 null 且距当前时间不超过 15 分钟，对应 `presence=online`；
+            - 非 null 但已超出 15 分钟，对应 `presence=offline`。
+
+            推导来源与更新时机：只来自 `/sync/push` 中**被服务端接受**的读数（使用服务端接收时间，
+            不是客户端上报的 `recordedAt`，补录旧读数不会让设备重新上线）；在录入读数的同一数据库事务内
+            单调推进，因此 push 提交后立即可见。客户端不能写入该字段，也不参与 LWW。
+        presence:
+          type: string
+          enum: [unknown, online, offline]
+          description: |
+            服务端按 `lastSeenAt` 与固定 15 分钟窗口在**每次响应生成时**实时推导的在线状态（自 0.21.0）：
+            `unknown` = `lastSeenAt` 为 null（从未上报）；`online` = `now - lastSeenAt <= 900s`；
+            `offline` = 曾上报但已超过 900s。长时间无读数上报会自然转为 `offline`，没有单独的「下线」事件。
+            该字段只读，客户端不得回传；`/sync/changes` 中的值在响应生成时重算，与 `/my/devices` 一致。
         alias:
           type: string
           description: 用户设置的别名；不会因设备广播名变化而被覆盖
@@ -3503,6 +3548,19 @@ components:
             - RFC3339 时间戳 = 标记，精度截断到微秒后参与 LWW。
             与 `alias` 等字段一致受设备级 `updatedAt` 约束：旧写入不会覆盖更新的标记。
             重复上报相同 `markedAt` 且内容未变化时返回 `unchanged`，不产生新的 `change_log`。
+        lastSeenAt:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+          description: |
+            只读派生字段（自 0.21.0）。服务端忽略客户端在此处的任何取值；
+            `lastSeenAt` / `presence` 只能由服务端在读数录入时维护，不参与 LWW。
+        presence:
+          type: string
+          enum: [unknown, online, offline]
+          readOnly: true
+          description: 只读派生字段（自 0.21.0），客户端上报会被忽略。
         rules:
           type: object
           additionalProperties: true

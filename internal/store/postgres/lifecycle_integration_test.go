@@ -67,7 +67,8 @@ func TestCleanupAndRetentionLifecycle(t *testing.T) {
 		seqs = append(seqs, res.Applied[0].ServerSeq)
 	}
 	// 再写一条读数，用于验证清理不影响 readings。
-	readingMAC := "AA:BB:CC:00:01:0A"
+	// 使用没有 user_devices 行的设备，避免触发在线状态变更而干扰本用例的 change_log 计数。
+	readingMAC := "AA:BB:CC:00:01:0D"
 	if _, _, err := st.Push(ctx, userID, model.PushRequest{Readings: []model.PushReading{{
 		ID: uuid.NewString(), Platform: "android", ExternalID: readingMAC,
 		Metric: "temperature_celsius", Value: 21.5, Unit: "celsius", RecordedAt: now,

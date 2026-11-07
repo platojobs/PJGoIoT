@@ -140,6 +140,15 @@ type UserDevice struct {
 	// MarkedAt 是用户「标记设备」的操作时间；nil 表示未标记（JSON 输出 null）。
 	// 它同时作为该字段的 LWW 版本，逐字段与客户端上报值比较并截断到微秒。
 	MarkedAt *time.Time `json:"markedAt"`
+	// LastSeenAt 是服务端最后一次观察到该设备读数上报的接收时间（UTC，微秒）。
+	// nil 表示该设备从未上报过读数（presence=unknown），与「曾在线但已超出窗口」
+	// 的 presence=offline 严格区分。该字段只读：由服务端在读数录入时维护，
+	// 客户端在 /sync/push 中上报会被忽略。
+	LastSeenAt *time.Time `json:"lastSeenAt"`
+	// Presence 是服务端按 LastSeenAt 与 15 分钟窗口实时推导的三态：
+	// unknown / online / offline。每次响应生成时重新计算，不是持久化状态，
+	// 客户端不得把它当作可写字段回传。
+	Presence string `json:"presence"`
 }
 
 // Household 是家庭视图：role 为当前用户在家庭中的角色，counts 由服务端聚合。

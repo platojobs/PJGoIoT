@@ -143,6 +143,11 @@ if device.get("deviceType") != "environmental_sensor":
     raise SystemExit(f"deviceType 未关联到真实型号: {device.get('deviceType')}")
 if device.get("vendor") != "Espressif Systems":
     raise SystemExit(f"vendor 异常: {device.get('vendor')}")
+# 契约 0.21.0：设备先落库、读数随后被接受，接收时间应让设备处于 online。
+if not device.get("lastSeenAt"):
+    raise SystemExit("lastSeenAt 缺失：读数上报未推进在线状态")
+if device.get("presence") != "online":
+    raise SystemExit(f"presence 期望 online，实际 {device.get('presence')}")
 
 readings = load("readings.json")["items"]
 metrics = sorted({item["metric"] for item in readings})

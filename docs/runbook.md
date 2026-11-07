@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.25.1）
+# PJGoIoT 运行手册（v0.26.0）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -174,6 +174,15 @@
 | v0.25.1 CI | **已验证** | GitHub Actions [run 42316135591](https://github.com/platojobs/PJGoIoT/actions/runs/42316135591) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
 | v0.25.1 真机边界 | **未验证** | 客户端并发调度/弱网重试、本地库合并与 UI、设备时钟漂移、>2 客户端与跨平台并发、推送与进程被杀重放；只做了 HTTP 模拟 |
 | v0.25.0 未验证 | **未验证** | 标记密集写入下的写放大与 payload 增长；`marked_at` 高频变更对端到端 HTTP+JSON 的影响（§7 只测 SQL 层）；其余同 v0.24.0 |
+| v0.26.0 在线状态迁移 | **已验证（真实 PG + 迁移演练）** | `000020_device_presence`：`user_devices.last_seen_at timestamptz NULL`；`migrate-drill.sh` 空库→20、历史库→20、20→down→1→up 三场景通过，`users/tokens/user_devices/change_log` 行数不丢 |
+| v0.26.0 在线状态语义 | **已验证（真实 PG 集成）** | `TestDevicePresencePostgres`：从未上报 `lastSeenAt=null`/`presence=unknown` 且 DB 为 NULL；读数上报后 `online`、DB 回读一致、微秒精度、`updatedAt` 不变；增量 `/sync/changes` 可见并带 `lastSeenAt`；再次上报推进时间且新增 1 条；窗口内 14m50s=`online`、窗口外 15m10s=`offline`、重新上报回到 `online`；用户 B 同 `externalId` 的读数不影响用户 A，反之亦然 |
+| v0.26.0 在线状态 HTTP/e2e | **已验证（真实栈）** | `scripts/seed-for-e2e.sh` 新增断言：`GET /my/devices` 返回 `lastSeenAt` 非空且 `presence=online`；`GET /sync/changes` 看到 2 条 `user_device`（seq1 `unknown`、seq2 `online`），游标推进到 2；health `version=0.26.0` |
+| v0.26.0 `/sync/changes` 性能复测 | **已验证（本机真实 PG）** | 同一 108 万行库上 version 19→20 A/B（各 60/30 次采样）：floor 16 家庭 p95 **0.905 → 0.869 ms**、buffers **54 不变**；主查询 cursor=0 新结构 p95 **5.708 → 4.179 ms**、buffers **121 不变**。见 [`perf-baseline.md`](perf-baseline.md) §8 |
+| v0.26.0 单测与集成 | **已验证** | `go test ./...`（`TEST_DATABASE_URL` 指向真实 PostgreSQL，迁移 20）：**114 个顶层测试 + 218 个子测试全部 PASS，0 FAIL、0 SKIP** |
+| v0.26.0 契约 | **已验证** | `openapi info.version=0.21.0`；`UserDevice` 新增必填 `lastSeenAt`（可空、UTC、微秒）与 `presence`（`unknown/online/offline`）；`PushDevice` 标注两者只读；redocly lint **0 error**（14 条非阻断 warning）；health 示例版本 0.26.0 |
+| v0.26.0 MAC 路径解码 | **已验证（HTTP + e2e）** | 服务端按 RFC 只解码一层：`AA%3A...` → 200；`AA%253A...` → path 参数为字面量 `%3A` → 400 `INVALID_MAC`。不为双重编码做二次解码，也不放宽 MAC 校验 |
+| v0.26.0 最新读数路径 | **已确认（契约 + e2e）** | 后端没有「按设备取最新一条」的单接口；`GET /my/devices/{platform}/{externalId}/readings/metrics` 已返回每指标 `lastAt` 与 `unit`，选中指标后 `GET /my/devices/{platform}/{externalId}/readings?metric=X&limit=1`（`recorded_at DESC, id DESC`）即最新一条，两次往返即可 |
+| v0.26.0 未验证 | **未验证** | presence 高频心跳的 `change_log` 写放大；handler 侧 JSON 重算的端到端 HTTP p95；共享家庭中成员读设备时 owner 记录的在线状态（本轮按账号隔离，不跨账号改写）；真机蓝牙在线判定 |
 
 ## 1. 部署前检查清单
 

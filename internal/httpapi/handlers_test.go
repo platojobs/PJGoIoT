@@ -686,6 +686,27 @@ func TestMyDeviceByKey(t *testing.T) {
 		}
 	})
 
+	t.Run("MAC 单次百分号编码可正常匹配", func(t *testing.T) {
+		encoded := strings.ReplaceAll(androidMAC, ":", "%3A")
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+encoded, "", user.Token, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("MAC 双重编码（%253A）返回 INVALID_MAC，不做二次解码", func(t *testing.T) {
+		// iOS appendingPathComponent 若把已编码的 %3A 再编码成 %253A，
+		// 服务端按 RFC 只解码一层，path 参数为字面量 %3A，MAC 校验必须拒绝。
+		doubleEncoded := strings.ReplaceAll(androidMAC, ":", "%253A")
+		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/android/"+doubleEncoded, "", user.Token, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if code := decode[errResponse](t, rec).Error.Code; code != httpapi.CodeInvalidMAC {
+			t.Fatalf("code=%q", code)
+		}
+	})
+
 	t.Run("iOS 非法 externalId 返回 400", func(t *testing.T) {
 		rec := do(t, h, http.MethodGet, "/api/v1/my/devices/ios/not-a-uuid", "", user.Token, nil)
 		if rec.Code != http.StatusBadRequest {

@@ -909,7 +909,7 @@ func runFeedbackWrite(client *http.Client, base, token string, st *stats) {
 		"kind": "experience",
 		"body": fmt.Sprintf("loadgen feedback %d at %s", seq, time.Now().UTC().Format(time.RFC3339Nano)),
 		"context": map[string]any{
-			"platform": "android", "appVersion": "0.25.1", "buildType": "release",
+			"platform": "android", "appVersion": "0.26.0", "buildType": "release",
 			"osVersion": "14", "deviceModel": "loadgen",
 		},
 	})

@@ -201,8 +201,10 @@ func TestPushTransactionBoundaries(t *testing.T) {
 		if readings != res.AppliedReadings {
 			t.Fatalf("读数实际行数=%d appliedReadings=%d", readings, res.AppliedReadings)
 		}
-		if changes != applied {
-			t.Fatalf("change_log 行数=%d applied=%d", changes, applied)
+		if changes != applied+2 {
+			// 3 台设备各 1 条；读数命中的 2 台已存设备各追加 1 条 lastSeenAt 变更
+			//（同批重复读数只算一次）。
+			t.Fatalf("change_log 行数=%d 期望 %d（设备 %d + 在线状态 2）", changes, applied+2, applied)
 		}
 	})
 

@@ -398,16 +398,23 @@ func (s *Store) ListUserDevices(ctx context.Context, userID string) ([]model.Use
 			householdID   uuid.NullUUID
 			roomID        uuid.NullUUID
 			markedAt      sql.NullTime
+			lastSeenAt    sql.NullTime
 		)
 		if err := rows.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &mac, &d.Alias,
 			&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
-			&deviceType, &vendor, &firmware, &compatibility, &householdID, &roomID, &markedAt); err != nil {
+			&deviceType, &vendor, &firmware, &compatibility, &householdID, &roomID, &markedAt,
+			&lastSeenAt); err != nil {
 			return nil, fmt.Errorf("解析用户设备失败: %w", err)
 		}
 		if markedAt.Valid {
 			v := markedAt.Time.UTC()
 			d.MarkedAt = &v
 		}
+		if lastSeenAt.Valid {
+			v := lastSeenAt.Time.UTC()
+			d.LastSeenAt = &v
+		}
+		d.Presence = model.DerivePresence(time.Now().UTC(), d.LastSeenAt)
 		if mac.Valid {
 			d.MAC = mac.String
 		}
@@ -454,7 +461,7 @@ SELECT d.id, d.client_id, d.platform, d.external_id, d.mac, d.alias, d.advertise
          WHEN pd.compatibility IS NOT NULL AND pd.compatibility <> '{}'::jsonb THEN pd.compatibility
          WHEN dt.compatibility IS NOT NULL THEN dt.compatibility
        END AS resolved_compatibility,
-       d.household_id, d.room_id, d.marked_at
+       d.household_id, d.room_id, d.marked_at, d.last_seen_at
 FROM user_devices d
 LEFT JOIN public_devices pd ON pd.mac = lower(d.mac)
 LEFT JOIN device_types dt ON dt.type = COALESCE(NULLIF(d.device_type, ''), pd.device_type)
@@ -506,7 +513,7 @@ func (s *Store) GetUserDeviceByKey(ctx context.Context, userID string, platform 
 const visibleDeviceSelectSQL = `
 SELECT d.id, d.client_id, d.platform, d.external_id, COALESCE(d.mac, ''), d.alias, d.advertised_name,
        d."group", d.rules, d.scan_records, d.updated_at, d.server_seq, d.device_type,
-       d.household_id, d.room_id, d.marked_at
+       d.household_id, d.room_id, d.marked_at, d.last_seen_at
 FROM user_devices d
 WHERE d.deleted_at IS NULL
   AND (d.user_id = $1 OR d.household_id IN (
@@ -521,16 +528,22 @@ func scanVisibleDevice(row deviceScanner) (model.UserDevice, error) {
 		householdID uuid.NullUUID
 		roomID      uuid.NullUUID
 		markedAt    sql.NullTime
+		lastSeenAt  sql.NullTime
 	)
 	if err := row.Scan(&d.ID, &d.ClientID, &d.Platform, &d.ExternalID, &d.MAC, &d.Alias,
 		&d.AdvertisedName, &d.Group, &d.Rules, &d.ScanRecords, &d.UpdatedAt, &d.ServerSeq,
-		&deviceType, &householdID, &roomID, &markedAt); err != nil {
+		&deviceType, &householdID, &roomID, &markedAt, &lastSeenAt); err != nil {
 		return model.UserDevice{}, err
 	}
 	if markedAt.Valid {
 		v := markedAt.Time.UTC()
 		d.MarkedAt = &v
 	}
+	if lastSeenAt.Valid {
+		v := lastSeenAt.Time.UTC()
+		d.LastSeenAt = &v
+	}
+	d.Presence = model.DerivePresence(time.Now().UTC(), d.LastSeenAt)
 	if deviceType.Valid && deviceType.String != "" {
 		v := deviceType.String
 		d.DeviceType = &v
@@ -738,6 +751,13 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 			record.HouseholdID = existing.HouseholdID
 			record.RoomID = existing.RoomID
 		}
+		// lastSeenAt 是服务端只读状态，设备写入不改变它，只把当前快照带进变更日志。
+		if existing != nil {
+			record.LastSeenAt = existing.LastSeenAt
+			record.Presence = model.DerivePresence(now, existing.LastSeenAt)
+		} else {
+			record.Presence = model.PresenceUnknown
+		}
 		var deletedAt sql.NullTime
 		if dev.Deleted {
 			record.DeletedAt = &decision.EffectiveUpdatedAt
@@ -783,6 +803,11 @@ func (s *Store) Push(ctx context.Context, userID string, req model.PushRequest, 
 
 	if len(req.Readings) > 0 {
 		if err := pushReadingsTx(ctx, tx, uid, req.Readings, now, &result, q); err != nil {
+			return model.PushResult{}, false, err
+		}
+		// 读数被接受即视为该设备的一次活动：在同一事务内推进 last_seen_at
+		// 并写入 user_device 变更，保证 /sync/changes 能增量看到在线状态。
+		if err := s.touchDevicePresenceTx(ctx, tx, uid, req.Readings, now, q); err != nil {
 			return model.PushResult{}, false, err
 		}
 		if err := injectFault("readings_written"); err != nil {
@@ -944,7 +969,7 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 	}
 	query := `SELECT user_id, id, client_id, mac, alias, "group", rules, scan_records, updated_at,
 		deleted_at, server_seq, created_at, platform, external_id, device_type, advertised_name,
-		household_id, room_id, marked_at
+		household_id, room_id, marked_at, last_seen_at
 		FROM user_devices
 		WHERE user_id = $1 AND (id IN (` + buildIN(2, len(ids)) + `) OR external_id IN (` +
 		buildIN(2+len(ids), len(exts)) + `))`
@@ -959,11 +984,12 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 			householdID uuid.NullUUID
 			roomID      uuid.NullUUID
 			markedAt    sql.NullTime
+			lastSeenAt  sql.NullTime
 		)
 		if err := rows.Scan(&row.UserID, &row.ID, &row.ClientID, &row.Mac, &row.Alias, &row.Group,
 			&row.Rules, &row.ScanRecords, &row.UpdatedAt, &row.DeletedAt, &row.ServerSeq,
 			&row.CreatedAt, &row.Platform, &row.ExternalID, &row.DeviceType, &row.AdvertisedName,
-			&householdID, &roomID, &markedAt); err != nil {
+			&householdID, &roomID, &markedAt, &lastSeenAt); err != nil {
 			return nil, nil, fmt.Errorf("解析已存设备失败: %w", err)
 		}
 		d := mapUserDevice(row)
@@ -971,6 +997,11 @@ func loadExistingDevices(ctx context.Context, db queryer, uid uuid.UUID, devices
 			t := markedAt.Time.UTC()
 			d.MarkedAt = &t
 		}
+		if lastSeenAt.Valid {
+			t := lastSeenAt.Time.UTC()
+			d.LastSeenAt = &t
+		}
+		d.Presence = model.DerivePresence(time.Now().UTC(), d.LastSeenAt)
 		if householdID.Valid {
 			v := householdID.UUID.String()
 			d.HouseholdID = &v
