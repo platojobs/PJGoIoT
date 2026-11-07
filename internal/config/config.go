@@ -85,7 +85,7 @@ func Load() (Config, error) {
 		ShutdownDrain:         time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECONDS", 5)) * time.Second,
 		InstanceID:            getEnv("INSTANCE_ID", ""),
 		TokenTTLDays:          getEnvInt("TOKEN_TTL_DAYS", 180),
-		Version:               getEnv("APP_VERSION", "0.25.0"),
+		Version:               getEnv("APP_VERSION", "0.25.1"),
 		PushWorkerEnabled:     getEnvBool("PUSH_WORKER_ENABLED", true),
 		PushWorkerInterval:    time.Duration(getEnvInt("PUSH_WORKER_INTERVAL_SECONDS", 5)) * time.Second,
 		PushWorkerBatch:       getEnvInt("PUSH_WORKER_BATCH", 50),

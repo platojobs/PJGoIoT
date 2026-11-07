@@ -100,7 +100,7 @@ jobs:
             RATE_LIMIT_BURST=0 \
             PAIRING_CLAIM_RATE_PER_MINUTE=0 \
             PAIRING_CLAIM_BURST=0 \
-            APP_VERSION=0.25.0 \
+            APP_VERSION=0.25.1 \
             ADDR=127.0.0.1:18080 \
             /tmp/pjgoiot-api >/tmp/api.log 2>&1 &
           echo $! >/tmp/api.pid

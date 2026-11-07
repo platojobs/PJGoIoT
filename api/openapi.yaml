@@ -74,7 +74,7 @@ info:
       `/sync/changes` 仅调整可见性下限与主查询的**内部实现**：非零游标的 `410 CURSOR_EXPIRED`
       判定与响应结构不变；`cursor=0` 按既有约定始终从最老保留行开始返回（不再做无意义的
       下限探测，也不会因历史清理而误报 410）。
-    - 自契约 `0.20.0`（服务 v0.25.0）起设备支持正式同步字段 `markedAt`：
+    - 自契约 `0.20.0`（服务 v0.25.1）起设备支持正式同步字段 `markedAt`：
       `UserDevice` 新增可空 `markedAt`，`PushDevice` 支持「缺省=保持 / null=取消标记 /
       RFC3339=标记」三态；标记与取消标记都会写入 `change_log`，参与与其他设备字段相同的
       字段级 LWW（微秒截断），重复上报同一时间戳不产生新的变更条目。
@@ -123,7 +123,7 @@ paths:
               example:
                 status: ok
                 service: pjgoiot-api
-                version: "0.25.0"
+                version: "0.25.1"
                 store: postgres
                 time: "2026-11-05T01:00:00Z"
         "503":

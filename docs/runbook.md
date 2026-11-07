@@ -1,4 +1,4 @@
-# PJGoIoT 运行手册（v0.25.0）
+# PJGoIoT 运行手册（v0.25.1）
 
 > 适用范围：`docker-compose.yml` + `deploy/Caddyfile` 的单机多实例部署形态
 > （Caddy → `api1`/`api2` → PostgreSQL）。
@@ -161,9 +161,17 @@
 | v0.25.0 `/sync/changes` 性能复测 | **已验证（本机真实 PG）** | 与 v0.24.0 同规模数据集（108 万行）：floor 16 家庭 p95 **0.850 ms**（v0.24.0 1.035）、buffers 54 不变；主查询 cursor=0 新结构 p95 **2.985 ms**、buffers **121 不变**；旧 OR/IN 104.793 ms。见 [`perf-baseline.md`](perf-baseline.md) §7 |
 | v0.25.0 单测与集成 | **已验证** | `go test ./...`（`TEST_DATABASE_URL` 指向真实 PostgreSQL，迁移 19）：**111 个顶层测试 + 204 个子测试全部 PASS，0 FAIL、0 SKIP** |
 | v0.25.0 e2e 栈 | **已验证（Docker PG + 本地 API）** | `scripts/stack-for-e2e.sh` + `seed-for-e2e.sh`：push `applied=1 skippedReadings=0 conflicts=0`；`user_devices=1`、`readings=24`、`device_types=5`，firmware/accessory/public_model 校验通过 |
-| v0.25.0 契约 | **已验证** | `openapi info.version=0.20.0`；`UserDevice.markedAt` 可空、`PushDevice.markedAt` 三态；redocly lint **0 error**（14 条非阻断 warning）；health 示例版本 0.25.0 |
+| v0.25.0 契约 | **已验证** | `openapi info.version=0.20.0`；`UserDevice.markedAt` 可空、`PushDevice.markedAt` 三态；redocly lint **0 error**（14 条非阻断 warning）；health 示例版本 0.25.1 |
 | v0.25.0 校验 job 等价项 | **已验证（本机）** | YAML 解析、Grafana dashboard 校验、`bash -n` 与容器内 `shellcheck -x`（含改动的 `migrate-drill.sh`）全部通过 |
 | v0.25.0 CI | **已验证** | GitHub Actions [run 42306039234](https://github.com/platojobs/PJGoIoT/actions/runs/42306039234) 四 job 全绿：`构建与测试`、`配置与脚本校验`、`压测门槛（smoke）`、`构建镜像` |
+| v0.25.1 双客户端并发（HTTP） | **已验证（真实 HTTP + 真实 PG）** | `scripts/verify-marked-concurrency.sh` 连续 3 次全部通过（每次 37 条断言、0 FAIL）：同 `(platform, externalId)`、两个客户端不同 `id`、10 轮并发交错（微秒 `...123456Z` / 毫秒 `...123000Z`）；最终落库恒为微秒值，合并新增 `change_log` 1 或 2 条（取决于谁先赢锁，属两个不同操作），同一 `(markedAt, updatedAt)` 重复分组计数 0；毫秒值条目 ≤1 |
+| v0.25.1 缺省/null 交错 | **已验证（HTTP）** | 缺省 `markedAt` 不清除已有标记；显式 `null` 清空；取消后再缺省仍为 NULL；取消后用旧 `updatedAt` 再标记 → `conflict(server_newer)` 且 DB 仍为 NULL、不新增条目 |
+| v0.25.1 幂等回放 | **已验证（HTTP）** | 把 `/my/devices` 返回的 `...123456Z` 与原 `updatedAt` 原样回传两次，均 `unchanged`，`change_log` 条目数不变 |
+| v0.25.1 游标推进 | **已验证（HTTP + 真实 PG）** | 上述写入后用 `limit=10` 拉 `/sync/changes`：seq 严格递增、无停滞；HTTP 生成的 `scene` 与 DB 直接插入的未知 `legacy_unknown` 均被越过；尾部空页游标不倒退；详见 [`perf-results/v0.25.1-marked-concurrency.md`](perf-results/v0.25.1-marked-concurrency.md) |
+| v0.25.1 契约 | **未变更** | 服务端行为与 0.20.0 一致，无 schema 迁移；服务版本仅用于发布记账，递增到 0.25.1 |
+| v0.25.1 单测与 e2e | **已验证** | `go test ./...`（真实 PostgreSQL，迁移 19）：**111 个顶层 + 204 个子测试 PASS，0 FAIL、0 SKIP**；e2e `applied=1 skippedReadings=0 conflicts=0`、`readings=24`、`device_types=5` |
+| v0.25.1 校验 | **已验证（本机）** | redocly **0 error / 14 warnings**；新增脚本 `bash -n` 与容器内 `shellcheck -x` 通过 |
+| v0.25.1 真机边界 | **未验证** | 客户端并发调度/弱网重试、本地库合并与 UI、设备时钟漂移、>2 客户端与跨平台并发、推送与进程被杀重放；只做了 HTTP 模拟 |
 | v0.25.0 未验证 | **未验证** | 标记密集写入下的写放大与 payload 增长；`marked_at` 高频变更对端到端 HTTP+JSON 的影响（§7 只测 SQL 层）；其余同 v0.24.0 |
 
 ## 1. 部署前检查清单
