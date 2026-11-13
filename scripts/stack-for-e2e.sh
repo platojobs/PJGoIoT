@@ -9,7 +9,7 @@
 #   - 把连接信息写入 .e2e/stack.env，stdout 最后一行输出 BASE_URL=...（可直接 eval）；
 #   - `--stop` 停止 API、删除 Postgres 容器并清理 .e2e 状态。
 #
-# 依赖：docker、go、curl、python3。详细说明见 docs/e2e-with-postgres.md。
+# 依赖：docker、go、curl、python3。详细说明见 docs/runbook.md §9。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -4,7 +4,7 @@
 #   memory  ：进程内令牌桶 —— 两个实例各自计数，总额度 = 3×2 = 6（已知限制）。
 #   postgres：共享令牌桶 —— 两个实例共用一行计数，总额度 = 3（跨实例一致）。
 #
-# 结论会写进 docs/slo.md 的「容量假设」与 README 的「限流边界」。
+# 结论见 README「部署与运维」与 docs/runbook.md §7。
 #
 # 用法：bash scripts/shared-rate-limit-check.sh
 set -euo pipefail

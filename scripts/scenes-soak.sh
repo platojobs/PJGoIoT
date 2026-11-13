@@ -13,7 +13,7 @@
 #   DURATION=15m WINDOW=1m CONCURRENCY=40 \
 #   scripts/scenes-soak.sh
 #
-# 结果默认写入 docs/perf-results/v0.24.0-scenes-soak.md；原始采样 CSV 与
+# 结果默认写入 docs/perf-results/scenes-soak.md；原始采样 CSV 与
 # loadgen 报告保留在同目录 /tmp 下（脚本退出前会说明路径）。
 set -euo pipefail
 
@@ -24,7 +24,7 @@ DATABASE_URL="${DATABASE_URL:-}"
 DURATION="${DURATION:-15m}"
 WINDOW="${WINDOW:-1m}"
 CONCURRENCY="${CONCURRENCY:-40}"
-OUT="${OUT:-$ROOT/docs/perf-results/v0.24.0-scenes-soak.md}"
+OUT="${OUT:-$ROOT/docs/perf-results/scenes-soak.md}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-10}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖: $1" >&2; exit 1; }; }

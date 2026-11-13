@@ -30,7 +30,7 @@ groups:
           summary: "API P95 延迟超过 2 秒"
           description: "近 5 分钟 P95 延迟 {{ $value }}s，检查数据库慢查询、连接池与同步推送体积。"
 
-      # 以下三条与 docs/slo.md 的 3 条 SLO 一一对应：
+      # 以下三条与 docs/runbook.md §8 的 3 条 SLO 一一对应：
       # 可用性 99.5%/月（错误预算 0.5%），1% 错误率 ≈ 2x 燃烧率。
       - alert: ApiAvailabilityBudgetBurn
         expr: |
@@ -45,7 +45,7 @@ groups:
           slo: availability
         annotations:
           summary: "可用性错误预算快速燃烧"
-          description: "近 1 小时 5xx 比例 {{ $value | humanizePercentage }}，超过 99.5% 可用性目标对应错误率（0.5%）的 2 倍，请按 docs/slo.md 处理。"
+          description: "近 1 小时 5xx 比例 {{ $value | humanizePercentage }}，超过 99.5% 可用性目标对应错误率（0.5%）的 2 倍，请按 docs/runbook.md §8 处理。"
 
       - alert: ApiDevicesP95High
         expr: |
